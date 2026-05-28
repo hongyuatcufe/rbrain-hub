@@ -1,44 +1,53 @@
-# rbrain
+# rbrain-hub
 
-**rbrain** is a Rust-based personal AI knowledge base CLI for academic research. A self-contained binary backed by SQLite, [tantivy](https://github.com/quickwit-oss/tantivy) (BM25 full-text search), and [usearch](https://github.com/unum-cloud/usearch) (vector search) — no system dependencies required.
+**rbrain-hub** is the team/cloud edition of [rbrain](https://github.com/hongyuatcufe/rbrain) — a Rust-based AI knowledge base CLI for academic research. It replaces the single-user usearch HNSW index with [LanceDB](https://lancedb.github.io/lancedb/) (MVCC concurrent writes, S3 backend) and adds Qwen dense+sparse dual-vector hybrid search.
 
-**rbrain** 是面向学术研究的个人 AI 知识库命令行工具。单一自包含二进制，后端使用 SQLite + tantivy（BM25 全文检索）+ usearch（向量检索），无任何系统依赖。
+**rbrain-hub** 是 [rbrain](https://github.com/hongyuatcufe/rbrain) 的团队/云版本，面向学术研究。将单用户的 usearch HNSW 索引替换为 [LanceDB](https://lancedb.github.io/lancedb/)（MVCC 并发写入，支持 S3），并增加了 Qwen 稠密+稀疏双向量混合检索。
+
+---
+
+## What's different from rbrain / 与 rbrain 的主要区别
+
+| | rbrain (personal) | rbrain-hub (team/cloud) |
+|---|---|---|
+| Vector store | usearch HNSW (in-process) | LanceDB (MVCC, S3-ready) |
+| Embedding | Qwen dense only | Qwen dense + sparse (`output_type="dense&sparse"`) |
+| Hybrid search | 2-way RRF (dense + BM25) | 3-way RRF (dense + sparse + BM25) |
+| Concurrent writes | Single-threaded Mutex | LanceDB MVCC |
+| Cloud storage | Local disk only | LanceDB → S3; SQLite + Tantivy → EBS/EFS |
+| CJK full-text | Tantivy + Lindera | Tantivy + Lindera (unchanged) |
+
+> **Why keep Tantivy?** LanceDB's Rust SDK FTS has open CJK issues (#2168, #2329). The existing Tantivy pipeline (per-language indices, Lindera morphological analysis, traditional→simplified conversion, CJK stopwords) is more robust and is kept as-is.
 
 ---
 
 ## Features / 功能特性
 
-- **Hybrid search / 混合检索** — BM25 keyword search + semantic vector search, optional LLM query expansion
-  BM25 关键词检索 + 语义向量检索，支持 LLM 查询扩展
+- **3-way hybrid search / 三路混合检索** — BM25 keyword + dense ANN + sparse ANN via parallel `tokio::join!`, merged with Reciprocal Rank Fusion; sparse falls back gracefully if unavailable
+- **Dual embedding / 双向量嵌入** — single Qwen API call returns both dense (1024-dim) and sparse vectors via `output_type="dense&sparse"`
+- **LanceDB vector store** — MVCC concurrent-safe writes, IVF-PQ ANN index (auto-built at ≥256 rows), S3-compatible storage backend
 - **Knowledge graph / 知识图谱** — typed directed links anchored to specific passages (`evidence`, `related`, `supports`, `contrasts`, `develops`)
-  带类型的有向链接，可锚定到具体段落
 - **Dream Cycle / 自动知识提取流水线** — lint → embed → extract concepts/figures → synthesize concept clusters
-  自动化多阶段流水线：检查 → 嵌入 → 提取概念/人物 → 概念聚类综合
 - **Think / 深度推理** — structured reasoning over retrieved context: tensions, judgments, open questions
-  基于检索上下文的结构化推理：张力、工作判断、开放问题
 - **Timeline / 时间线** — dated evidence log attached to any page
-  为任意页面附加带日期的证据条目
 - **Takes / 诠释片段** — interpretive fragments (`judgment`, `question`, `hypothesis`, `interpretation`) without overwriting page content
-  为页面附加诠释性笔记，不覆盖原文
 - **MCP server / MCP 服务端** — expose all brain operations to Claude and other MCP-compatible AI assistants
-  将所有知识库操作暴露给 Claude 等 MCP 兼容客户端
-- **CJK support / 中日韩支持** — language detection (zh-hans, zh-hant, ja, ko, en), CJK-safe chunking, mixed-script search
-  语言检测、CJK 安全分块、多语言混合检索
+- **CJK support / 中日韩支持** — language detection (zh-hans, zh-hant, ja, ko, en), CJK-safe chunking, Lindera morphological analysis, traditional→simplified normalization
 
 ---
 
 ## Install / 安装
 
 ```bash
-git clone https://github.com/hongyuatcufe/rbrain
-cd rbrain
+git clone https://github.com/hongyuatcufe/rbrain-hub
+cd rbrain-hub
 cargo build --release -p rbrain-cli
 
 # add to PATH
 ln -sf "$PWD/target/release/rbrain" ~/.local/bin/rbrain
 ```
 
-Requires Rust 1.78+. / 需要 Rust 1.78+。
+Requires Rust 1.85+. / 需要 Rust 1.85+。
 
 ---
 
@@ -80,6 +89,21 @@ rbrain get concepts/自主知识体系
 
 ---
 
+## Storage Layout / 存储结构
+
+```
+.rbrain/
+  config.toml      ← API keys and settings (gitignored)
+  brain.db         ← SQLite: pages, chunks, links, dream_metadata
+  lance/           ← LanceDB: dense + sparse vectors  (→ S3 in cloud deploy)
+  tantivy/         ← Tantivy BM25 index               (local disk / EFS only)
+  dictionaries/    ← Lindera CJK dictionaries
+```
+
+Cloud deployment: point `lance_dir` at an S3 URI; keep SQLite and Tantivy on EBS (single instance) or EFS (multi-replica).
+
+---
+
 ## CLI Reference / 命令参考
 
 ### Brain Management / 知识库管理
@@ -109,7 +133,7 @@ Page types / 页面类型: `note` | `concept` | `figure` | `synthesis` | `wiki` 
 ```bash
 rbrain search "query"                         # BM25 keyword search / BM25 关键词检索
 rbrain search "query" --tag t --type concept  # filtered / 过滤检索
-rbrain query "question" --expand              # hybrid + query expansion / 混合检索
+rbrain query "question" --expand              # 3-way hybrid + query expansion / 三路混合检索
 ```
 
 ### Knowledge Graph / 知识图谱
@@ -156,7 +180,7 @@ rbrain tags <slug>
 ```bash
 rbrain think "topic" --limit 12 --expand   # deep reasoning / 深度推理
 rbrain think "topic" --save                # saves as synthesis/<slug>
-rbrain generate "topic" --limit 12 --expand  # wiki-style summary / 文献综述草稿
+rbrain generate "topic" --limit 12 --expand  # wiki-style summary / 百科综述
 rbrain generate "topic" --save             # saves as wiki/<slug>
 ```
 
@@ -178,53 +202,36 @@ rbrain dream --stage extract        # Phase 3: extract concepts & figures / 提�
 rbrain dream --stage synthesize     # Phase 4: synthesize concept clusters / 概念聚类综合
 ```
 
-**Phase 3 — Extract / 提取阶段**：对每篇未处理的 `note`，调用 DeepSeek 提取概念、学者/人物和时间线事件。自动创建 `concepts/<slug>` 和 `figures/<slug>` 页面；关联人物的事件写入人物页，其他事件写入 `research/evidence/events/<source-slug>` 派生页。`raw/` 来源文献不会被 dream 改写。处理记录写入 `dream_metadata`（幂等，不重复处理）。
+**Phase 3 — Extract**: For each unprocessed `note`, calls DeepSeek to extract concepts, figures, and timeline events. Creates `concepts/<slug>` and `figures/<slug>` pages; events associated with people are written to figure pages. Idempotent via `dream_metadata`.
 
-For each unprocessed `note`, calls DeepSeek to extract concepts, figures, and timeline events. Events associated with people are written to figure pages; other events are written to derived `research/evidence/events/<source-slug>` pages. Dream never rewrites `raw/` source documents. Idempotent via `dream_metadata`.
+对每篇未处理的 `note`，调用 DeepSeek 提取概念、学者/人物和时间线事件。自动创建 `concepts/<slug>` 和 `figures/<slug>` 页面；关联人物的事件写入人物页。通过 `dream_metadata` 保证幂等。
 
-**Phase 4 — Synthesize / 综合阶段**：对有 3 篇以上源文章反向链接的概念，自动生成结构化文献综合页面，保存至 `synthesis/<concept-slug>`，并建立 `develops`（→ 概念）和 `evidence`（→ 源文章）链接。源文章更新后自动重新综合。
+**Phase 4 — Synthesize**: For each concept with 3+ source note backlinks, generates a structured synthesis at `synthesis/<concept-slug>`. Auto-links synthesis → concept (`develops`) and synthesis → source notes (`evidence`). Re-synthesizes when sources are updated.
 
-For each concept with 3+ source note backlinks, generates a structured literature synthesis at `synthesis/<concept-slug>`. Auto-links synthesis → concept (`develops`) and synthesis → source notes (`evidence`). Re-synthesizes when sources are updated.
+对有 3 篇以上源文章反向链接的概念，自动生成结构化综合页面，保存至 `synthesis/<concept-slug>`。源文章更新后自动重新综合。
+
+### Citation Workflow / 引用工作流
+
+```bash
+rbrain cite <slug> --depth 3 --append   # collect sources, append bibliography
+rbrain audit <slug>                     # check citation quality (ERRORs and WARNs)
+rbrain audit <slug> --fix               # auto-fix duplicates and orphan entries
+```
 
 ---
 
 ## MCP Server / MCP 服务端
 
-rbrain 通过 Model Context Protocol 将所有操作暴露给 Claude Code 等 MCP 客户端。
+rbrain-hub exposes all brain operations to Claude Code and other MCP-compatible clients.
 
 ```bash
-rbrain serve mcp                  # stdio mode (for Claude Code) / stdio 模式
-rbrain serve mcp --http 127.0.0.1:3456  # local HTTP mode / 本地 HTTP 模式
+rbrain serve mcp                          # stdio mode (for Claude Code)
+rbrain serve mcp --http 127.0.0.1:3456   # local HTTP mode
 ```
 
-HTTP mode exposes mutation tools without authentication and therefore only accepts loopback
-addresses (`127.0.0.1`, `[::1]`, or `localhost`). Do not expose it directly to a network.
-
-### MCP Tools / MCP 工具列表
-
-| Tool | Description |
-|------|-------------|
-| `brain_put` | Write or update a page / 写入或更新页面 |
-| `brain_get` | Read a page / 读取页面 |
-| `brain_delete` | Delete a page / 删除页面 |
-| `brain_list` | List pages with optional type/tag filter / 列出页面 |
-| `brain_query` | Hybrid semantic search / 混合语义检索 |
-| `brain_think` | Deep reasoning synthesis on a topic / 深度推理 |
-| `brain_generate` | Search + LLM wiki synthesis / 文献综述生成 |
-| `brain_link` | Create a typed graph link / 建立知识图谱链接 |
-| `brain_unlink` | Remove a link / 删除链接 |
-| `brain_backlinks` | Get incoming links / 反向链接 |
-| `brain_outlinks` | Get outgoing links / 出向链接 |
-| `brain_graph` | Traverse graph neighborhood / 图谱邻域遍历 |
-| `brain_orphans` | List pages with no incoming links / 孤立页面 |
-| `brain_add_timeline_entry` | Add a dated entry to a page / 添加时间线条目 |
-| `brain_add_tag` | Add a tag / 添加标签 |
-| `brain_remove_tag` | Remove a tag / 删除标签 |
-| `brain_stats` | Brain statistics / 统计信息 |
+HTTP mode only accepts loopback addresses. Do not expose to a network without authentication.
 
 ### Claude Code Setup / Claude Code 配置
-
-Add to `.claude/settings.json` / 添加到 `.claude/settings.json`：
 
 ```json
 {
@@ -238,46 +245,83 @@ Add to `.claude/settings.json` / 添加到 `.claude/settings.json`：
 }
 ```
 
+### MCP Tools / MCP 工具列表
+
+| Tool | Description |
+|------|-------------|
+| `brain_put` | Write or update a page |
+| `brain_get` | Read a page |
+| `brain_delete` | Delete a page |
+| `brain_list` | List pages with optional type/tag filter |
+| `brain_query` | 3-way hybrid semantic search |
+| `brain_think` | Deep reasoning synthesis on a topic |
+| `brain_generate` | Search + LLM wiki synthesis |
+| `brain_link` | Create a typed graph link |
+| `brain_unlink` | Remove a link |
+| `brain_backlinks` | Get incoming links |
+| `brain_outlinks` | Get outgoing links |
+| `brain_graph` | Traverse graph neighborhood |
+| `brain_orphans` | List pages with no incoming links |
+| `brain_add_timeline_entry` | Add a dated entry to a page |
+| `brain_add_tag` | Add a tag |
+| `brain_remove_tag` | Remove a tag |
+| `brain_stats` | Brain statistics |
+
 ---
 
 ## Architecture / 架构
 
 ```
-rbrain/
+rbrain-hub/
 ├── crates/
-│   ├── rbrain-cli/      # CLI entry point (clap) / 命令行入口
-│   ├── rbrain-engine/   # Core logic: dream, search, linking, synthesis / 核心逻辑
-│   ├── rbrain-core/     # Page model, language detection, markdown parsing / 页面模型
-│   ├── rbrain-db/       # SQLite schema and queries (sqlx) / 数据库层
-│   ├── rbrain-search/   # Tantivy BM25 + usearch vector index / 检索层
-│   ├── rbrain-llm/      # DeepSeek chat + Qwen embedding clients / LLM 客户端
-│   ├── rbrain-mcp/      # MCP server (stdio + HTTP) / MCP 服务端
-│   └── rbrain-worker/   # Background job queue / 后台任务队列
-└── rbrain-research-cli/ # Claude Code skill for research workflows / 研究工作流技能
+│   ├── rbrain-cli/      # CLI entry point (clap)
+│   ├── rbrain-engine/   # Core logic: dream, hybrid search, linking, synthesis
+│   ├── rbrain-core/     # Page model, SparseVec, VectorStore/Embedder traits
+│   ├── rbrain-db/       # SQLite schema and queries (sqlx)
+│   ├── rbrain-search/   # LanceStore (LanceDB) + Tantivy BM25
+│   ├── rbrain-llm/      # DeepSeek chat + Qwen dual-embedding client
+│   ├── rbrain-mcp/      # MCP server (stdio + HTTP)
+│   └── rbrain-worker/   # Background job queue
+└── spike/lancedb/       # LanceDB feasibility spike (validation only)
 ```
 
-**Embedding / 嵌入模型**: Qwen `text-embedding-v4` (1024-dim) via DashScope  
-**LLM**: DeepSeek `deepseek-chat` — extraction, synthesis, think, generate  
-**Storage / 存储**: SQLite (pages, chunks, links, dream_metadata) + usearch (vectors) + tantivy (BM25)
+**Embedding**: Qwen `text-embedding-v4` — single API call returns 1024-dim dense vector + sparse vector via `output_type="dense&sparse"`
+
+**LLM**: DeepSeek `deepseek-chat` — extraction, synthesis, think, generate
+
+**Storage**:
+- SQLite (`brain.db`) — pages, chunks, links, dream_metadata, tags, takes, timeline
+- LanceDB (`lance/`) — dense `FixedSizeList<Float32>[1024]` + sparse `List<Int64>` / `List<Float32>`; IVF-PQ ANN index auto-built at ≥256 rows
+- Tantivy (`tantivy/`) — BM25 full-text with per-language indices (zh-hans, zh-hant, ja, ko, en) and Lindera morphological analysis
+
+**Hybrid search pipeline**:
+```
+query
+  ├── dense ANN    (LanceDB, _distance)      ─┐
+  ├── sparse ANN   (stub → empty in 0.17)    ─┤─ tokio::join! → 3-way RRF
+  └── BM25 keyword (Tantivy + Lindera)       ─┘
+```
 
 ---
 
 ## Brain Auto-Discovery / 知识库自动发现
 
-rbrain 从当前目录向上遍历自动定位知识库：
-1. 找到 `.rbrain/` → 使用该项目本地知识库
-2. 未找到 → 回退到 `~/.rbrain/`
-
-rbrain walks up from CWD to discover the active brain:
+rbrain-hub walks up from CWD to discover the active brain:
 1. finds `.rbrain/` → uses project-local brain
 2. falls back to `~/.rbrain/`
 
-这意味着 `cd my-project && rbrain stats` 无需任何参数即可使用项目知识库。
+No `BRAIN_HOME` environment variable needed. / 无需设置环境变量。
+
+---
+
+## Roadmap / 路线图
+
+- **Phase 3**: Multi-tenant HTTP routing via `X-Brain-ID` header; per-tenant LanceDB table isolation
+- **Sparse ANN**: Enable when LanceDB Rust SDK adds sparse index support (tracking upstream)
+- **S3 backend**: Validated in spike; production wiring pending Phase 3
 
 ---
 
 ## Skill / Claude Code 技能
 
-研究工作流技能文件位于 [`rbrain-research-cli/SKILL.md`](rbrain-research-cli/SKILL.md)，涵盖完整工作流：知识库发现、检索、写入、图谱链接、Dream Cycle、Signal Detection 和 MCP 使用模式。
-
-A Claude Code skill for research workflows is at [`rbrain-research-cli/SKILL.md`](rbrain-research-cli/SKILL.md). Covers brain discovery, retrieval, writing, graph linking, dream cycle, signal detection, and MCP usage patterns.
+A Claude Code skill for research workflows is at [`rbrain-research-cli/SKILL.md`](rbrain-research-cli/SKILL.md). Covers brain discovery, retrieval, writing, graph linking, dream cycle, citation workflow, and MCP usage patterns.
