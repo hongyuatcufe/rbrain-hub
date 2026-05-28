@@ -5,3 +5,4 @@ pub mod vector_store;
 
 pub use keyword_index::TantivyIndex;
 pub use search::rrf;
+pub use vector_store::LanceStore;

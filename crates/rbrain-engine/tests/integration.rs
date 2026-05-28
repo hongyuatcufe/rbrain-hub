@@ -7,15 +7,16 @@ use rbrain_core::page::{Language, Page};
 use rbrain_engine::Engine;
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_search::TantivyIndex;
-use rbrain_search::vector_store::UsearchStore;
+use rbrain_search::LanceStore;
 use std::sync::Arc;
 
 /// Open a full-stack engine backed by MockEmbedder. No API key needed.
 async fn open_mock_engine(tb: &TestBrain) -> Engine {
     let embedder = Arc::new(MockEmbedder::new(tb.config.embedding_dim));
     let vector_store = Arc::new(
-        UsearchStore::new(tb.config.vectors_path.clone(), tb.config.embedding_dim)
-            .expect("UsearchStore::new"),
+        LanceStore::new(tb.config.lance_dir.clone(), tb.config.embedding_dim)
+            .await
+            .expect("LanceStore::new"),
     );
     let keyword_index = Arc::new(
         TantivyIndex::new(tb.config.tantivy_dir.clone()).expect("TantivyIndex::new"),

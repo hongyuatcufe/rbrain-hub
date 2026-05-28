@@ -43,8 +43,11 @@ lindera-tantivy = "=2.0.0"
 # lindera 2.x (same major as lindera-tantivy 2.0.0); 3.x crates are incompatible
 lindera = { version = "=2.3.4", features = ["embed-ipadic", "embed-cc-cedict", "embed-ko-dic"] }
 
-# Vector search (YOUNG - PIN EXACT)
-usearch = "=2.25.2"
+# Vector store — LanceDB (replaces usearch)
+lancedb = "=0.17.0"
+arrow-array = "=53.4.1"
+arrow-schema = "=53.4.1"
+arrow-buffer = "=53.4.1"
 
 # Embeddings + LLM (HTTP via reqwest)
 reqwest = { version = "0.12", features = ["json"] }

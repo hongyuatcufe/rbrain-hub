@@ -20,7 +20,7 @@ pub struct Config {
     pub repo_dir: PathBuf,        // ~/brain
     pub data_dir: PathBuf,        // ~/.rbrain
     pub db_path: PathBuf,         // ~/.rbrain/brain.db
-    pub vectors_path: PathBuf,    // ~/.rbrain/vectors.usearch
+    pub lance_dir: PathBuf,       // ~/.rbrain/lance
     pub tantivy_dir: PathBuf,     // ~/.rbrain/tantivy
     pub dictionaries_dir: PathBuf,// ~/.rbrain/dictionaries
     pub qwen: QwenConfig,
@@ -37,7 +37,7 @@ impl Default for Config {
             repo_dir: home.join("brain"),
             data_dir: data_dir.clone(),
             db_path: data_dir.join("brain.db"),
-            vectors_path: data_dir.join("vectors.usearch"),
+            lance_dir: data_dir.join("lance"),
             tantivy_dir: data_dir.join("tantivy"),
             dictionaries_dir: data_dir.join("dictionaries"),
             qwen: QwenConfig::default(),
@@ -111,7 +111,7 @@ impl Config {
                 "repo_dir":        project_dir,
                 "data_dir":        local_dir,
                 "db_path":         local_dir.join("brain.db"),
-                "vectors_path":    local_dir.join("vectors.usearch"),
+                "lance_dir":       local_dir.join("lance"),
                 "tantivy_dir":     local_dir.join("tantivy"),
                 "dictionaries_dir": local_dir.join("dictionaries"),
             });
@@ -129,7 +129,7 @@ impl Config {
                 "repo_dir":        project_dir,
                 "data_dir":        data_dir,
                 "db_path":         data_dir.join("brain.db"),
-                "vectors_path":    data_dir.join("vectors.usearch"),
+                "lance_dir":       data_dir.join("lance"),
                 "tantivy_dir":     data_dir.join("tantivy"),
                 "dictionaries_dir": data_dir.join("dictionaries"),
             });
@@ -167,7 +167,7 @@ impl Config {
             "repo_dir":        project_dir,
             "data_dir":        data_dir,
             "db_path":         data_dir.join("brain.db"),
-            "vectors_path":    data_dir.join("vectors.usearch"),
+            "lance_dir":       data_dir.join("lance"),
             "tantivy_dir":     data_dir.join("tantivy"),
             "dictionaries_dir": data_dir.join("dictionaries"),
         });

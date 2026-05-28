@@ -8,7 +8,12 @@ rbrain-core = { workspace = true }
 tantivy = { workspace = true }
 lindera-tantivy = { workspace = true }
 lindera = { workspace = true }
-usearch = { workspace = true }
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-buffer = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

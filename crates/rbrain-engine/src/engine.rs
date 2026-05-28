@@ -320,11 +320,12 @@ impl Engine {
             .collect();
 
         // Keep the previous searchable version intact when embedding fails.
-        let embeddings = embedder.embed_batch(&chunk_texts_for_embed).await?;
-        if embeddings.len() != chunk_texts.len() {
+        // Use dual embedding (dense + sparse) in a single API call.
+        let dual_embeddings = embedder.embed_batch_dual(&chunk_texts_for_embed).await?;
+        if dual_embeddings.len() != chunk_texts.len() {
             return Err(BrainError::Conflict(format!(
                 "embedder returned {} vectors for {} chunks",
-                embeddings.len(),
+                dual_embeddings.len(),
                 chunk_texts.len()
             )));
         }
@@ -391,26 +392,17 @@ impl Engine {
         }
 
         let mut vector_items = Vec::new();
-        for (chunk_id, embedding) in chunk_ids.iter().zip(embeddings.iter()) {
-            let embedding_bytes: Vec<u8> = embedding
-                .iter()
-                .flat_map(|f: &f32| f.to_le_bytes().to_vec())
-                .collect();
+        for (chunk_id, (dense, sparse)) in chunk_ids.iter().zip(dual_embeddings.iter()) {
+            sqlx::query("UPDATE chunks SET has_embedding = 1 WHERE id = ?1")
+                .bind(chunk_id)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-            sqlx::query(
-                "UPDATE chunks SET embedding = ?1, embedding_model = ?2, has_embedding = 1 \
-                 WHERE id = ?3",
-            )
-            .bind(&embedding_bytes)
-            .bind("text-embedding-v4")
-            .bind(chunk_id)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            vector_items.push((*chunk_id, dense.clone(), sparse.clone()));
 
-            vector_items.push((*chunk_id, embedding.clone()));
-
-            let chunk_text = chunk_texts.get(chunk_ids.iter().position(|&id| id == *chunk_id).unwrap_or(0))
+            let chunk_text = chunk_texts
+                .get(chunk_ids.iter().position(|&id| id == *chunk_id).unwrap_or(0))
                 .cloned()
                 .unwrap_or_default();
             keyword_index.upsert(*chunk_id, &normalized_slug, &chunk_text, &lang).await?;
@@ -426,7 +418,6 @@ impl Engine {
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
 
-        vector_store.save().await?;
         keyword_index.commit().await?;
 
         Ok(())
@@ -511,7 +502,6 @@ impl Engine {
             for chunk_id in &chunk_ids {
                 let _ = vector_store.delete(*chunk_id).await;
             }
-            let _ = vector_store.save().await;
         }
 
         if let Some(keyword_index) = &self.inner.keyword_index {
@@ -1063,24 +1053,52 @@ impl Engine {
         lang: &rbrain_core::page::Language,
         k: usize,
     ) -> Result<Vec<(i64, f64)>> {
-        let vector_results = self.vector_search(query, k).await?;
-        let keyword_results = self.keyword_search(query, lang, k).await?;
+        // Get dense results and sparse results in parallel with keyword search.
+        let (dense_results, sparse_results, keyword_results) = tokio::join!(
+            self.vector_search(query, k),
+            self.sparse_search(query, k),
+            self.keyword_search(query, lang, k),
+        );
 
-        let vector_rrf: Vec<(i64, usize)> = vector_results
-            .into_iter()
-            .enumerate()
-            .map(|(rank, (chunk_id, _))| (chunk_id, rank + 1))
-            .collect();
+        let mut ranked_lists: Vec<Vec<(i64, usize)>> = Vec::new();
 
-        let keyword_rrf: Vec<(i64, usize)> = keyword_results
-            .into_iter()
-            .enumerate()
-            .map(|(rank, (chunk_id, _))| (chunk_id, rank + 1))
-            .collect();
+        if let Ok(r) = dense_results {
+            if !r.is_empty() {
+                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+            }
+        }
+        if let Ok(r) = sparse_results {
+            if !r.is_empty() {
+                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+            }
+        }
+        if let Ok(r) = keyword_results {
+            if !r.is_empty() {
+                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+            }
+        }
 
-        let fused = rrf(vec![vector_rrf, keyword_rrf], 60.0);
+        Ok(rrf(ranked_lists, 60.0))
+    }
 
-        Ok(fused)
+    /// Sparse vector search — returns empty when backend doesn't support it yet.
+    async fn sparse_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        let embedder = match &self.inner.embedder {
+            Some(e) => e,
+            None => return Ok(vec![]),
+        };
+        let vector_store = match &self.inner.vector_store {
+            Some(vs) => vs,
+            None => return Ok(vec![]),
+        };
+
+        let dual = embedder.embed_batch_dual(&[query.to_string()]).await?;
+        let sparse = dual.into_iter().next().map(|(_, s)| s).unwrap_or_default();
+        if sparse.indices.is_empty() {
+            return Ok(vec![]);
+        }
+
+        vector_store.search_sparse(&sparse, k).await
     }
 
     pub async fn expanded_search(
@@ -1262,7 +1280,7 @@ impl Engine {
             })?;
 
         let query_embedding = embedder.embed_one(query).await?;
-        let mut results = vector_store.search(&query_embedding, k).await?;
+        let mut results = vector_store.search_dense(&query_embedding, k).await?;
 
         if results.is_empty() {
             return Ok(results);
@@ -2009,11 +2027,7 @@ impl Engine {
             issues.push("Database connection failed".to_string());
         }
 
-        if let Some(vector_store) = &self.inner.vector_store {
-            if let Err(e) = vector_store.save().await {
-                issues.push(format!("Vector store error: {}", e));
-            }
-        }
+        // LanceDB auto-persists; no explicit save needed.
 
         let stale_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0"

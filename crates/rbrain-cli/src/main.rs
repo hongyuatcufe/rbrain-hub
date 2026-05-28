@@ -7,7 +7,7 @@ use rbrain_engine::{Engine, extract_links};
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_llm::qwen::QwenEmbedder;
 use rbrain_search::TantivyIndex;
-use rbrain_search::vector_store::UsearchStore;
+use rbrain_search::LanceStore;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -1089,7 +1089,12 @@ async fn main() -> anyhow::Result<()> {
             // Storage
             println!("\n── Storage ────────────────────────────────────────────");
             let db_size = std::fs::metadata(&config.db_path).map(|m| m.len()).unwrap_or(0);
-            let vec_size = std::fs::metadata(&config.vectors_path).map(|m| m.len()).unwrap_or(0);
+            let lance_size: u64 = walkdir::WalkDir::new(&config.lance_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
             let tantivy_size: u64 = walkdir::WalkDir::new(&config.tantivy_dir)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -1097,7 +1102,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|m| m.len())
                 .sum();
             println!("  SQLite DB:     {}", fmt_bytes(db_size));
-            println!("  Vector store:  {}", fmt_bytes(vec_size));
+            println!("  LanceDB:       {}", fmt_bytes(lance_size));
             println!("  Tantivy index: {}", fmt_bytes(tantivy_size));
 
             // Issues
@@ -1155,7 +1160,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("Brain path:       {}", config.data_dir.display());
                     println!("Repo dir:         {}", config.repo_dir.display());
                     println!("DB path:          {}", config.db_path.display());
-                    println!("Vectors path:     {}", config.vectors_path.display());
+                    println!("Lance dir:        {}", config.lance_dir.display());
                     println!("Tantivy dir:      {}", config.tantivy_dir.display());
                     println!("Embedding dim:    {}", config.embedding_dim);
                     println!("Log level:        {}", config.log_level);
@@ -1175,7 +1180,7 @@ async fn main() -> anyhow::Result<()> {
                         "data_dir" | "brain_dir" => config.data_dir.display().to_string(),
                         "repo_dir" => config.repo_dir.display().to_string(),
                         "db_path" => config.db_path.display().to_string(),
-                        "vectors_path" => config.vectors_path.display().to_string(),
+                        "lance_dir" => config.lance_dir.display().to_string(),
                         "tantivy_dir" => config.tantivy_dir.display().to_string(),
                         "embedding_dim" => config.embedding_dim.to_string(),
                         "log_level" => config.log_level.clone(),
@@ -1428,7 +1433,9 @@ fn fmt_bytes(n: u64) -> String {
 
 async fn init_engine_with_search(config: Config, mock_embed: bool) -> anyhow::Result<Engine> {
     let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);
-    let vector_store = Arc::new(UsearchStore::new(config.vectors_path.clone(), config.embedding_dim)?);
+    let vector_store = Arc::new(
+        LanceStore::new(config.lance_dir.clone(), config.embedding_dim).await?
+    );
 
     let embedder: Arc<dyn Embedder> = if mock_embed {
         Arc::new(MockEmbedder::new(config.embedding_dim))

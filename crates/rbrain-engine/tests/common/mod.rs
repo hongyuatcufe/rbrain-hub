@@ -16,7 +16,7 @@ impl TestBrain {
             repo_dir: tmpdir.path().join("brain"),
             data_dir: data_dir.clone(),
             db_path: data_dir.join("brain.db"),
-            vectors_path: data_dir.join("vectors.usearch"),
+            lance_dir: data_dir.join("lance"),
             tantivy_dir: data_dir.join("tantivy"),
             dictionaries_dir: data_dir.join("dictionaries"),
             ..Default::default()

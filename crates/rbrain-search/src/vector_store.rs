@@ -1,132 +1,254 @@
-use async_trait::async_trait;
-use rbrain_core::error::Result;
-use rbrain_core::vector_store::VectorStore;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-pub struct UsearchStore {
-    index: Mutex<usearch::Index>,
-    path: PathBuf,
+use arrow_array::{FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator};
+use arrow_buffer::OffsetBuffer;
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use futures::TryStreamExt;
+use lancedb::index::vector::IvfPqIndexBuilder;
+use lancedb::index::Index;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::{connect, Table};
+
+use rbrain_core::error::{BrainError, Result};
+use rbrain_core::vector_store::{SparseVec, VectorStore};
+
+const TABLE_NAME: &str = "chunks";
+
+fn io_err(e: impl std::fmt::Display) -> BrainError {
+    BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+}
+
+fn schema(dim: i32) -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "dense",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim,
+            ),
+            false,
+        ),
+        Field::new(
+            "sparse_indices",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            false,
+        ),
+        Field::new(
+            "sparse_values",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            false,
+        ),
+    ]))
+}
+
+pub struct LanceStore {
+    table: Table,
     dim: usize,
 }
 
-impl UsearchStore {
-    pub fn new(path: PathBuf, dim: usize) -> Result<Self> {
-        let index = usearch::Index::new(&usearch::IndexOptions {
-            dimensions: dim,
-            metric: usearch::MetricKind::Cos,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 128,
-            multi: false,
-            quantization: usearch::ScalarKind::F32,
-        }).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch init: {}", e))
-        ))?;
+impl LanceStore {
+    pub async fn new(lance_dir: PathBuf, dim: usize) -> Result<Self> {
+        let uri = lance_dir.to_str().ok_or_else(|| io_err("invalid lance_dir path"))?;
+        let db = connect(uri).execute().await.map_err(io_err)?;
 
-        // Pre-reserve capacity so the HNSW graph is properly initialised.
-        // usearch can SIGSEGV on remove() when the index has no reserved capacity.
-        index.reserve(64).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch reserve: {}", e))
-        ))?;
-
-        let store = Self {
-            index: Mutex::new(index),
-            path: path.clone(),
-            dim,
+        let table_names = db.table_names().execute().await.map_err(io_err)?;
+        let table = if table_names.contains(&TABLE_NAME.to_string()) {
+            db.open_table(TABLE_NAME).execute().await.map_err(io_err)?
+        } else {
+            // Seed with an empty batch to establish schema.
+            let schema = schema(dim as i32);
+            let empty = empty_batch(dim as i32, &schema);
+            let reader = RecordBatchIterator::new(vec![Ok(empty)], schema);
+            db.create_table(TABLE_NAME, Box::new(reader))
+                .execute()
+                .await
+                .map_err(io_err)?
         };
 
-        if path.exists() {
-            store.load()?;
-        }
+        Ok(Self { table, dim })
+    }
 
-        Ok(store)
+    fn schema(&self) -> Arc<Schema> {
+        schema(self.dim as i32)
     }
 }
 
-#[async_trait]
-impl VectorStore for UsearchStore {
-    async fn upsert(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
-        let idx = self.index.lock().unwrap();
-        let key = chunk_id as u64;
-        // Remove existing entry first so this is a true upsert (multi: false forbids duplicates).
-        if idx.size() > 0 {
-            let _ = idx.remove(key);
-        }
-        if idx.size() >= idx.capacity() {
-            let reserve_to = (idx.capacity() + 256).next_power_of_two();
-            idx.reserve(reserve_to).map_err(|e| rbrain_core::error::BrainError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, format!("usearch reserve: {}", e))
-            ))?;
-        }
-        idx.add(key, embedding).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch add: {}", e))
-        ))?;
-        Ok(())
-    }
+fn empty_batch(dim: i32, schema: &Arc<Schema>) -> RecordBatch {
+    let ids = Int64Array::from(vec![] as Vec<i64>);
+    let dense_values = Float32Array::from(vec![] as Vec<f32>);
+    let dense = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim,
+        Arc::new(dense_values),
+        None,
+    )
+    .unwrap();
+    let sparse_idx_col = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Int64, true)),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(Int64Array::from(vec![] as Vec<i64>)),
+        None,
+    )
+    .unwrap();
+    let sparse_val_col = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(Float32Array::from(vec![] as Vec<f32>)),
+        None,
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ids),
+            Arc::new(dense),
+            Arc::new(sparse_idx_col),
+            Arc::new(sparse_val_col),
+        ],
+    )
+    .unwrap()
+}
 
-    async fn upsert_batch(&self, items: &[(i64, Vec<f32>)]) -> Result<()> {
+#[async_trait]
+impl VectorStore for LanceStore {
+    async fn upsert_batch(&self, items: &[(i64, Vec<f32>, SparseVec)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        let idx = self.index.lock().unwrap();
-        // Remove existing entries first (true upsert — multi: false forbids duplicates).
-        if idx.size() > 0 {
-            for (id, _) in items {
-                let _ = idx.remove(*id as u64);
-            }
+
+        // Delete any existing entries for these IDs (true upsert semantics).
+        let id_list: String = items
+            .iter()
+            .map(|(id, _, _)| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = self.table.delete(&format!("id IN ({})", id_list)).await;
+
+        let schema = self.schema();
+        let dim = self.dim as i32;
+
+        let ids: Int64Array = items.iter().map(|(id, _, _)| *id).collect();
+
+        // dense: FixedSizeList — all vectors concatenated, stride = dim
+        let all_dense: Float32Array = items
+            .iter()
+            .flat_map(|(_, d, _)| d.iter().copied())
+            .collect();
+        let dense = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim,
+            Arc::new(all_dense),
+            None,
+        )
+        .map_err(io_err)?;
+
+        // sparse indices: variable-length List<i64>
+        let mut s_idx_vals: Vec<i64> = Vec::new();
+        let mut s_idx_offsets: Vec<i32> = vec![0];
+        let mut s_val_vals: Vec<f32> = Vec::new();
+        let mut s_val_offsets: Vec<i32> = vec![0];
+
+        for (_, _, sparse) in items {
+            s_idx_vals.extend(sparse.indices.iter().map(|&i| i as i64));
+            s_idx_offsets.push(s_idx_vals.len() as i32);
+            s_val_vals.extend(&sparse.values);
+            s_val_offsets.push(s_val_vals.len() as i32);
         }
-        // Capacity check: size may have shrunk after removes, but reserve for the full batch.
-        let needed = idx.size() + items.len();
-        if needed > idx.capacity() {
-            let reserve_to = (needed + 256).next_power_of_two();
-            idx.reserve(reserve_to).map_err(|e| rbrain_core::error::BrainError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, format!("usearch reserve: {}", e))
-            ))?;
+
+        let sparse_idx_col = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(s_idx_offsets.into()),
+            Arc::new(Int64Array::from(s_idx_vals)),
+            None,
+        )
+        .map_err(io_err)?;
+
+        let sparse_val_col = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            OffsetBuffer::new(s_val_offsets.into()),
+            Arc::new(Float32Array::from(s_val_vals)),
+            None,
+        )
+        .map_err(io_err)?;
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(dense),
+                Arc::new(sparse_idx_col),
+                Arc::new(sparse_val_col),
+            ],
+        )
+        .map_err(io_err)?;
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        self.table
+            .add(Box::new(reader))
+            .execute()
+            .await
+            .map_err(io_err)?;
+
+        // Rebuild IVF-PQ index once the table grows large enough.
+        let row_count = self.table.count_rows(None).await.unwrap_or(0);
+        if row_count >= 256 {
+            let _ = self
+                .table
+                .create_index(&["dense"], Index::IvfPq(IvfPqIndexBuilder::default()))
+                .execute()
+                .await;
         }
-        for (id, vec) in items {
-            idx.add(*id as u64, vec).map_err(|e| rbrain_core::error::BrainError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, format!("usearch add: {}", e))
-            ))?;
-        }
+
         Ok(())
     }
 
     async fn delete(&self, chunk_id: i64) -> Result<()> {
-        let idx = self.index.lock().unwrap();
-        if idx.size() > 0 {
-            idx.remove(chunk_id as u64).map_err(|e| rbrain_core::error::BrainError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, format!("usearch remove: {}", e))
-            ))?;
+        self.table
+            .delete(&format!("id = {}", chunk_id))
+            .await
+            .map_err(io_err)
+    }
+
+    async fn search_dense(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
+        let stream = self
+            .table
+            .query()
+            .nearest_to(query)
+            .map_err(io_err)?
+            .limit(k)
+            .execute()
+            .await
+            .map_err(io_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<RecordBatch>>().await.map_err(io_err)?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| io_err("missing 'id' column in LanceDB result"))?;
+
+            // LanceDB returns _distance column for ANN results
+            let dist_col = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+            for i in 0..batch.num_rows() {
+                let chunk_id = id_col.value(i);
+                let dist = dist_col.map(|c| c.value(i)).unwrap_or(0.0);
+                results.push((chunk_id, dist));
+            }
         }
-        Ok(())
+
+        Ok(results)
     }
 
-    async fn search(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
-        let idx = self.index.lock().unwrap();
-        let results = idx.search(query, k).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch search: {}", e))
-        ))?;
-        let keys: Vec<u64> = results.keys.to_vec();
-        let distances: Vec<f32> = results.distances.to_vec();
-        Ok(keys.iter().zip(distances.iter()).map(|(k, d)| (*k as i64, *d)).collect())
-    }
-
-    async fn save(&self) -> Result<()> {
-        let idx = self.index.lock().unwrap();
-        let path_str = self.path.to_str().unwrap_or("");
-        idx.save(path_str).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch save: {}", e))
-        ))?;
-        Ok(())
-    }
-
-    fn load(&self) -> Result<()> {
-        let idx = self.index.lock().unwrap();
-        let path_str = self.path.to_str().unwrap_or("");
-        idx.load(path_str).map_err(|e| rbrain_core::error::BrainError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("usearch load: {}", e))
-        ))?;
-        Ok(())
+    async fn search_sparse(&self, _query: &SparseVec, _k: usize) -> Result<Vec<(i64, f32)>> {
+        // LanceDB Rust SDK 0.17 does not yet expose sparse ANN search.
+        // Return empty — hybrid_search gracefully skips empty lists in RRF.
+        Ok(vec![])
     }
 }
