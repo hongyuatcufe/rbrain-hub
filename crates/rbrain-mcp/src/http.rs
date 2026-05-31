@@ -99,7 +99,7 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let pages = engine.list_pages(None, None).await
+            let pages = engine.list_pages(None, None, None, None, None).await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
             let mut results: Vec<(Page, f32)> = pages.into_iter()
@@ -179,7 +179,7 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let pages = engine.list_pages(None, filter.as_deref()).await
+            let pages = engine.list_pages(None, filter.as_deref(), None, None, None).await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
             let results: Vec<_> = pages.into_iter()
@@ -240,7 +240,7 @@ async fn call_tool(
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
         "brain_stats" => {
-            let pages = engine.list_pages(None, None).await
+            let pages = engine.list_pages(None, None, None, None, None).await
                 .map_err(|e| (-32000, format!("Failed to get stats: {}", e)))?;
 
             let total_pages = pages.len();
@@ -270,7 +270,7 @@ async fn call_tool(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let lang = rbrain_core::page::Language::detect(&topic);
-            engine.think(&topic, &lang, limit, expand).await
+            engine.think(&topic, &lang, limit, expand, None).await
                 .map_err(|e| (-32000, format!("Think failed: {}", e)))
         }
         "brain_add_timeline_entry" => {

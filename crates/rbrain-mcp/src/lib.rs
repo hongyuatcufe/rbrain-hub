@@ -5,7 +5,9 @@ use rmcp::{
 };
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
+use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat, SaveTypeConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct RBrainMcpServer {
@@ -59,6 +61,12 @@ pub struct ListArgs {
     pub page_type: Option<String>,
     /// Filter by tag
     pub tag: Option<String>,
+    /// Filter by language code: "zh-hans", "zh-hant", "en", "ja", "ko"
+    pub language: Option<String>,
+    /// Maximum number of results (default: no limit, clamped to 1–200)
+    pub limit: Option<i64>,
+    /// Sort field: "updated_at" (default), "created_at", or "title"
+    pub sort_by: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -109,6 +117,10 @@ pub struct ThinkArgs {
     pub limit: Option<i32>,
     /// Use LLM query expansion for better recall (default false)
     pub expand: Option<bool>,
+    /// Override the expected JSON/Markdown output schema injected into the prompt via {response_schema}.
+    /// Leave empty to use the prompt file's default structure.
+    /// Example: '{"核心论点":"string","最强反驳":"string","回应策略":"string"}'
+    pub response_schema: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -135,6 +147,44 @@ pub struct TagArgs {
 pub struct OutlinksArgs {
     /// Source page slug — find all pages this page links to
     pub slug: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ProcessArgs {
+    /// Filter for input pages (page_type required)
+    pub page_type: String,
+    /// Optional tag filter
+    pub tag: Option<String>,
+    /// Optional language filter (e.g. "zh-hans")
+    pub language: Option<String>,
+    /// Specific page slugs to process (overrides page_type/tag/language filter)
+    pub slugs: Option<Vec<String>>,
+    /// Max number of pages to process (default: all)
+    pub limit: Option<i32>,
+
+    /// Task prompt — what to do with each page (inline text or "file:<name>" to load from prompts dir)
+    pub task_prompt: String,
+    /// Expected response format: "json" (default) or "markdown"
+    pub response_format: Option<String>,
+    /// JSON schema hint for the LLM (guides output structure and enables retry)
+    pub output_schema: Option<String>,
+
+    /// Output mode: "return" (default), "save", or "update_frontmatter"
+    pub output_mode: Option<String>,
+    /// For "save" mode: page type for output pages
+    pub output_page_type: Option<String>,
+    /// For "save" mode: slug prefix for output pages (e.g. "research/processed/")
+    pub output_slug_prefix: Option<String>,
+    /// For "save" mode: whether to embed output pages
+    pub embed_output: Option<bool>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ProcessResult {
+    pub ok: bool,
+    pub count: usize,
+    pub results: Vec<serde_json::Value>,
+    pub message: String,
 }
 
 // ── Result types ────────────────────────────────────────────────────────────
@@ -173,6 +223,8 @@ pub struct PageSummary {
     pub page_type: String,
     pub language: Option<String>,
     pub updated_at: String,
+    /// First ~160 chars of body content, stripped of markdown formatting
+    pub snippet: String,
 }
 
 /// Wrapper for Vec<PageSummary>
@@ -183,14 +235,17 @@ pub struct PageList {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GenerateArgs {
-    /// Topic to generate a wiki page about
+    /// Topic to generate a page about
     pub topic: String,
     /// Number of context chunks to use (default 8, max 20)
     pub limit: Option<i32>,
-    /// Save the result as a wiki page in the knowledge base (default false)
+    /// Save the result as a page in the knowledge base (default false)
     pub save: Option<bool>,
     /// Use LLM query expansion for better recall (default false)
     pub expand: Option<bool>,
+    /// Prompt template name: loads compose_{template}.md from prompts dir.
+    /// Built-in: "wiki". Custom: "policy_brief", "review_article", "thesis_section", etc.
+    pub template: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -361,18 +416,29 @@ impl RBrainMcpServer {
     /// List pages with optional filters.
     #[tool(
         name = "brain_list",
-        description = "List all pages with optional type or tag filter. Returns summaries without full content."
+        description = "List pages with optional filters. Supports: page_type, tag, language \
+            (zh-hans/zh-hant/en/ja/ko), limit (max 200), sort_by (updated_at/created_at/title). \
+            Returns summaries with 160-char snippet."
     )]
     async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Json<PageList> {
         match self
             .engine
-            .list_pages(args.page_type.as_deref(), args.tag.as_deref())
+            .list_pages(
+                args.page_type.as_deref(),
+                args.tag.as_deref(),
+                args.language.as_deref(),
+                args.limit,
+                args.sort_by.as_deref(),
+            )
             .await
         {
             Ok(pages) => Json(PageList {
                 results: pages
                     .into_iter()
                     .map(|p| PageSummary {
+                        snippet: rbrain_core::markdown::MarkdownParser::extract_snippet(
+                            &p.compiled_truth, 160,
+                        ),
                         slug: p.slug,
                         title: p.title,
                         page_type: p.page_type,
@@ -483,7 +549,7 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.topic);
 
-        match self.engine.generate_wiki(&args.topic, &lang, limit, expand).await {
+        match self.engine.generate_wiki(&args.topic, &lang, limit, expand, args.template.as_deref()).await {
             Ok(wiki) => {
                 let saved_as = if args.save.unwrap_or(false) {
                     let slug = args
@@ -590,7 +656,7 @@ impl RBrainMcpServer {
         let lang = rbrain_core::page::Language::detect(&args.topic);
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
         let expand = args.expand.unwrap_or(false);
-        match self.engine.think(&args.topic, &lang, limit, expand).await {
+        match self.engine.think(&args.topic, &lang, limit, expand, args.response_schema.as_deref()).await {
             Ok(result) => Json(ThinkResult { reasoning: result }),
             Err(e) => Json(ThinkResult { reasoning: format!("Error: {}", e) }),
         }
@@ -673,6 +739,76 @@ impl RBrainMcpServer {
                     .collect(),
             }),
             Err(_) => Json(LinkList { results: vec![] }),
+        }
+    }
+
+    /// Batch LLM processing of knowledge base pages with a custom task prompt.
+    #[tool(
+        name = "brain_process",
+        description = "Batch-process knowledge base pages with a custom LLM task. \
+            Filters pages by type/tag/language/slugs, sends each through the task_prompt, \
+            and returns results or saves them as new pages. \
+            Examples: extract key passages, generate exam questions, annotate themes, \
+            score evidence quality. Requires deepseek.api_key."
+    )]
+    async fn process(&self, Parameters(args): Parameters<ProcessArgs>) -> Json<ProcessResult> {
+        let limit = args.limit.map(|l| l.clamp(1, 500) as usize);
+
+        let prompt = if let Some(name) = args.task_prompt.strip_prefix("file:") {
+            PromptSpec::File(name.to_string())
+        } else {
+            PromptSpec::Inline(args.task_prompt.clone())
+        };
+
+        let response_format = match args.response_format.as_deref().unwrap_or("json") {
+            "markdown" => ResponseFormat::Markdown,
+            _ => ResponseFormat::Json,
+        };
+
+        let output_mode = match args.output_mode.as_deref().unwrap_or("return") {
+            "save" => OutputMode::SaveAs {
+                page_type: args.output_page_type.unwrap_or_else(|| "note".to_string()),
+                slug_prefix: args.output_slug_prefix.unwrap_or_else(|| "processed/".to_string()),
+                embed: args.embed_output.unwrap_or(false),
+            },
+            "update_frontmatter" => OutputMode::UpdateFrontmatter,
+            _ => OutputMode::Return,
+        };
+
+        let step = PipelineStep {
+            id: "brain_process".to_string(),
+            input: InputSpec::SelfContent {
+                page_type: args.page_type,
+                tag: args.tag,
+                language: args.language,
+                slugs: args.slugs,
+            },
+            prompt,
+            output_schema: args.output_schema,
+            response_format,
+            output_mode,
+            incremental: false,
+            batch_size: 1,
+            max_inputs: limit,
+            inject_existing_titles: None,
+        };
+
+        match self.engine.run_pipeline_step(&step).await {
+            Ok(results) => {
+                let count = results.len();
+                Json(ProcessResult {
+                    ok: true,
+                    count,
+                    results,
+                    message: format!("Processed {} page(s)", count),
+                })
+            }
+            Err(e) => Json(ProcessResult {
+                ok: false,
+                count: 0,
+                results: vec![],
+                message: format!("Error: {}", e),
+            }),
         }
     }
 }

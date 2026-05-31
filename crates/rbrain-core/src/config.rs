@@ -23,6 +23,8 @@ pub struct Config {
     pub lance_dir: PathBuf,       // ~/.rbrain/lance
     pub tantivy_dir: PathBuf,     // ~/.rbrain/tantivy
     pub dictionaries_dir: PathBuf,// ~/.rbrain/dictionaries
+    pub prompts_dir: PathBuf,     // ~/.rbrain/prompts  (user prompt overrides)
+    pub profiles_dir: PathBuf,    // ~/.rbrain/profiles (pipeline profiles)
     pub qwen: QwenConfig,
     pub deepseek: DeepSeekConfig,
     pub embedding_dim: usize,     // 1024, locked
@@ -40,6 +42,8 @@ impl Default for Config {
             lance_dir: data_dir.join("lance"),
             tantivy_dir: data_dir.join("tantivy"),
             dictionaries_dir: data_dir.join("dictionaries"),
+            prompts_dir: data_dir.join("prompts"),
+            profiles_dir: data_dir.join("profiles"),
             qwen: QwenConfig::default(),
             deepseek: DeepSeekConfig::default(),
             embedding_dim: 1024,
@@ -114,6 +118,8 @@ impl Config {
                 "lance_dir":       local_dir.join("lance"),
                 "tantivy_dir":     local_dir.join("tantivy"),
                 "dictionaries_dir": local_dir.join("dictionaries"),
+                "prompts_dir":     local_dir.join("prompts"),
+                "profiles_dir":    local_dir.join("profiles"),
             });
 
             fig = fig
@@ -132,6 +138,8 @@ impl Config {
                 "lance_dir":       data_dir.join("lance"),
                 "tantivy_dir":     data_dir.join("tantivy"),
                 "dictionaries_dir": data_dir.join("dictionaries"),
+                "prompts_dir":     data_dir.join("prompts"),
+                "profiles_dir":    data_dir.join("profiles"),
             });
             fig = fig
                 .merge(Serialized::globals(path_overrides))
@@ -170,6 +178,8 @@ impl Config {
             "lance_dir":       data_dir.join("lance"),
             "tantivy_dir":     data_dir.join("tantivy"),
             "dictionaries_dir": data_dir.join("dictionaries"),
+            "prompts_dir":     data_dir.join("prompts"),
+            "profiles_dir":    data_dir.join("profiles"),
         });
 
         Figment::new()

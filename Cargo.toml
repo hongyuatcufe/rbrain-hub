@@ -87,6 +87,7 @@ anyhow = "1"
 
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 
 # Misc
 strsim = "0.11"

@@ -1,0 +1,37 @@
+[profile]
+name = "policy_analysis"
+description = "Policy document analysis: extract verbatim passages, annotate with theme and importance"
+
+[[stages]]
+id = "extract_passages"
+enabled = true
+input_mode = "self"
+page_type  = "note"
+prompt          = "extract_academic"
+response_format = "json"
+output_mode = "save_multi"
+incremental = true
+batch_size  = 1
+
+[stages.type_map.concepts]
+page_type = "concept"
+slug_prefix = "policy/concepts/"
+embed = false
+
+[[stages]]
+id = "synthesize_by_concept"
+enabled = true
+input_mode    = "linked_sources"
+anchor_type   = "concept"
+source_type   = "note"
+min_sources   = 2
+use_chunks    = true
+dedup_sources_threshold = 0.8
+prompt          = "synthesize_academic"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "synthesis"
+output_slug_prefix = "policy/synthesis/"
+embed_output       = true
+incremental = true
+batch_size  = 1

@@ -1,0 +1,64 @@
+[profile]
+name = "literature_review"
+description = "Academic literature review: extract → per-concept synthesis → final composed document"
+
+[[stages]]
+id = "extract"
+enabled = true
+input_mode = "self"
+page_type  = "note"
+prompt          = "extract_academic"
+response_format = "json"
+output_mode = "save_multi"
+incremental = true
+batch_size  = 1
+inject_existing_titles = "concept"
+
+[stages.type_map.concepts]
+page_type = "concept"
+slug_prefix = "research/concepts/"
+embed = false
+enrich_existing = true
+
+[stages.type_map.figures]
+page_type = "figure"
+slug_prefix = "research/figures/"
+embed = false
+
+[stages.type_map.events]
+page_type = "evidence"
+slug_prefix = "research/evidence/"
+embed = false
+
+[[stages]]
+id = "synthesize"
+enabled = true
+input_mode    = "linked_sources"
+anchor_type   = "concept"
+source_type   = "note"
+min_sources   = 2
+use_chunks    = true
+dedup_sources_threshold = 0.8
+prompt          = "synthesize_academic"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "synthesis"
+output_slug_prefix = "research/synthesis/"
+embed_output       = true
+incremental = true
+batch_size  = 1
+
+[[stages]]
+id = "compose"
+enabled = true
+input_mode  = "aggregate"
+page_type   = "synthesis"
+max_pages   = 25
+chars_per_page = 2500
+prompt          = "compose_literature_review"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "wiki"
+output_slug_prefix = "research/wiki/"
+embed_output       = true
+incremental = true

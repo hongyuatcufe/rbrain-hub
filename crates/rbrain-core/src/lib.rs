@@ -5,6 +5,7 @@ pub mod keyword_index;
 pub mod logging;
 pub mod markdown;
 pub mod page;
+pub mod prompt_loader;
 pub mod vector_store;
 
 pub use embedder::Embedder;

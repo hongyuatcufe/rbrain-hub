@@ -52,10 +52,14 @@ enum Commands {
     },
     /// List pages with optional type or tag filter
     List {
-        #[arg(long, help = "Filter by page type (e.g. wiki, note, book)")]
+        #[arg(long, help = "Filter by page type (e.g. wiki, note, concept)")]
         r#type: Option<String>,
         #[arg(long, help = "Filter by tag")]
         tag: Option<String>,
+        #[arg(long, help = "Filter by language (e.g. zh-hans, en)")]
+        language: Option<String>,
+        #[arg(long, help = "Sort by field: updated_at (default), created_at, title")]
+        sort_by: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(short, long, default_value = "50", help = "Max pages to show")]
@@ -290,6 +294,8 @@ enum Commands {
     Dream {
         #[arg(long, help = "Only run a specific stage of the dream cycle (lint, embed, extract, synthesize)")]
         stage: Option<String>,
+        #[arg(long, help = "Run a named pipeline profile from $data_dir/profiles/{name}.toml")]
+        profile: Option<String>,
     },
 }
 
@@ -499,21 +505,28 @@ async fn main() -> anyhow::Result<()> {
             engine.delete_page(&slug).await?;
             println!("Page deleted");
         }
-        Commands::List { r#type, tag, json, limit } => {
+        Commands::List { r#type, tag, language, sort_by, json, limit } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
-            let pages = engine.list_pages(r#type.as_deref(), tag.as_deref()).await?;
-            let total = pages.len();
-            let pages: Vec<_> = pages.into_iter().take(limit).collect();
+            let sql_limit = Some(limit.clamp(1, 200) as i64);
+            let pages = engine.list_pages(
+                r#type.as_deref(),
+                tag.as_deref(),
+                language.as_deref(),
+                sql_limit,
+                sort_by.as_deref(),
+            ).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&pages)?);
             } else {
                 for page in &pages {
-                    println!("{} ({}) - {}", page.slug, page.page_type, page.title);
-                }
-                if total > limit {
-                    println!("  … and {} more (use -l {} to see all)", total - limit, total);
+                    let snippet = rbrain_core::markdown::MarkdownParser::extract_snippet(&page.compiled_truth, 80);
+                    if snippet.is_empty() {
+                        println!("{} ({}) - {}", page.slug, page.page_type, page.title);
+                    } else {
+                        println!("{} ({})\n  {}", page.slug, page.page_type, snippet);
+                    }
                 }
             }
         }
@@ -596,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
                     ));
                 }
             } else if all {
-                let pages = engine.list_pages(None, None).await?;
+                let pages = engine.list_pages(None, None, None, None, None).await?;
                 let pb = indicatif::ProgressBar::new(pages.len() as u64);
                 pb.set_style(
                     indicatif::ProgressStyle::with_template(
@@ -638,7 +651,7 @@ async fn main() -> anyhow::Result<()> {
             let engine = Engine::open(config.clone()).await?;
 
             if all {
-                let pages = engine.list_pages(None, None).await?;
+                let pages = engine.list_pages(None, None, None, None, None).await?;
                 let mut total_links = 0usize;
                 for page in &pages {
                     let full_content = format!("{} {}", page.compiled_truth, page.timeline);
@@ -895,7 +908,7 @@ async fn main() -> anyhow::Result<()> {
             let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Searching for: {}…", topic);
-            let wiki = engine.generate_wiki(&topic, &lang, limit, expand).await
+            let wiki = engine.generate_wiki(&topic, &lang, limit, expand, None).await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             println!("{}", wiki);
@@ -964,7 +977,7 @@ async fn main() -> anyhow::Result<()> {
             let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Thinking about: {}…", topic);
-            let reasoning = engine.think(&topic, &lang, limit, expand).await
+            let reasoning = engine.think(&topic, &lang, limit, expand, None).await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             println!("{}", reasoning);
@@ -1348,10 +1361,43 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Dream { stage } => {
+        Commands::Dream { stage, profile } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            engine.run_dream_cycle(stage.as_deref()).await?;
+
+            if let Some(profile_name) = profile {
+                // Load and run a named pipeline profile (user file or built-in)
+                let profile_cfg = engine.load_profile(&profile_name).map_err(|e| {
+                    anyhow::anyhow!("Failed to load profile '{}': {}", profile_name, e)
+                })?;
+
+                println!("Running profile: {}", profile_cfg.profile.name);
+                for stage_cfg in profile_cfg.stages {
+                    if !stage_cfg.enabled { continue; }
+                    println!("\n[Pipeline] Stage: {}", stage_cfg.id);
+                    let step = stage_cfg.into_step().map_err(|e| {
+                        anyhow::anyhow!("Invalid stage config: {}", e)
+                    })?;
+                    let results = engine.run_pipeline_step(&step).await.map_err(|e| {
+                        anyhow::anyhow!("Stage failed: {}", e)
+                    })?;
+                    println!("  → {} result(s)", results.len());
+                }
+            } else if stage.as_deref() == Some("merge-concepts") {
+                let threshold: f32 = 0.85;
+                println!("Merging similar concepts (cosine threshold={})...", threshold);
+                let records = engine.merge_similar_concepts(threshold).await?;
+                if records.is_empty() {
+                    println!("  No similar concepts found above threshold.");
+                } else {
+                    println!("  Merged {} concept pair(s):", records.len());
+                    for r in &records {
+                        println!("    {} → {} (sim={:.3})", r.dropped, r.kept, r.similarity);
+                    }
+                }
+            } else {
+                engine.run_dream_cycle(stage.as_deref()).await?;
+            }
         }
     }
 

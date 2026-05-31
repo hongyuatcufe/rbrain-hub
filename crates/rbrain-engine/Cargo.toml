@@ -28,6 +28,7 @@ sqlx = { workspace = true }
 regex = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -4,6 +4,7 @@ use rbrain_core::error::{BrainError, Result};
 use rbrain_core::keyword_index::KeywordIndex;
 use rbrain_core::markdown::MarkdownParser;
 use rbrain_core::page::Page;
+use rbrain_core::prompt_loader::PromptLoader;
 use rbrain_core::vector_store::VectorStore;
 use rbrain_llm::{DeepSeekClient, Intent};
 use rbrain_search::chunker::Chunker;
@@ -21,6 +22,7 @@ use strsim::levenshtein;
 use walkdir::WalkDir;
 
 use crate::links::{extract_links, LinkRef};
+use crate::pipeline::clean_json;
 
 #[derive(Clone)]
 pub struct Engine {
@@ -40,7 +42,25 @@ struct EngineInner {
     vector_store: Option<Arc<dyn VectorStore>>,
     keyword_index: Option<Arc<TantivyIndex>>,
     deepseek: Option<Arc<DeepSeekClient>>,
+    prompts: PromptLoader,
 }
+
+fn build_prompt_loader(config: &Config) -> PromptLoader {
+    let mut builtins = std::collections::HashMap::new();
+    builtins.insert("think_cjk",          include_str!("prompts/think_cjk.md"));
+    builtins.insert("think_en",           include_str!("prompts/think_en.md"));
+    builtins.insert("compose_wiki",       include_str!("prompts/compose_wiki.md"));
+    builtins.insert("extract_academic",   include_str!("prompts/extract_academic.md"));
+    builtins.insert("synthesize_academic",   include_str!("prompts/synthesize_academic.md"));
+    builtins.insert("compose_literature_review", include_str!("prompts/compose_literature_review.md"));
+    PromptLoader::new(config.prompts_dir.clone(), builtins)
+}
+
+/// Built-in pipeline profile TOML files, embedded at compile time.
+const BUILTIN_PROFILES: &[(&str, &str)] = &[
+    ("literature_review", include_str!("profiles/literature_review.toml")),
+    ("policy_analysis",   include_str!("profiles/policy_analysis.toml")),
+];
 
 impl Engine {
     /// Open engine without embedding/vector search capabilities
@@ -55,6 +75,7 @@ impl Engine {
         let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
 
         let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);
+        let prompts = build_prompt_loader(&config);
 
         Ok(Self {
             inner: Arc::new(EngineInner {
@@ -64,6 +85,7 @@ impl Engine {
                 vector_store: None,
                 keyword_index: Some(keyword_index),
                 deepseek,
+                prompts,
             }),
         })
     }
@@ -83,6 +105,7 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
+        let prompts = build_prompt_loader(&config);
 
         Ok(Self {
             inner: Arc::new(EngineInner {
@@ -92,6 +115,7 @@ impl Engine {
                 vector_store: Some(vector_store),
                 keyword_index: Some(keyword_index),
                 deepseek,
+                prompts,
             }),
         })
     }
@@ -518,38 +542,52 @@ impl Engine {
         &self,
         page_type: Option<&str>,
         tag: Option<&str>,
+        language: Option<&str>,
+        limit: Option<i64>,
+        sort_by: Option<&str>,
     ) -> Result<Vec<Page>> {
-        const BASE: &str = "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at FROM pages";
+        const BASE: &str = "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, \
+            timeline, language, content_hash, created_at, updated_at FROM pages";
 
-        let rows = match (page_type, tag) {
-            (Some(pt), Some(tg)) => {
-                let tag_pattern = format!("%{}%", tg);
-                sqlx::query(&format!("{} WHERE page_type = ?1 AND tags LIKE ?2 ORDER BY updated_at DESC", BASE))
-                    .bind(pt)
-                    .bind(tag_pattern)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (Some(pt), None) => {
-                sqlx::query(&format!("{} WHERE page_type = ?1 ORDER BY updated_at DESC", BASE))
-                    .bind(pt)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (None, Some(tg)) => {
-                let tag_pattern = format!("%{}%", tg);
-                sqlx::query(&format!("{} WHERE tags LIKE ?1 ORDER BY updated_at DESC", BASE))
-                    .bind(tag_pattern)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (None, None) => {
-                sqlx::query(&format!("{} ORDER BY updated_at DESC", BASE))
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
+        let mut conditions: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+
+        if let Some(pt) = page_type {
+            conditions.push(format!("page_type = ?{}", binds.len() + 1));
+            binds.push(pt.to_string());
         }
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(tg) = tag {
+            conditions.push(format!("tags LIKE ?{}", binds.len() + 1));
+            binds.push(format!("%{}%", tg));
+        }
+        if let Some(lang) = language {
+            conditions.push(format!("language = ?{}", binds.len() + 1));
+            binds.push(lang.to_string());
+        }
+
+        let order = match sort_by.unwrap_or("updated_at") {
+            "created_at" => "created_at DESC",
+            "title" => "title ASC",
+            _ => "updated_at DESC",
+        };
+        let limit_clause = limit
+            .map(|l| format!(" LIMIT {}", l.clamp(1, 200)))
+            .unwrap_or_default();
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!("{}{} ORDER BY {}{}", BASE, where_clause, order, limit_clause);
+
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b.as_str());
+        }
+        let rows = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages = Vec::new();
         for row in rows {
@@ -1825,6 +1863,7 @@ impl Engine {
         lang: &rbrain_core::page::Language,
         limit: usize,
         expand: bool,
+        response_schema: Option<&str>,
     ) -> Result<String> {
         let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
             BrainError::ApiUnreachable {
@@ -1857,43 +1896,27 @@ impl Engine {
         let context = context_parts.join("\n\n---\n\n");
 
         let (system, user) = if is_cjk {
-            let sys = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
-                1. 梳理材料中的核心观点与论据\
-                2. 指出材料间的张力、矛盾或空白\
-                3. 形成有依据的工作判断（注明不确定之处）\
-                4. 列出尚待回答的开放性问题\
-                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\n\
-                引用规则：\
-                - 引用材料时用 [[slug | chunk:N]] 格式，slug 和 chunk 编号来自材料头部标注，每个核心论断至少注明一处。\
-                - 若材料标注「类型: synthesis」或「类型: wiki」，这是对原始文献的综合，非一手来源。\
-                  其「本段所引原始文献」块列出了原始作者和论文，请将论点归因于该块中列出的原始作者\
-                  （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
-                  引用该原始文献的 slug，而非引用综述页面。综述仅作为发现线索，学术归因须落到原始来源。\
-                - 标注「类型: note」的材料或 raw/ 开头的 slug 可直接引用。";
+            let raw = self.inner.prompts.load("think_cjk");
+            let sys = if let Some(schema) = response_schema {
+                PromptLoader::render(&raw, &std::collections::HashMap::from([("response_schema", schema)]))
+            } else {
+                raw
+            };
             let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
             (sys, usr)
         } else {
-            let sys = "You are a rigorous academic researcher. Based on the provided source materials, \
-                reason deeply about the given question:\
-                1. Identify the core claims and arguments in the materials\
-                2. Note tensions, contradictions, or gaps between sources\
-                3. Form a working judgment (flagging uncertainty where it exists)\
-                4. List open questions that remain unanswered\
-                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\n\
-                Citation rules:\
-                - Cite sources using [[slug | chunk:N]] format (slug and chunk number from the source header). Each key claim must cite at least one source.\
-                - If a source is marked \"type: synthesis\" or \"type: wiki\", it is a secondary source summarising primary literature. \
-                  Its \"[Original sources]\" block lists the original authors and articles. \
-                  Attribute ideas to the authors listed in that block \
-                  (format: Author (year) argues... [[raw/articles/slug | chunk:N]]) \
-                  and cite the original source slugs, not the synthesis page. \
-                  The synthesis is a finding aid, not a citable primary source.\
-                - Sources marked \"type: note\" or raw/ slugs can be cited directly.";
+            let raw = self.inner.prompts.load("think_en");
+            let sys = if let Some(schema) = response_schema {
+                PromptLoader::render(&raw, &std::collections::HashMap::from([("response_schema", schema)]))
+            } else {
+                raw
+            };
             let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
             (sys, usr)
         };
 
-        deepseek.chat(system, &user).await
+        deepseek.chat(&system, &user).await
+            .map(|s| MarkdownParser::normalize_llm_output(&s))
     }
 
     pub async fn graph_query(
@@ -2186,12 +2209,15 @@ impl Engine {
 
     /// Search for context chunks and synthesise a wiki page with the DeepSeek LLM.
     /// Returns the generated Markdown string.
+    /// `template` selects the prompt: loads `compose_{template}.md` (user file or builtin fallback).
+    /// Defaults to "wiki" → `compose_wiki.md`.
     pub async fn generate_wiki(
         &self,
         topic: &str,
         lang: &rbrain_core::page::Language,
         limit: usize,
         expand: bool,
+        template: Option<&str>,
     ) -> Result<String> {
         let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
             BrainError::ApiUnreachable {
@@ -2221,22 +2247,15 @@ impl Engine {
         }
         let context = context_parts.join("\n\n---\n\n");
 
-        let system = "你是知识库编辑。根据提供的原文材料，生成一篇简洁的Markdown wiki页面。\
-            要求：包含一级标题、2-4个核心观点（用##小节）、简短结语。\
-            严格基于原文，不添加原文没有的内容。输出简体中文。\
-            引用原文时，用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号均来自原文材料头部的标注）。每个核心观点至少标注一处来源。\
-            注意：\
-            - 若材料标注「类型: synthesis」或「类型: wiki」，表示这是对原始文献的综合，\
-              其「本段所引原始文献」块列出了原始作者和论文。\
-              请将论点归因于该块中列出的原始作者\
-              （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
-              引用该原始文献的 slug，而非仅引用综述页面。综述页面仅作为发现线索，学术归因应落到原始来源。\
-            - 若材料标注「类型: note」或来自 raw/ 路径，直接引用即可。";
+        let prompt_name = format!("compose_{}", template.unwrap_or("wiki"));
+        let system = self.inner.prompts.try_load(&prompt_name)
+            .map_err(|e| BrainError::Conflict(e))?;
         let user = format!(
-            "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。"
+            "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成页面。"
         );
 
-        deepseek.chat(system, &user).await
+        deepseek.chat(&system, &user).await
+            .map(|s| MarkdownParser::normalize_llm_output(&s))
     }
 
     /// Add a tag to a page (no-op if already present).
@@ -2385,7 +2404,7 @@ impl Engine {
     /// Export all pages to a directory as .md files (json=true → .json files).
     pub async fn export_pages(&self, dir: &std::path::Path, json: bool) -> Result<usize> {
         std::fs::create_dir_all(dir)?;
-        let pages = self.list_pages(None, None).await?;
+        let pages = self.list_pages(None, None, None, None, None).await?;
         let count = pages.len();
         for page in &pages {
             if json {
@@ -2430,6 +2449,653 @@ impl Engine {
 
     pub fn get_config(&self) -> &Config {
         &self.inner.config
+    }
+
+    /// Load a pipeline profile by name.
+    /// Checks `$profiles_dir/{name}.toml` first, falls back to built-in profiles.
+    pub fn load_profile(&self, name: &str) -> Result<crate::pipeline::PipelineProfile> {
+        let path = self.inner.config.profiles_dir.join(format!("{name}.toml"));
+        let toml_str = if path.exists() {
+            std::fs::read_to_string(&path)
+                .map_err(|e| BrainError::Io(e))?
+        } else {
+            BUILTIN_PROFILES
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+                .ok_or_else(|| BrainError::Conflict(format!("profile '{name}' not found")))?
+        };
+        toml::from_str::<crate::pipeline::PipelineProfile>(&toml_str)
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
+    }
+
+    /// List available built-in profile names.
+    pub fn builtin_profile_names() -> Vec<&'static str> {
+        BUILTIN_PROFILES.iter().map(|(k, _)| *k).collect()
+    }
+
+    /// Execute a generic pipeline step against the knowledge base.
+    ///
+    /// Supports:
+    ///   - `InputSpec::SelfContent` with `OutputMode::Return`, `SaveAs`, `UpdateFrontmatter`
+    ///   - `InputSpec::LinkedSources` with `OutputMode::SaveAs` (Markdown, e.g. synthesize)
+    ///   - `ResponseFormat::Json` (with RetryParser) and `ResponseFormat::Markdown`
+    ///
+    /// Returns a list of JSON values — the raw LLM results for `OutputMode::Return`,
+    /// or `[{"slug": "..."}]` records for write modes.
+    pub async fn run_pipeline_step(
+        &self,
+        step: &crate::pipeline::PipelineStep,
+    ) -> Result<Vec<serde_json::Value>> {
+        use crate::pipeline::{InputSpec, OutputMode, PromptSpec, ResponseFormat, RetryParser};
+
+        let deepseek = match &self.inner.deepseek {
+            Some(c) => c.clone(),
+            None => return Err(BrainError::Conflict("no DeepSeek client configured".into())),
+        };
+
+        // ── Load system prompt (needed early for AggregateContent early return) ─
+        let system_prompt = match &step.prompt {
+            PromptSpec::File(name) => self.inner.prompts.try_load(name)
+                .map_err(|e| BrainError::Conflict(e))?,
+            PromptSpec::Inline(text) => text.clone(),
+        };
+
+        // ── 1. Fetch input pages ───────────────────────────────────────────────
+        let input_pages: Vec<Page> = match &step.input {
+            InputSpec::SelfContent { page_type, tag, language, slugs } => {
+                if let Some(specific) = slugs {
+                    let mut pages = Vec::new();
+                    for s in specific {
+                        if let Ok(p) = self.get_page(s).await { pages.push(p); }
+                    }
+                    pages
+                } else {
+                    self.list_pages(
+                        Some(page_type.as_str()),
+                        tag.as_deref(),
+                        language.as_deref(),
+                        step.max_inputs.map(|n| n as i64),
+                        None,
+                    ).await?
+                }
+            }
+            InputSpec::LinkedSources { anchor_page_type, .. } => {
+                // For LinkedSources, anchor pages drive the loop — fetch them here.
+                self.list_pages(Some(anchor_page_type.as_str()), None, None, None, None).await?
+            }
+            InputSpec::AggregateContent { page_type, tag, max_pages, chars_per_page } => {
+                // AggregateContent is handled as a single synthetic "page" carrying all content.
+                // We build the combined context here and return a single placeholder entry.
+                // Fetch without SQL LIMIT to avoid the internal clamp(1,200) cap;
+                // sort and truncate in Rust so we always get the most-recently-updated pages.
+                let mut pages = self.list_pages(
+                    Some(page_type.as_str()),
+                    tag.as_deref(),
+                    None,
+                    None,
+                    None,
+                ).await?;
+                pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                pages.truncate(*max_pages);
+
+                if pages.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                let combined = pages.iter().enumerate().map(|(i, p)| {
+                    let body: String = p.compiled_truth.chars().take(*chars_per_page).collect();
+                    format!("## [{}/{}] {}\nSlug: {}\n\n{}", i + 1, pages.len(), p.title, p.slug, body)
+                }).collect::<Vec<_>>().join("\n\n---\n\n");
+
+                println!("  [{}] Aggregating {} {} page(s) into single compose call...",
+                    step.id, pages.len(), page_type);
+
+                // Build a synthetic placeholder page to carry the combined context through the loop
+                let mut synthetic = Page::new(
+                    format!("__aggregate__{}", page_type),
+                    page_type.clone(),
+                    combined,
+                );
+                synthetic.title = format!("Aggregated {} pages", pages.len());
+                return self.run_aggregate_step(step, synthetic, &system_prompt, &deepseek).await;
+            }
+        };
+
+        if input_pages.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // ── 2. Incremental filter for SelfContent + SaveAs / UpdateFrontmatter ─
+        // (LinkedSources staleness is handled per-anchor in the loop below)
+        let pages_to_process: Vec<Page> = if step.incremental {
+            match &step.output_mode {
+                OutputMode::SaveAs { page_type, slug_prefix, .. } => {
+                    input_pages.into_iter().filter(|p| {
+                        let out_slug = format!("{}{}", slug_prefix,
+                            p.slug.split('/').last().unwrap_or(&p.slug));
+                        // Skip if output page already exists and is newer than input
+                        self.get_page_updated_at_blocking(&out_slug)
+                            .map(|out_updated| p.updated_at > out_updated)
+                            .unwrap_or(true)
+                    }).collect()
+                }
+                OutputMode::SaveMulti { .. } => {
+                    // For SaveMulti incremental: a source page is considered "done" if it
+                    // already has any outgoing "mentions" links (created during SaveMulti).
+                    let db = self.inner.db.clone();
+                    input_pages.into_iter().filter(|p| {
+                        let slug = p.slug.clone();
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                sqlx::query_scalar::<_, i64>(
+                                    "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND edge_type = 'mentions'"
+                                )
+                                .bind(&slug)
+                                .fetch_one(&db)
+                                .await
+                                .unwrap_or(0)
+                            })
+                        }) == 0  // only process pages with no existing mentions links
+                    }).collect()
+                }
+                _ => input_pages,
+            }
+        } else {
+            input_pages
+        };
+
+        let retry_parser = RetryParser { max_retries: 2 };
+        let mut all_results: Vec<serde_json::Value> = Vec::new();
+
+        // ── 3b. Pre-fetch known titles for context injection ───────────────────
+        // When inject_existing_titles is set, we build a list of existing page titles
+        // of that type and inject it into each LLM prompt. This prevents the LLM from
+        // creating synonym variants of concepts that already exist.
+        let known_titles_block: Option<String> = if let Some(ref type_name) = step.inject_existing_titles {
+            let titles: Vec<String> = sqlx::query_scalar(
+                "SELECT title FROM pages WHERE page_type = ?1 AND title != '' ORDER BY title"
+            )
+            .bind(type_name.as_str())
+            .fetch_all(&self.inner.db)
+            .await
+            .unwrap_or_default();
+            if titles.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "\n\nAlready-known {} names (if you extract something semantically equivalent, use the EXACT existing name — do NOT create a variant):\n{}",
+                    type_name,
+                    titles.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+                ))
+            }
+        } else {
+            None
+        };
+
+        // ── 3c. Dedup LinkedSources anchors by source-set Jaccard similarity ───
+        // When two anchors share ≥ dedup_sources_threshold of their source articles,
+        // the one with fewer sources is skipped to avoid near-identical synthesis pages.
+        let pages_to_process: Vec<Page> = if let InputSpec::LinkedSources {
+            source_page_type,
+            dedup_sources_threshold,
+            ..
+        } = &step.input {
+            if *dedup_sources_threshold > 0.0 {
+                let threshold = *dedup_sources_threshold;
+                // Build source sets for every anchor
+                let mut anchor_sources: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
+                for page in &pages_to_process {
+                    let srcs: std::collections::HashSet<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT l.source_slug FROM links l
+                         JOIN pages p ON p.slug = l.source_slug
+                         WHERE l.target_slug = ?1 AND p.page_type = ?2"
+                    )
+                    .bind(&page.slug)
+                    .bind(source_page_type.as_str())
+                    .fetch_all(&self.inner.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                    anchor_sources.push((page.slug.clone(), srcs));
+                }
+
+                // Mark the anchor with fewer sources in each near-duplicate pair
+                let mut skip: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for i in 0..anchor_sources.len() {
+                    if skip.contains(&anchor_sources[i].0) { continue; }
+                    for j in (i + 1)..anchor_sources.len() {
+                        if skip.contains(&anchor_sources[j].0) { continue; }
+                        let a = &anchor_sources[i].1;
+                        let b = &anchor_sources[j].1;
+                        let intersection = a.intersection(b).count();
+                        let union = a.len() + b.len() - intersection;
+                        if union == 0 { continue; }
+                        let jaccard = intersection as f32 / union as f32;
+                        if jaccard >= threshold {
+                            // Skip the anchor with fewer sources; on tie, skip the later one
+                            if a.len() >= b.len() {
+                                skip.insert(anchor_sources[j].0.clone());
+                                                println!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[j].0, jaccard, anchor_sources[i].0);
+                            } else {
+                                skip.insert(anchor_sources[i].0.clone());
+                                println!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[i].0, jaccard, anchor_sources[j].0);
+                                break; // i is now skipped, move to next i
+                            }
+                        }
+                    }
+                }
+                pages_to_process.into_iter().filter(|p| !skip.contains(&p.slug)).collect()
+            } else {
+                pages_to_process
+            }
+        } else {
+            pages_to_process
+        };
+
+        // ── 4. Process each page (or anchor for LinkedSources) ─────────────────
+        let total_pages = pages_to_process.len();
+        if total_pages == 0 {
+            println!("  [{}] No pages to process (all up-to-date).", step.id);
+            return Ok(all_results);
+        }
+        println!("  [{}] Processing {} page(s)...", step.id, total_pages);
+
+        for (page_idx, page) in pages_to_process.iter().enumerate() {
+            println!("  [{}/{}] {} '{}'",
+                page_idx + 1, total_pages, step.id, page.slug);
+            // Build user context
+            let user_context = match &step.input {
+                InputSpec::SelfContent { .. } => {
+                    let base = format!("Slug: {}\nType: {}\nTitle: {}\n\n{}",
+                        page.slug, page.page_type, page.title, page.compiled_truth);
+                    if let Some(ref block) = known_titles_block {
+                        format!("{}{}", base, block)
+                    } else {
+                        base
+                    }
+                }
+                InputSpec::LinkedSources { source_page_type, min_sources, use_chunks, .. } => {
+                    // Gather source pages linked to this anchor
+                    let source_slugs: Vec<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT l.source_slug FROM links l
+                         JOIN pages p ON p.slug = l.source_slug
+                         WHERE l.target_slug = ?1 AND p.page_type = ?2"
+                    )
+                    .bind(&page.slug)
+                    .bind(source_page_type.as_str())
+                    .fetch_all(&self.inner.db)
+                    .await
+                    .unwrap_or_default();
+
+                    if source_slugs.len() < *min_sources {
+                        println!("    → skip: only {}/{} source(s) required",
+                            source_slugs.len(), min_sources);
+                        continue; // not enough sources — skip this anchor
+                    }
+
+                    // Incremental staleness check for LinkedSources
+                    if step.incremental {
+                        if let OutputMode::SaveAs { slug_prefix, .. } = &step.output_mode {
+                            let out_slug = format!("{}{}", slug_prefix,
+                                page.slug.split('/').last().unwrap_or(&page.slug));
+                            if let Some(out_updated) = self.get_page_updated_at_blocking(&out_slug) {
+                                let any_newer = source_slugs.iter().any(|s| {
+                                    self.get_page_updated_at_blocking(s)
+                                        .map(|t| t > out_updated)
+                                        .unwrap_or(false)
+                                });
+                                if !any_newer {
+                                    println!("    → skip: synthesis up-to-date");
+                                    continue; // up to date
+                                }
+                            }
+                        }
+                    }
+                    println!("    → synthesizing from {} source(s)...", source_slugs.len());
+
+                    // Build context from source pages
+                    let mut context_items = Vec::new();
+                    for s in &source_slugs {
+                        if let Ok(src) = self.get_page(s).await {
+                            if *use_chunks {
+                                let db_chunks: Vec<(i64, String)> = sqlx::query(
+                                    "SELECT id, text FROM chunks WHERE page_slug = ?1
+                                     AND is_compiled_truth = 1 ORDER BY chunk_idx"
+                                )
+                                .bind(s)
+                                .fetch_all(&self.inner.db)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("text")))
+                                .collect();
+
+                                if db_chunks.is_empty() {
+                                    let snippet: String = src.compiled_truth.chars().take(800).collect();
+                                    context_items.push(format!("Source: {} | {}\n{}",
+                                        src.slug, src.title, snippet));
+                                } else {
+                                    let slug = &src.slug;
+                                    let chunks_text = db_chunks.iter()
+                                        .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    context_items.push(format!("Source: {} | {}\n{}",
+                                        src.slug, src.title, chunks_text));
+                                }
+                            } else {
+                                let snippet: String = src.compiled_truth.chars().take(800).collect();
+                                context_items.push(format!("Source: {} | {}\n{}",
+                                    src.slug, src.title, snippet));
+                            }
+                        }
+                    }
+                    let anchor_desc: String = page.compiled_truth.chars().take(500).collect();
+                    format!("Anchor: {} ({})\nDescription: {}\n\nSources:\n\n{}",
+                        page.title, page.slug, anchor_desc,
+                        context_items.join("\n\n---\n\n"))
+                }
+                // AggregateContent never reaches this loop — it returns early via run_aggregate_step.
+                InputSpec::AggregateContent { .. } => unreachable!("AggregateContent is handled before the page loop"),
+            };
+
+            // Build the full user message — inject output_schema if present
+            let user_msg = if let Some(schema) = &step.output_schema {
+                format!("{}\n\nOutput schema:\n{}", user_context, schema)
+            } else {
+                user_context
+            };
+
+            // ── 5. LLM call ────────────────────────────────────────────────────
+            println!("    → calling LLM (prompt: {})...",
+                match &step.prompt { PromptSpec::File(n) => n.as_str(), PromptSpec::Inline(_) => "<inline>" });
+            let response = match deepseek.chat(&system_prompt, &user_msg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("    WARN: LLM call failed for {}: {}", page.slug, e);
+                    continue;
+                }
+            };
+
+            // ── 6. Parse response ───────────────────────────────────────────────
+            let parsed_items: Vec<serde_json::Value> = match step.response_format {
+                ResponseFormat::Json => {
+                    let schema_hint = step.output_schema.as_deref();
+                    let ds_clone = deepseek.clone();
+                    let sys_clone = system_prompt.clone();
+                    match retry_parser.parse_with_retry::<Vec<serde_json::Value>, _, _>(
+                        &response,
+                        schema_hint,
+                        |fix_prompt| {
+                            let client = ds_clone.clone();
+                            let sys = sys_clone.clone();
+                            async move { client.chat(&sys, &fix_prompt).await.map_err(|e| BrainError::Io(
+                                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                            ))}
+                        },
+                    ).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // Try as single object
+                            let cleaned = clean_json(&response);
+                            match serde_json::from_str::<serde_json::Value>(cleaned) {
+                                Ok(v) => vec![v],
+                                Err(e) => {
+                                    eprintln!("  [pipeline] WARN: JSON parse failed for {}: {}", page.slug, e);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                ResponseFormat::Markdown => {
+                    let normalized = MarkdownParser::normalize_llm_output(&response);
+                    vec![serde_json::json!({"content": normalized, "slug": page.slug})]
+                }
+            };
+
+            // ── 7. Apply output mode ────────────────────────────────────────────
+            match &step.output_mode {
+                OutputMode::Return => {
+                    all_results.extend(parsed_items);
+                }
+
+                OutputMode::SaveAs { page_type, slug_prefix, embed } => {
+                    for item in &parsed_items {
+                        let content = item.get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let suffix = page.slug.split('/').last().unwrap_or(&page.slug);
+                        let out_slug = format!("{}{}", slug_prefix, suffix);
+                        let mut out_page = Page::new(out_slug.clone(), page_type.clone(), content);
+                        out_page.language = Some(rbrain_core::page::Language::detect(&out_page.compiled_truth));
+                        self.put_page(out_page.clone()).await?;
+                        if *embed && self.has_embedder() {
+                            println!("    → embedding {}...", out_slug);
+                            if let Err(e) = self.chunk_and_embed_page(&out_page).await {
+                                eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
+                            }
+                        }
+                        println!("    → saved: {}", out_slug);
+                        all_results.push(serde_json::json!({"slug": out_slug, "action": "saved"}));
+                    }
+                }
+
+                OutputMode::UpdateFrontmatter => {
+                    for item in &parsed_items {
+                        if let Some(obj) = item.as_object() {
+                            if let Ok(mut p) = self.get_page(&page.slug).await {
+                                // Coerce non-object frontmatter to {} before merging
+                                if !p.frontmatter.is_object() {
+                                    p.frontmatter = serde_json::Value::Object(serde_json::Map::new());
+                                }
+                                if let Some(fm) = p.frontmatter.as_object_mut() {
+                                    for (k, v) in obj {
+                                        fm.insert(k.clone(), v.clone());
+                                    }
+                                    self.put_page(p).await?;
+                                    all_results.push(serde_json::json!({"slug": page.slug, "action": "frontmatter_updated"}));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                OutputMode::SaveMulti { type_map } => {
+                    // Track slugs used in this batch to avoid silent overwrites
+                    let mut used_slugs: HashSet<String> = HashSet::new();
+                    let mut created_count = 0usize;
+                    let mut enriched_count = 0usize;
+                    for item in &parsed_items {
+                        for (key, cfg) in type_map {
+                            if let Some(arr) = item.get(key).and_then(|v| v.as_array()) {
+                                for entry in arr {
+                                    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                                    if name.trim().is_empty() {
+                                        continue;
+                                    }
+                                    let content = entry.get("description")
+                                        .or_else(|| entry.get("content"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let base_slug = format!("{}{}", cfg.slug_prefix, slugify(name));
+                                    // Deduplicate within this run using a counter suffix
+                                    let out_slug = if used_slugs.contains(&base_slug) {
+                                        let mut i = 2usize;
+                                        loop {
+                                            let candidate = format!("{}-{}", base_slug, i);
+                                            if !used_slugs.contains(&candidate) {
+                                                break candidate;
+                                            }
+                                            i += 1;
+                                        }
+                                    } else {
+                                        base_slug.clone()
+                                    };
+                                    used_slugs.insert(out_slug.clone());
+
+                                    // enrich_existing: append new perspective to existing page
+                                    // instead of overwriting (prevents losing earlier descriptions).
+                                    let already_exists = sqlx::query_scalar::<_, i64>(
+                                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
+                                    )
+                                    .bind(&out_slug)
+                                    .fetch_one(&self.inner.db)
+                                    .await
+                                    .unwrap_or(0) > 0;
+
+                                    // Track whether content was actually appended this call.
+                                    let mut did_enrich = false;
+                                    if cfg.enrich_existing && already_exists && !content.trim().is_empty() {
+                                        // Idempotency: only enrich if this source hasn't linked to
+                                        // this concept before (prevents duplicate appends on re-run).
+                                        let already_linked = sqlx::query_scalar::<_, i64>(
+                                            "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = 'mentions'"
+                                        )
+                                        .bind(&page.slug)
+                                        .bind(&out_slug)
+                                        .fetch_one(&self.inner.db)
+                                        .await
+                                        .unwrap_or(0) > 0;
+
+                                        if !already_linked {
+                                            if let Ok(mut existing) = self.get_page(&out_slug).await {
+                                                let append = format!(
+                                                    "\n\n---\n\n*来源：{}*\n\n{}",
+                                                    page.slug,
+                                                    content.trim()
+                                                );
+                                                existing.compiled_truth.push_str(&append);
+                                                self.put_page(existing).await?;
+                                                enriched_count += 1;
+                                                did_enrich = true;
+                                            }
+                                        }
+                                    } else {
+                                        let mut out_page = Page::new(out_slug.clone(), cfg.page_type.clone(), content);
+                                        out_page.title = name.to_string();
+                                        self.put_page(out_page.clone()).await?;
+                                        if cfg.embed && self.has_embedder() {
+                                            if let Err(e) = self.chunk_and_embed_page(&out_page).await {
+                                                eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
+                                            }
+                                        }
+                                        created_count += 1;
+                                    }
+
+                                    // Link source page → extracted entity so LinkedSources can find it
+                                    if let Err(e) = self.add_link(
+                                        &page.slug, &out_slug, "mentions", None, None
+                                    ).await {
+                                        eprintln!("    WARN: link creation failed {}->{}: {}", page.slug, out_slug, e);
+                                    }
+                                    let action = if did_enrich {
+                                        "enriched"
+                                    } else if already_exists && cfg.enrich_existing {
+                                        "skipped" // already enriched by this source in a prior run
+                                    } else {
+                                        "saved"
+                                    };
+                                    all_results.push(serde_json::json!({
+                                        "slug": out_slug,
+                                        "action": action,
+                                        "type": cfg.page_type
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    println!("    → extracted: {} new, {} enriched", created_count, enriched_count);
+                }
+            }
+        }
+
+        Ok(all_results)
+    }
+
+    /// Execute a single aggregate LLM call: combined context → one output page.
+    /// Used by AggregateContent input mode (COMPOSE stage).
+    async fn run_aggregate_step(
+        &self,
+        step: &crate::pipeline::PipelineStep,
+        synthetic_page: Page,
+        system_prompt: &str,
+        deepseek: &rbrain_llm::DeepSeekClient,
+    ) -> Result<Vec<serde_json::Value>> {
+        use crate::pipeline::{OutputMode, PromptSpec, ResponseFormat};
+
+        let user_msg = format!("Topic: {}\n\n{}", synthetic_page.title, synthetic_page.compiled_truth);
+        println!("    → calling LLM (prompt: {})...",
+            match &step.prompt { PromptSpec::File(n) => n.as_str(), PromptSpec::Inline(_) => "<inline>" });
+
+        let response = match deepseek.chat(system_prompt, &user_msg).await {
+            Ok(r) => r,
+            Err(e) => return Err(BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+        };
+
+        let content = match step.response_format {
+            ResponseFormat::Markdown => {
+                rbrain_core::markdown::MarkdownParser::normalize_llm_output(&response)
+            }
+            ResponseFormat::Json => {
+                let cleaned = crate::pipeline::clean_json(&response);
+                cleaned.to_string()
+            }
+        };
+
+        let mut results = vec![];
+        match &step.output_mode {
+            OutputMode::SaveAs { page_type, slug_prefix, embed } => {
+                let out_slug = format!("{}compose", slug_prefix);
+                let mut out_page = Page::new(out_slug.clone(), page_type.clone(), content);
+                out_page.language = Some(rbrain_core::page::Language::detect(&out_page.compiled_truth));
+                self.put_page(out_page.clone()).await?;
+                if *embed && self.has_embedder() {
+                    println!("    → embedding {}...", out_slug);
+                    if let Err(e) = self.chunk_and_embed_page(&out_page).await {
+                        eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
+                    }
+                }
+                println!("    → saved: {}", out_slug);
+                results.push(serde_json::json!({"slug": out_slug, "action": "saved"}));
+            }
+            OutputMode::Return => {
+                results.push(serde_json::json!({"content": content}));
+            }
+            other => {
+                return Err(BrainError::Conflict(format!(
+                    "AggregateContent stage '{}' uses unsupported output_mode '{:?}'; only 'save' and 'return' are supported",
+                    step.id, other
+                )));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Blocking helper: get a page's updated_at without async (used in filter closures).
+    fn get_page_updated_at_blocking(&self, slug: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        // We use tokio's block_in_place to query synchronously inside an async context.
+        // This is only safe if we're on a multi-thread runtime (which tokio defaults to).
+        let db = self.inner.db.clone();
+        let slug = slug.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    "SELECT updated_at FROM pages WHERE slug = ?1"
+                )
+                .bind(&slug)
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten()
+            })
+        })
     }
 
     pub async fn run_dream_cycle(&self, stage: Option<&str>) -> Result<()> {
@@ -2543,27 +3209,7 @@ impl Engine {
             println!("  Extracting from page: {}", slug);
             
             let knowledge = if let Some(client) = deepseek {
-                let system = "You are a knowledge extractor. Extract key concepts, scholars/figures (people), and timeline events from the provided academic text.\n\
-                              Rules:\n\
-                              - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
-                              - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
-                              - For concept names: use the shortest canonical form as it appears in the source (e.g., \"知识体系\" not \"某领域的知识体系构建研究\"). Do not add qualifiers unless they are part of the established term. If you see an \"Already-known concepts\" list in the user message, match against it first — prefer the exact existing name over a new variant.\n\
-                              - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY) only when the source explicitly gives a date; omit an event if its date is unknown. Never infer the current date.\n\
-                              - For events: exclude document metadata such as received/revised/accepted/publication dates, journal issue publication, acknowledgements, funding or project approval records, and the publication of this source article itself.\n\
-                              - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
-                              - Only extract entities with substantive presence in the text (not passing mentions).\n\
-                              Your response must be a raw JSON object (no markdown fences) conforming exactly to:\n\
-                              {\n\
-                                \"concepts\": [\n\
-                                  { \"name\": \"Concept Name\", \"description\": \"Definition or role as used in source: <slug>\", \"context\": \"Relevant text snippet\" }\n\
-                                ],\n\
-                                \"figures\": [\n\
-                                  { \"name\": \"Full Name\", \"description\": \"Institution/role/field — do NOT say 本文作者\", \"context\": \"Relevant text snippet\" }\n\
-                                ],\n\
-                                \"events\": [\n\
-                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Event description\", \"context\": \"Relevant text snippet\", \"figure_slug\": \"research/figures/姓名 or empty\" }\n\
-                                ]\n\
-                              }";
+                let system = self.inner.prompts.load("extract_academic");
 
                 // Fetch existing concept titles so LLM can normalize to known names
                 let existing_concepts: Vec<String> = sqlx::query_scalar(
@@ -2583,7 +3229,7 @@ impl Engine {
                     )
                 };
                 let user = format!("Source slug: {}\nTitle: {}\nType: {}{}\n\nContent:\n{}", slug, display_title, page_type, known_concepts_block, compiled_truth);
-                match client.chat(system, &user).await {
+                match client.chat(&system, &user).await {
                     Ok(resp) => {
                         let cleaned = clean_json(&resp);
                         match serde_json::from_str::<ExtractedKnowledge>(cleaned) {
@@ -2630,7 +3276,8 @@ impl Engine {
                     .unwrap_or(0) > 0;
                     
                 if !exists {
-                    let mut cp = Page::new(concept_slug.clone(), "concept".to_string(), concept.description.clone());
+                    let desc = MarkdownParser::normalize_llm_output(&concept.description);
+                    let mut cp = Page::new(concept_slug.clone(), "concept".to_string(), desc);
                     cp.title = concept.name.clone();
                     cp.language = Some(rbrain_core::page::Language::detect(&concept.description));
                     self.put_page(cp).await?;
@@ -2670,9 +3317,10 @@ impl Engine {
                     .unwrap_or(0) > 0;
                     
                 if !exists {
-                    let mut fp = Page::new(figure_slug.clone(), "figure".to_string(), figure.description.clone());
+                    let fig_desc = MarkdownParser::normalize_llm_output(&figure.description);
+                    let mut fp = Page::new(figure_slug.clone(), "figure".to_string(), fig_desc.clone());
                     fp.title = figure.name.clone();
-                    fp.language = Some(rbrain_core::page::Language::detect(&figure.description));
+                    fp.language = Some(rbrain_core::page::Language::detect(&fig_desc));
                     self.put_page(fp).await?;
                     println!("    Created figure page: {}", figure_slug);
                 }
@@ -2755,6 +3403,61 @@ impl Engine {
                 }
             }
             
+            // 4. Write academic_meta to note page frontmatter (only fills missing fields)
+            {
+                let meta = &knowledge.academic_meta;
+                let has_meta = !meta.authors.is_empty()
+                    || meta.year.is_some()
+                    || meta.journal.is_some()
+                    || meta.doi.is_some();
+                if has_meta {
+                    if let Ok(mut page) = self.get_page(&slug).await {
+                        let mut changed = false;
+                        {
+                            if let Some(fm) = page.frontmatter.as_object_mut() {
+                                if !meta.authors.is_empty() && !fm.contains_key("authors") {
+                                    fm.insert("authors".to_string(), serde_json::json!(meta.authors));
+                                    for a in &meta.authors {
+                                        if !page.tags.contains(a) {
+                                            page.tags.push(a.clone());
+                                        }
+                                    }
+                                    changed = true;
+                                }
+                                if let Some(y) = meta.year {
+                                    if !fm.contains_key("year") {
+                                        fm.insert("year".to_string(),
+                                            serde_json::Value::String(y.to_string()));
+                                        changed = true;
+                                    }
+                                }
+                                if let Some(ref j) = meta.journal {
+                                    if !fm.contains_key("journal") && !j.trim().is_empty() {
+                                        fm.insert("journal".to_string(),
+                                            serde_json::Value::String(j.clone()));
+                                        changed = true;
+                                    }
+                                }
+                                if let Some(ref d) = meta.doi {
+                                    if !fm.contains_key("doi") && !d.trim().is_empty() {
+                                        fm.insert("doi".to_string(),
+                                            serde_json::Value::String(d.clone()));
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        if changed {
+                            if let Err(e) = self.put_page_force(page).await {
+                                eprintln!("    WARN: failed to write academic_meta for {}: {}", slug, e);
+                            } else {
+                                println!("    Written academic_meta to frontmatter of {}", slug);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Update dream_metadata
             sqlx::query("INSERT OR REPLACE INTO dream_metadata (slug, last_extracted_at) VALUES (?1, datetime('now'))")
                 .bind(&slug)
@@ -2770,7 +3473,7 @@ impl Engine {
         println!("\n[Dream Cycle] Phase 4: Synthesizing concept-based literature reviews...");
 
         // Collect all concept pages
-        let all_pages = self.list_pages(None, None).await?;
+        let all_pages = self.list_pages(None, None, None, None, None).await?;
         let concept_pages: Vec<Page> = all_pages.into_iter()
             .filter(|p| p.page_type == "concept")
             .collect();
@@ -2782,6 +3485,9 @@ impl Engine {
 
         let deepseek = self.inner.deepseek.as_ref();
         let mut synthesized = 0usize;
+        // Jaccard dedup: track (concept_slug, source_set) pairs already committed to synthesis
+        let dedup_threshold: f32 = 0.8;
+        let mut committed_sources: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
 
         for concept in &concept_pages {
             // Find source notes that link to this concept (page_type = 'note' only)
@@ -2800,6 +3506,23 @@ impl Engine {
             if source_slugs.len() < 3 {
                 continue;
             }
+
+            // Skip if another concept already committed with a highly overlapping source set
+            let src_set: std::collections::HashSet<String> = source_slugs.iter().cloned().collect();
+            let is_near_duplicate = committed_sources.iter().any(|(prev_slug, prev_set)| {
+                let intersection = src_set.intersection(prev_set).count();
+                let union = src_set.len() + prev_set.len() - intersection;
+                let jaccard = if union == 0 { 0.0 } else { intersection as f32 / union as f32 };
+                if jaccard >= dedup_threshold {
+                    eprintln!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                        concept.slug, jaccard, prev_slug);
+                    true
+                } else {
+                    false
+                }
+            });
+            if is_near_duplicate { continue; }
+            committed_sources.push((concept.slug.clone(), src_set));
 
             // Fetch the actual source pages
             let mut source_pages: Vec<Page> = Vec::new();
@@ -2842,15 +3565,7 @@ impl Engine {
 
             let synthesized_content = if let Some(client) = deepseek {
 
-                let system = "You are an academic research synthesizer. \
-                    Given a concept and source article chunks (each labelled with its chunk ID), \
-                    generate a structured literature synthesis page. \
-                    You MUST cite sources using Wikilinks [[slug | chunk:N]] where N is the exact chunk ID shown in the context. \
-                    Never cite just [[slug]] without a chunk ID — the chunk ID is required for traceability. \
-                    Structure with Markdown: H1 title, ## sections for themes/debates/evidence, \
-                    a ## Working Judgment section with your synthesis, \
-                    and a ## Open Questions section. \
-                    Output in the language of the source materials (Simplified Chinese for Chinese sources).";
+                let system = self.inner.prompts.load("synthesize_academic");
 
                 let mut context_items = Vec::new();
                 for p in &source_pages {
@@ -2873,13 +3588,14 @@ impl Engine {
                         let mut idx = 800;
                         while idx > 0 && !p.compiled_truth.is_char_boundary(idx) { idx -= 1; }
                         let snippet = p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
-                        context_items.push(format!("Source: [[{}]] ({})\n{}", p.slug, p.title, snippet));
+                        context_items.push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
                     } else {
+                        let slug = &p.slug;
                         let chunk_blocks: Vec<String> = db_chunks.iter()
-                            .map(|(id, text)| format!("[chunk:{}] {}", id, text))
+                            .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
                             .collect();
                         context_items.push(format!(
-                            "Source: {} ({})\n{}",
+                            "Source: {} | {}\n{}",
                             p.slug, p.title,
                             chunk_blocks.join("\n")
                         ));
@@ -2892,8 +3608,8 @@ impl Engine {
                     context_items.join("\n\n---\n\n")
                 );
 
-                match client.chat(system, &user).await {
-                    Ok(resp) => resp,
+                match client.chat(&system, &user).await {
+                    Ok(resp) => MarkdownParser::normalize_llm_output(&resp),
                     Err(e) => {
                         eprintln!("    WARN: LLM call failed for {}: {}. Using mock.", concept.slug, e);
                         self.generate_mock_concept_synthesis(concept, &source_pages)
@@ -2995,7 +3711,7 @@ impl Engine {
             });
         }
 
-        ExtractedKnowledge { concepts, figures, events }
+        ExtractedKnowledge { concepts, figures, events, academic_meta: AcademicMeta::default() }
     }
 
     /// Rebuild the link index for a single page from its wikilink content (no re-embed).
@@ -3345,6 +4061,156 @@ impl Engine {
 
         Ok(sources)
     }
+
+    /// Merge concept pages whose titles are semantically similar (cosine similarity ≥ threshold).
+    ///
+    /// Algorithm:
+    /// 1. List all concept pages and batch-embed their titles.
+    /// 2. Compute pairwise cosine similarity.
+    /// 3. Use Union-Find to cluster concepts with similarity ≥ threshold.
+    /// 4. In each cluster, keep the concept with the highest inbound link count.
+    /// 5. Redirect all inbound links from dropped concepts to the kept one.
+    /// 6. Delete dropped concept pages (DB + filesystem).
+    ///
+    /// Returns a list of (kept_slug, dropped_slug, similarity) records.
+    pub async fn merge_similar_concepts(&self, threshold: f32) -> Result<Vec<MergeRecord>> {
+        let embedder = match &self.inner.embedder {
+            Some(e) => e.clone(),
+            None => return Err(BrainError::ApiUnreachable {
+                provider: "embedder".to_string(),
+                message: "Embedder required for concept merging".to_string(),
+            }),
+        };
+
+        let concepts = self.list_pages(Some("concept"), None, None, None, None).await?;
+        if concepts.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let titles: Vec<String> = concepts.iter().map(|c| c.title.clone()).collect();
+        let embeddings = embedder.embed_batch(&titles).await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let n = concepts.len();
+
+        // Union-Find helpers (index-based)
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            if parent[x] != x { parent[x] = find(parent, parent[x]); }
+            parent[x]
+        }
+        fn union(parent: &mut Vec<usize>, x: usize, y: usize) {
+            let px = find(parent, x);
+            let py = find(parent, y);
+            if px != py { parent[px] = py; }
+        }
+
+        // Cosine similarity between two f32 vecs
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+        }
+
+        // Find pairs above threshold and union them
+        let mut similar_pairs: Vec<(usize, usize, f32)> = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim = cosine(&embeddings[i], &embeddings[j]);
+                if sim >= threshold {
+                    union(&mut parent, i, j);
+                    similar_pairs.push((i, j, sim));
+                }
+            }
+        }
+
+        if similar_pairs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group concepts by cluster root
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(i);
+        }
+
+        let mut records: Vec<MergeRecord> = Vec::new();
+
+        for (_root, members) in &clusters {
+            if members.len() < 2 { continue; }
+
+            // Get inbound link counts for each member
+            let mut counts: Vec<(usize, i64)> = Vec::new();
+            for &idx in members {
+                let slug = &concepts[idx].slug;
+                let cnt: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM links WHERE target_slug = ?1"
+                )
+                .bind(slug)
+                .fetch_one(&self.inner.db)
+                .await
+                .unwrap_or(0);
+                counts.push((idx, cnt));
+            }
+            // Keep the one with the most inbound links (tie: keep longest title as tiebreaker)
+            counts.sort_by(|a, b| b.1.cmp(&a.1)
+                .then(concepts[b.0].title.len().cmp(&concepts[a.0].title.len())));
+            let (keeper_idx, _) = counts[0];
+            let keeper_slug = concepts[keeper_idx].slug.clone();
+
+            for &(dropped_idx, _) in &counts[1..] {
+                let dropped_slug = concepts[dropped_idx].slug.clone();
+                // Find the similarity for this pair (use max across all similar_pairs)
+                let sim = similar_pairs.iter()
+                    .filter(|(i, j, _)| {
+                        (*i == keeper_idx && *j == dropped_idx) ||
+                        (*i == dropped_idx && *j == keeper_idx)
+                    })
+                    .map(|(_, _, s)| *s)
+                    .fold(0f32, f32::max);
+
+                eprintln!("  [merge] '{}' → '{}' (sim={:.3})", dropped_slug, keeper_slug, sim);
+
+                // Redirect all inbound links from dropped to keeper
+                // Use OR IGNORE to skip rows that would violate the UNIQUE constraint
+                sqlx::query(
+                    "UPDATE OR IGNORE links SET target_slug = ?1 WHERE target_slug = ?2"
+                )
+                .bind(&keeper_slug)
+                .bind(&dropped_slug)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                // Delete any remaining links still pointing to dropped (conflicting duplicates)
+                sqlx::query("DELETE FROM links WHERE target_slug = ?1")
+                .bind(&dropped_slug)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+                // Delete the dropped concept page
+                self.delete_page(&dropped_slug).await?;
+
+                records.push(MergeRecord {
+                    kept: keeper_slug.clone(),
+                    dropped: dropped_slug,
+                    similarity: sim,
+                });
+            }
+        }
+
+        Ok(records)
+    }
+}
+
+/// Record of one concept merge operation.
+#[derive(Debug)]
+pub struct MergeRecord {
+    pub kept: String,
+    pub dropped: String,
+    pub similarity: f32,
 }
 
 /// A source entry collected during citation graph traversal.
@@ -3483,24 +4349,25 @@ struct ExtractedEvent {
     figure_slug: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct AcademicMeta {
+    #[serde(default)]
+    authors: Vec<String>,
+    #[serde(default)]
+    year: Option<i32>,
+    #[serde(default)]
+    journal: Option<String>,
+    #[serde(default)]
+    doi: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ExtractedKnowledge {
     concepts: Vec<ExtractedConcept>,
     figures: Vec<ExtractedFigure>,
     events: Vec<ExtractedEvent>,
-}
-
-fn clean_json(s: &str) -> &str {
-    let mut s = s.trim();
-    if s.starts_with("```") {
-        if let Some(end) = s.rfind("```").filter(|&e| e > 0) {
-            s = &s[3..end];
-            if s.starts_with("json") {
-                s = &s[4..];
-            }
-        }
-    }
-    s.trim()
+    #[serde(default)]
+    academic_meta: AcademicMeta,
 }
 
 fn extracted_event_rejection_reason(event: &ExtractedEvent) -> Option<&'static str> {
@@ -3566,7 +4433,7 @@ fn is_iso_event_date(date: &str) -> bool {
     }
 }
 
-fn slugify(s: &str) -> String {
+pub(crate) fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
