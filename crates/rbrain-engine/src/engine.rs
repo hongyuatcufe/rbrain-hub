@@ -3203,114 +3203,143 @@ impl Engine {
                 user_context
             };
 
-            // ── 5. LLM call ────────────────────────────────────────────────────
-            println!(
-                "    → calling LLM (prompt: {})...",
-                match &step.prompt {
-                    PromptSpec::File(n) => n.as_str(),
-                    PromptSpec::Inline(_) => "<inline>",
-                }
-            );
-            let response = match deepseek.chat(&system_prompt, &user_msg).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("    WARN: LLM call failed for {}: {}", page.slug, e);
-                    continue;
-                }
-            };
+            // ── 5-7. LLM call → parse → apply output (with retry for synthesis) ──
+            const SYNTH_MAX_RETRIES: usize = 2;
+            let mut revision_hint: Option<String> = None;
+            let mut llm_failed = false;
 
-            // ── 6. Parse response ───────────────────────────────────────────────
-            let parsed_items: Vec<serde_json::Value> = match step.response_format {
-                ResponseFormat::Json => {
-                    let schema_hint = step.output_schema.as_deref();
-                    let ds_clone = deepseek.clone();
-                    let sys_clone = system_prompt.clone();
-                    match retry_parser
-                        .parse_with_retry::<serde_json::Value, _, _>(
-                            &response,
-                            schema_hint,
-                            |fix_prompt| {
-                                let client = ds_clone.clone();
-                                let sys = sys_clone.clone();
-                                async move {
-                                    client.chat(&sys, &fix_prompt).await.map_err(|e| {
-                                        BrainError::Io(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            e.to_string(),
-                                        ))
-                                    })
-                                }
-                            },
-                        )
-                        .await
-                    {
-                        Ok(v) => json_value_to_items(v),
-                        Err(e) => {
-                            eprintln!(
-                                "  [pipeline] WARN: JSON parse failed for {}: {}",
-                                page.slug, e
-                            );
-                            continue;
-                        }
+            'retry: for attempt in 0..=SYNTH_MAX_RETRIES {
+                let effective_user_msg = match &revision_hint {
+                    Some(hint) => format!(
+                        "{user_msg}\n\nREVISION REQUIRED (attempt {}/{}): {hint}",
+                        attempt + 1,
+                        SYNTH_MAX_RETRIES + 1
+                    ),
+                    None => user_msg.clone(),
+                };
+
+                println!(
+                    "    → calling LLM (prompt: {})...",
+                    match &step.prompt {
+                        PromptSpec::File(n) => n.as_str(),
+                        PromptSpec::Inline(_) => "<inline>",
                     }
-                }
-                ResponseFormat::Markdown => {
-                    let normalized = MarkdownParser::normalize_llm_output(&response);
-                    vec![serde_json::json!({"content": normalized, "slug": page.slug})]
-                }
-            };
+                );
+                let response = match deepseek.chat(&system_prompt, &effective_user_msg).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("    WARN: LLM call failed for {}: {}", page.slug, e);
+                        llm_failed = true;
+                        break 'retry;
+                    }
+                };
 
-            // ── 7. Apply output mode ────────────────────────────────────────────
-            match &step.output_mode {
-                OutputMode::Return => {
-                    all_results.extend(parsed_items);
-                }
-
-                OutputMode::SaveAs {
-                    page_type,
-                    slug_prefix,
-                    embed,
-                } => {
-                    for item in &parsed_items {
-                        let content = item
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let suffix = page.slug.split('/').last().unwrap_or(&page.slug);
-                        let out_slug = format!("{}{}", slug_prefix, suffix);
-                        let mut out_page = Page::new(out_slug.clone(), page_type.clone(), content);
-                        out_page.language = Some(rbrain_core::page::Language::detect(
-                            &out_page.compiled_truth,
-                        ));
-                        if page_type == "synthesis" {
-                            if let Err(reason) = validate_synthesis_quality(
-                                &out_page.compiled_truth,
-                                linked_source_count.unwrap_or(0),
-                            ) {
+                let parsed_items: Vec<serde_json::Value> = match step.response_format {
+                    ResponseFormat::Json => {
+                        let schema_hint = step.output_schema.as_deref();
+                        let ds_clone = deepseek.clone();
+                        let sys_clone = system_prompt.clone();
+                        match retry_parser
+                            .parse_with_retry::<serde_json::Value, _, _>(
+                                &response,
+                                schema_hint,
+                                |fix_prompt| {
+                                    let client = ds_clone.clone();
+                                    let sys = sys_clone.clone();
+                                    async move {
+                                        client.chat(&sys, &fix_prompt).await.map_err(|e| {
+                                            BrainError::Io(std::io::Error::new(
+                                                std::io::ErrorKind::Other,
+                                                e.to_string(),
+                                            ))
+                                        })
+                                    }
+                                },
+                            )
+                            .await
+                        {
+                            Ok(v) => json_value_to_items(v),
+                            Err(e) => {
                                 eprintln!(
-                                    "    WARN: rejecting low-quality synthesis {}: {}",
-                                    out_slug, reason
+                                    "  [pipeline] WARN: JSON parse failed for {}: {}",
+                                    page.slug, e
                                 );
-                                all_results.push(serde_json::json!({
-                                    "slug": out_slug,
-                                    "action": "rejected",
-                                    "reason": reason
-                                }));
-                                continue;
+                                llm_failed = true;
+                                break 'retry;
                             }
                         }
-                        self.put_page(out_page.clone()).await?;
-                        if *embed && self.has_embedder() {
-                            println!("    → embedding {}...", out_slug);
-                            if let Err(e) = self.chunk_and_embed_page(&out_page).await {
-                                eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
-                            }
-                        }
-                        println!("    → saved: {}", out_slug);
-                        all_results.push(serde_json::json!({"slug": out_slug, "action": "saved"}));
                     }
-                }
+                    ResponseFormat::Markdown => {
+                        let normalized = MarkdownParser::normalize_llm_output(&response);
+                        vec![serde_json::json!({"content": normalized, "slug": page.slug})]
+                    }
+                };
+
+                match &step.output_mode {
+                    OutputMode::Return => {
+                        all_results.extend(parsed_items);
+                    }
+
+                    OutputMode::SaveAs {
+                        page_type,
+                        slug_prefix,
+                        embed,
+                    } => {
+                        for item in &parsed_items {
+                            let content = item
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let suffix = page.slug.split('/').last().unwrap_or(&page.slug);
+                            let out_slug = format!("{}{}", slug_prefix, suffix);
+                            let mut out_page =
+                                Page::new(out_slug.clone(), page_type.clone(), content);
+                            out_page.language = Some(rbrain_core::page::Language::detect(
+                                &out_page.compiled_truth,
+                            ));
+                            if page_type == "synthesis" {
+                                if let Err(reason) = validate_synthesis_quality(
+                                    &out_page.compiled_truth,
+                                    linked_source_count.unwrap_or(0),
+                                ) {
+                                    if attempt < SYNTH_MAX_RETRIES {
+                                        eprintln!(
+                                            "    WARN: attempt {}/{} rejected ({}), retrying…",
+                                            attempt + 1,
+                                            SYNTH_MAX_RETRIES + 1,
+                                            reason
+                                        );
+                                        revision_hint = Some(reason);
+                                        continue 'retry;
+                                    } else {
+                                        eprintln!(
+                                            "    WARN: rejecting {} after {} attempt(s): {}",
+                                            out_slug,
+                                            SYNTH_MAX_RETRIES + 1,
+                                            reason
+                                        );
+                                        all_results.push(serde_json::json!({
+                                            "slug": out_slug,
+                                            "action": "rejected",
+                                            "reason": reason
+                                        }));
+                                        continue;
+                                    }
+                                }
+                            }
+                            self.put_page(out_page.clone()).await?;
+                            if *embed && self.has_embedder() {
+                                println!("    → embedding {}...", out_slug);
+                                if let Err(e) = self.chunk_and_embed_page(&out_page).await {
+                                    eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
+                                }
+                            }
+                            println!("    → saved: {}", out_slug);
+                            all_results
+                                .push(serde_json::json!({"slug": out_slug, "action": "saved"}));
+                        }
+                    }
 
                 OutputMode::UpdateFrontmatter => {
                     for item in &parsed_items {
@@ -3468,6 +3497,11 @@ impl Engine {
                         created_count, enriched_count
                     );
                 }
+            }
+            break 'retry;
+            } // end 'retry loop
+            if llm_failed {
+                continue; // skip to next page
             }
         }
 
