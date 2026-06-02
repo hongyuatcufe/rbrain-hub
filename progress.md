@@ -9,6 +9,71 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 
 ---
 
+## 2026-06-02 — Literature Review Pipeline 质量门禁与干净重建复测
+
+### 修复问题
+
+| # | 问题 | 修复 |
+|---|------|------|
+| P1 | `RetryParser` 先按 `Vec<Value>` 解析，但 extract prompt 返回单个 JSON object，导致每篇文献出现 2 次无效 JSON 重试 | 改为先解析 `serde_json::Value`，再将 object/array 统一规范化为 result items |
+| P2 | synthesis 可能生成大量无引用、模板化、截断的内容（如 `国家逻辑.md`、`中国教育学学科体系.md` 曾出现几十节内容） | 新增 `validate_synthesis_quality`，保存前检查 traceable chunk 引用、二级标题数量、无引用正文节和过薄章节 |
+| P3 | 删除 `research/synthesis/*.md` 后，DB 中旧 synthesis page 仍会被 compose 聚合，污染最终综述 | `AggregateContent` 聚合前过滤没有对应 Markdown 文件的 stale DB page，并打印跳过数量 |
+| P4 | incremental 只看 DB 更新时间，不看输出文件是否存在；清空目录后可能误判 `synthesis up-to-date` | SaveAs 和 LinkedSources incremental 现在只有在 DB 记录与 Markdown 文件都存在时才允许跳过 |
+
+### Synthesis 质量规则
+
+- `synthesis` 保存前必须有可追溯 `[[raw/articles/... | chunk:N]]` 引用。
+- 引用数量下限：按 source 数量要求 1-3 个 traceable chunk citation。
+- 二级标题 `##` 总数上限为 9。最初实测 6 过严，会误拒绝 7-9 节的正常综合；9 能保留较完整结构，同时仍能拒绝 13、58、70 节这类章节爆炸。
+- substantive section 超过 2 个无 chunk 引用会被拒绝。
+- 过薄正文 section 超过 2 个会被拒绝。
+- prompt 已同步要求不超过 9 个 `##` section，并禁止无材料支撑的维度、例子、启示和模板化长枚举。
+
+### 干净重建测试（/Users/hongyu/project/rbrain-test）
+
+按用户要求重置测试项目，只保留：
+
+- `raw/articles/*.md`：55 篇测试文献
+- `.rbrain/config.toml`：保留 API key 配置，未打印内容
+
+重建步骤与结果：
+
+```bash
+cargo run -p rbrain-cli -- --brain-dir /Users/hongyu/project/rbrain-test/.rbrain sync
+cargo run -p rbrain-cli -- --brain-dir /Users/hongyu/project/rbrain-test/.rbrain embed --all
+cargo run -p rbrain-cli -- --brain-dir /Users/hongyu/project/rbrain-test/.rbrain stats
+```
+
+统计结果：
+
+| 指标 | 数值 |
+|------|------|
+| raw/note pages | 55 |
+| chunks | 696 |
+| embedding coverage | 100.0% |
+| research Markdown 初始状态 | 0 |
+
+随后运行：
+
+```bash
+cargo run -p rbrain-cli -- --brain-dir /Users/hongyu/project/rbrain-test/.rbrain dream --profile literature_review
+```
+
+阶段观察：
+
+- Extract：55 篇全部进入处理，产生 489 个结果。
+- 未再出现 `[RetryParser] attempt 1/2 still invalid JSON`，JSON object 解析重试问题未复现。
+- Synthesize：进入 72 个去重后 anchor。
+- 质量门禁已实测拒绝章节爆炸结果，例如 13 节、58 节的 synthesis；同时允许合规 synthesis 保存。
+- 本轮测试在 synthesis 中途按用户要求停止，以便换办公室前提交代码。
+
+### 验证
+
+- `cargo test -p rbrain-engine --lib`：通过。
+- `git diff --check`：通过。
+
+---
+
 ## 2026-05-31 — PipelineRunner 全功能落地 & 文献综述 E2E 验证
 
 ### 核心功能：可编程 Pipeline（TOML 配置）

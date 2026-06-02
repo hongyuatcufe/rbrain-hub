@@ -166,6 +166,12 @@ impl Engine {
         Ok((normalized, repo_path))
     }
 
+    fn page_markdown_exists(&self, slug: &str) -> bool {
+        self.page_path(slug)
+            .map(|(_, path)| path.exists())
+            .unwrap_or(false)
+    }
+
     fn deletion_tombstone_path(repo_path: &Path) -> PathBuf {
         let file_name = repo_path
             .file_name()
@@ -2804,6 +2810,15 @@ impl Engine {
                 let mut pages = self
                     .list_pages(Some(page_type.as_str()), tag.as_deref(), None, None, None)
                     .await?;
+                let page_count_before_file_filter = pages.len();
+                pages.retain(|p| self.page_markdown_exists(&p.slug));
+                let skipped_stale = page_count_before_file_filter.saturating_sub(pages.len());
+                if skipped_stale > 0 {
+                    println!(
+                        "  [{}] skipped {} stale {} page(s) without markdown files.",
+                        step.id, skipped_stale, page_type
+                    );
+                }
                 pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 pages.truncate(*max_pages);
 
@@ -2885,9 +2900,12 @@ impl Engine {
                                 p.slug.split('/').last().unwrap_or(&p.slug)
                             );
                             // Skip if output page already exists and is newer than input
-                            self.get_page_updated_at_blocking(&out_slug)
-                                .map(|out_updated| p.updated_at > out_updated)
-                                .unwrap_or(true)
+                            match self.get_page_updated_at_blocking(&out_slug) {
+                                Some(out_updated) if self.page_markdown_exists(&out_slug) => {
+                                    p.updated_at > out_updated
+                                }
+                                _ => true,
+                            }
                         })
                         .collect()
                 }
@@ -3045,6 +3063,7 @@ impl Engine {
                 page.slug
             );
             // Build user context
+            let mut linked_source_count: Option<usize> = None;
             let user_context = match &step.input {
                 InputSpec::SelfContent { .. } => {
                     let base = format!(
@@ -3094,14 +3113,16 @@ impl Engine {
                             );
                             if let Some(out_updated) = self.get_page_updated_at_blocking(&out_slug)
                             {
-                                let any_newer = source_slugs.iter().any(|s| {
-                                    self.get_page_updated_at_blocking(s)
-                                        .map(|t| t > out_updated)
-                                        .unwrap_or(false)
-                                });
-                                if !any_newer {
-                                    println!("    → skip: synthesis up-to-date");
-                                    continue; // up to date
+                                if self.page_markdown_exists(&out_slug) {
+                                    let any_newer = source_slugs.iter().any(|s| {
+                                        self.get_page_updated_at_blocking(s)
+                                            .map(|t| t > out_updated)
+                                            .unwrap_or(false)
+                                    });
+                                    if !any_newer {
+                                        println!("    → skip: synthesis up-to-date");
+                                        continue; // up to date
+                                    }
                                 }
                             }
                         }
@@ -3110,6 +3131,7 @@ impl Engine {
                         "    → synthesizing from {} source(s)...",
                         source_slugs.len()
                     );
+                    linked_source_count = Some(source_slugs.len());
 
                     // Build context from source pages
                     let mut context_items = Vec::new();
@@ -3204,7 +3226,7 @@ impl Engine {
                     let ds_clone = deepseek.clone();
                     let sys_clone = system_prompt.clone();
                     match retry_parser
-                        .parse_with_retry::<Vec<serde_json::Value>, _, _>(
+                        .parse_with_retry::<serde_json::Value, _, _>(
                             &response,
                             schema_hint,
                             |fix_prompt| {
@@ -3222,20 +3244,13 @@ impl Engine {
                         )
                         .await
                     {
-                        Ok(v) => v,
-                        Err(_) => {
-                            // Try as single object
-                            let cleaned = clean_json(&response);
-                            match serde_json::from_str::<serde_json::Value>(cleaned) {
-                                Ok(v) => vec![v],
-                                Err(e) => {
-                                    eprintln!(
-                                        "  [pipeline] WARN: JSON parse failed for {}: {}",
-                                        page.slug, e
-                                    );
-                                    continue;
-                                }
-                            }
+                        Ok(v) => json_value_to_items(v),
+                        Err(e) => {
+                            eprintln!(
+                                "  [pipeline] WARN: JSON parse failed for {}: {}",
+                                page.slug, e
+                            );
+                            continue;
                         }
                     }
                 }
@@ -3268,6 +3283,23 @@ impl Engine {
                         out_page.language = Some(rbrain_core::page::Language::detect(
                             &out_page.compiled_truth,
                         ));
+                        if page_type == "synthesis" {
+                            if let Err(reason) = validate_synthesis_quality(
+                                &out_page.compiled_truth,
+                                linked_source_count.unwrap_or(0),
+                            ) {
+                                eprintln!(
+                                    "    WARN: rejecting low-quality synthesis {}: {}",
+                                    out_slug, reason
+                                );
+                                all_results.push(serde_json::json!({
+                                    "slug": out_slug,
+                                    "action": "rejected",
+                                    "reason": reason
+                                }));
+                                continue;
+                            }
+                        }
                         self.put_page(out_page.clone()).await?;
                         if *embed && self.has_embedder() {
                             println!("    → embedding {}...", out_slug);
@@ -4188,6 +4220,18 @@ impl Engine {
                 &synth_page.compiled_truth,
             ));
 
+            if deepseek.is_some() {
+                if let Err(reason) =
+                    validate_synthesis_quality(&synth_page.compiled_truth, source_pages.len())
+                {
+                    eprintln!(
+                        "    WARN: rejecting low-quality synthesis {}: {}",
+                        synthesis_slug, reason
+                    );
+                    continue;
+                }
+            }
+
             self.put_page(synth_page.clone()).await?;
             println!("    Saved: {}", synthesis_slug);
 
@@ -5104,9 +5148,101 @@ pub(crate) fn slugify(s: &str) -> String {
         .join("-")
 }
 
+fn json_value_to_items(value: serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Null => Vec::new(),
+        item => vec![item],
+    }
+}
+
+fn validate_synthesis_quality(
+    content: &str,
+    source_count: usize,
+) -> std::result::Result<(), String> {
+    let citation_count = content.matches("| chunk:").count();
+    let required_citations = source_count.clamp(1, 3);
+    if citation_count < required_citations {
+        return Err(format!(
+            "only {citation_count} traceable citation(s), expected at least {required_citations}"
+        ));
+    }
+
+    let sections = markdown_sections(content);
+    let section_count = sections.len();
+    let max_sections = 9;
+    if section_count > max_sections {
+        return Err(format!(
+            "{section_count} second-level section(s), maximum is {max_sections} for {source_count} source(s)"
+        ));
+    }
+
+    let mut uncited_body_sections = 0usize;
+    let mut thin_sections = 0usize;
+    for (heading, body) in &sections {
+        let exempt = is_synthesis_meta_section(heading);
+        let has_citation = body.contains("| chunk:");
+        let body_chars = body.trim().chars().count();
+        if !exempt && !has_citation {
+            uncited_body_sections += 1;
+        }
+        if !exempt && body_chars < 80 {
+            thin_sections += 1;
+        }
+    }
+
+    if uncited_body_sections > 2 {
+        return Err(format!(
+            "{uncited_body_sections} substantive section(s) have no traceable citation"
+        ));
+    }
+    if thin_sections > 2 {
+        return Err(format!(
+            "{thin_sections} substantive section(s) are too thin"
+        ));
+    }
+
+    Ok(())
+}
+
+fn markdown_sections(content: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_body = String::new();
+
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            if let Some(heading) = current_heading.replace(line.trim().to_string()) {
+                sections.push((heading, current_body.trim().to_string()));
+                current_body.clear();
+            }
+        } else if current_heading.is_some() {
+            current_body.push_str(line);
+            current_body.push('\n');
+        }
+    }
+
+    if let Some(heading) = current_heading {
+        sections.push((heading, current_body.trim().to_string()));
+    }
+
+    sections
+}
+
+fn is_synthesis_meta_section(heading: &str) -> bool {
+    let heading = heading.trim_start_matches('#').trim();
+    matches!(
+        heading,
+        "Working Judgment" | "Open Questions" | "综合判断" | "开放问题" | "待研究问题" | "未决问题"
+    )
+}
+
 #[cfg(test)]
 mod event_filter_tests {
-    use super::{ExtractedEvent, extracted_event_rejection_reason, is_derived_research_context};
+    use super::{
+        ExtractedEvent, extracted_event_rejection_reason, is_derived_research_context,
+        json_value_to_items, validate_synthesis_quality,
+    };
 
     fn event(date: &str, description: &str) -> ExtractedEvent {
         ExtractedEvent {
@@ -5177,5 +5313,57 @@ mod event_filter_tests {
         }
         assert!(!is_derived_research_context("note"));
         assert!(!is_derived_research_context("book"));
+    }
+
+    #[test]
+    fn json_value_to_items_accepts_object_and_array() {
+        let object = serde_json::json!({"concepts": []});
+        assert_eq!(json_value_to_items(object).len(), 1);
+
+        let array = serde_json::json!([{"name": "a"}, {"name": "b"}]);
+        assert_eq!(json_value_to_items(array).len(), 2);
+    }
+
+    #[test]
+    fn synthesis_quality_rejects_section_sprawl_without_citations() {
+        let mut content = String::from("# 综合分析\n\n");
+        content.push_str("## 一、根据材料的主题\n\n");
+        content.push_str(
+            "这是有引用的扎实段落，说明材料中的具体论点与证据。[[raw/articles/a | chunk:1]]\n\n",
+        );
+        content.push_str("## 二、另一个根据材料的主题\n\n");
+        content.push_str("这是第二个有引用的扎实段落，继续说明来源材料中的证据。[[raw/articles/b | chunk:2]]\n\n");
+        for i in 3..=20 {
+            content.push_str(&format!("## {i}、模板化延展\n\n"));
+            content.push_str("这里没有引用，只是在延展主题。\n\n");
+        }
+
+        let err = validate_synthesis_quality(&content, 2).expect_err("sprawl should be rejected");
+        assert!(err.contains("section"));
+    }
+
+    #[test]
+    fn synthesis_quality_accepts_cited_compact_synthesis() {
+        let content = "\
+# 综合分析
+
+## 主题与证据
+
+这一主题直接来自第一篇材料，并保留可追溯引用。[[raw/articles/a | chunk:1]]
+
+## 分歧与互补
+
+第二篇材料提供不同角度，足以支撑一个紧凑综合。[[raw/articles/b | chunk:2]]
+
+## Working Judgment
+
+两篇材料可以形成有限但可追溯的工作判断。
+
+## Open Questions
+
+还需要更多来源验证边界。
+";
+
+        validate_synthesis_quality(content, 2).expect("compact cited synthesis should pass");
     }
 }
