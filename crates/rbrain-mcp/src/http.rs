@@ -1,9 +1,9 @@
 use axum::{
+    Router,
     extract::{Json, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
 };
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
@@ -87,27 +87,68 @@ async fn call_tool(
     arguments: serde_json::Value,
 ) -> Result<String, (i32, String)> {
     match name {
-        "brain_search" => {
-            let query = arguments.get("query")
+        "brain_query" => {
+            let query = arguments
+                .get("query")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s);
-            let limit = arguments.get("limit")
+            let limit = arguments
+                .get("limit")
                 .and_then(|v| v.as_i64())
                 .map(|l| l.max(1).min(50) as usize)
                 .unwrap_or(10);
-            let lang = arguments.get("lang")
+            let expand = arguments
+                .get("expand")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let lang = rbrain_core::page::Language::detect(query);
+
+            let chunks = engine
+                .search_with_context(query, &lang, limit, expand)
+                .await
+                .map_err(|e| (-32000, format!("Query failed: {}", e)))?;
+
+            let results: Vec<_> = chunks
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "page_slug": c.page_slug,
+                        "chunk_id": c.chunk_id,
+                        "score": c.score,
+                        "text": c.text,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
+        }
+        "brain_search" => {
+            let query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map_or_else(|| "", |s| s);
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .map(|l| l.max(1).min(50) as usize)
+                .unwrap_or(10);
+            let lang = arguments
+                .get("lang")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let pages = engine.list_pages(None, None, None, None, None).await
+            let pages = engine
+                .list_pages(None, None, None, None, None)
+                .await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
-            let mut results: Vec<(Page, f32)> = pages.into_iter()
+            let mut results: Vec<(Page, f32)> = pages
+                .into_iter()
                 .filter(|p| {
                     if let Some(lang_code) = &lang {
                         p.language.as_ref().map_or(false, |l| {
-                            l.to_string() == *lang_code || 
-                            (*lang_code == "zh" && l.to_string().starts_with("zh"))
+                            l.to_string() == *lang_code
+                                || (*lang_code == "zh" && l.to_string().starts_with("zh"))
                         })
                     } else {
                         true
@@ -122,23 +163,29 @@ async fn call_tool(
             results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             results.truncate(limit);
 
-            let search_results: Vec<_> = results.into_iter()
-                .map(|(p, score)| json!({
-                    "slug": p.slug,
-                    "title": p.title,
-                    "page_type": p.page_type,
-                    "score": score,
-                }))
+            let search_results: Vec<_> = results
+                .into_iter()
+                .map(|(p, score)| {
+                    json!({
+                        "slug": p.slug,
+                        "title": p.title,
+                        "page_type": p.page_type,
+                        "score": score,
+                    })
+                })
                 .collect();
 
             Ok(serde_json::to_string_pretty(&search_results).unwrap_or_default())
         }
         "brain_get" => {
-            let slug = arguments.get("slug")
+            let slug = arguments
+                .get("slug")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s);
-            
-            let page = engine.get_page(slug).await
+
+            let page = engine
+                .get_page(slug)
+                .await
                 .map_err(|e| (-32000, format!("Page not found: {}", e)))?;
 
             let result = json!({
@@ -155,100 +202,130 @@ async fn call_tool(
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         }
         "brain_put" => {
-            let slug = arguments.get("slug")
+            let slug = arguments
+                .get("slug")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s)
                 .to_string();
-            let content = arguments.get("content")
+            let content = arguments
+                .get("content")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s)
                 .to_string();
-            let page_type = arguments.get("page_type")
+            let page_type = arguments
+                .get("page_type")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "note", |s| s)
                 .to_string();
 
             let page = Page::new(slug, page_type, content);
-            engine.put_page(page).await
+            engine
+                .put_page(page)
+                .await
                 .map_err(|e| (-32000, format!("Failed to save page: {}", e)))?;
 
             Ok("Page saved successfully".to_string())
         }
         "brain_list" => {
-            let filter = arguments.get("filter")
+            let filter = arguments
+                .get("filter")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let pages = engine.list_pages(None, filter.as_deref(), None, None, None).await
+            let pages = engine
+                .list_pages(None, filter.as_deref(), None, None, None)
+                .await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
-            let results: Vec<_> = pages.into_iter()
-                .map(|p| json!({
-                    "slug": p.slug,
-                    "title": p.title,
-                    "page_type": p.page_type,
-                    "updated_at": p.updated_at.to_string(),
-                }))
+            let results: Vec<_> = pages
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "slug": p.slug,
+                        "title": p.title,
+                        "page_type": p.page_type,
+                        "updated_at": p.updated_at.to_string(),
+                    })
+                })
                 .collect();
 
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
         "brain_graph_query" => {
-            let slug = arguments.get("slug")
+            let slug = arguments
+                .get("slug")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s);
-            let edge_type = arguments.get("edge_type")
+            let edge_type = arguments
+                .get("edge_type")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let depth = arguments.get("depth")
+            let depth = arguments
+                .get("depth")
                 .and_then(|v| v.as_i64())
                 .map(|d| d.max(1).min(5) as usize)
                 .unwrap_or(2);
-            let direction = arguments.get("direction")
+            let direction = arguments
+                .get("direction")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "out", |s| s);
 
-            let edges = engine.graph_query(slug, edge_type.as_deref(), depth, direction).await
+            let edges = engine
+                .graph_query(slug, edge_type.as_deref(), depth, direction)
+                .await
                 .map_err(|e| (-32000, format!("Graph query failed: {}", e)))?;
 
-            let results: Vec<_> = edges.into_iter()
-                .map(|e| json!({
-                    "target": e.target,
-                    "edge_type": e.edge_type,
-                    "depth": e.depth,
-                }))
+            let results: Vec<_> = edges
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "target": e.target,
+                        "edge_type": e.edge_type,
+                        "depth": e.depth,
+                    })
+                })
                 .collect();
 
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
         "brain_backlinks" => {
-            let slug = arguments.get("slug")
+            let slug = arguments
+                .get("slug")
                 .and_then(|v| v.as_str())
                 .map_or_else(|| "", |s| s);
 
-            let links = engine.backlinks(slug).await
+            let links = engine
+                .backlinks(slug)
+                .await
                 .map_err(|e| (-32000, format!("Failed to get backlinks: {}", e)))?;
 
-            let results: Vec<_> = links.into_iter()
-                .map(|l| json!({
-                    "page_slug": l.target_slug,
-                    "edge_type": l.edge_type,
-                    "context": l.context,
-                }))
+            let results: Vec<_> = links
+                .into_iter()
+                .map(|l| {
+                    json!({
+                        "page_slug": l.target_slug,
+                        "edge_type": l.edge_type,
+                        "context": l.context,
+                    })
+                })
                 .collect();
 
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
         "brain_stats" => {
-            let pages = engine.list_pages(None, None, None, None, None).await
+            let pages = engine
+                .list_pages(None, None, None, None, None)
+                .await
                 .map_err(|e| (-32000, format!("Failed to get stats: {}", e)))?;
 
             let total_pages = pages.len();
-            let by_type: std::collections::HashMap<String, usize> = pages.iter()
-                .fold(std::collections::HashMap::new(), |mut acc, p| {
-                    *acc.entry(p.page_type.clone()).or_insert(0) += 1;
-                    acc
-                });
+            let by_type: std::collections::HashMap<String, usize> =
+                pages
+                    .iter()
+                    .fold(std::collections::HashMap::new(), |mut acc, p| {
+                        *acc.entry(p.page_type.clone()).or_insert(0) += 1;
+                        acc
+                    });
 
             let stats = json!({
                 "total_pages": total_pages,
@@ -258,93 +335,180 @@ async fn call_tool(
             Ok(serde_json::to_string_pretty(&stats).unwrap_or_default())
         }
         "brain_think" => {
-            let topic = arguments.get("topic")
+            let topic = arguments
+                .get("topic")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let limit = arguments.get("limit")
+            let limit = arguments
+                .get("limit")
                 .and_then(|v| v.as_i64())
                 .map(|l| l.max(1).min(20) as usize)
                 .unwrap_or(12);
-            let expand = arguments.get("expand")
+            let expand = arguments
+                .get("expand")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let lang = rbrain_core::page::Language::detect(&topic);
-            engine.think(&topic, &lang, limit, expand, None).await
+            engine
+                .think(&topic, &lang, limit, expand, None)
+                .await
                 .map_err(|e| (-32000, format!("Think failed: {}", e)))
         }
         "brain_add_timeline_entry" => {
-            let slug = arguments.get("slug")
+            let slug = arguments
+                .get("slug")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let text = arguments.get("text")
+            let text = arguments
+                .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let date = arguments.get("date")
+            let date = arguments
+                .get("date")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
-            let source = arguments.get("source")
+            let source = arguments
+                .get("source")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            engine.add_timeline_entry(&slug, &date, &text, source.as_deref()).await
+            engine
+                .add_timeline_entry(&slug, &date, &text, source.as_deref())
+                .await
                 .map(|_| format!("Timeline entry added to '{}'", slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_add_tag" => {
-            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let tag = arguments.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            engine.add_tag(&slug, &tag).await
+            let slug = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tag = arguments
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            engine
+                .add_tag(&slug, &tag)
+                .await
                 .map(|_| format!("Tag '{}' added to '{}'", tag, slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_remove_tag" => {
-            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let tag = arguments.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            engine.remove_tag(&slug, &tag).await
+            let slug = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tag = arguments
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            engine
+                .remove_tag(&slug, &tag)
+                .await
                 .map(|_| format!("Tag '{}' removed from '{}'", tag, slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_outlinks" => {
             let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-            let links = engine.outlinks(slug).await
+            let links = engine
+                .outlinks(slug)
+                .await
                 .map_err(|e| (-32000, format!("Failed: {}", e)))?;
-            let results: Vec<_> = links.into_iter()
-                .map(|l| json!({
-                    "target_slug": l.target_slug,
-                    "edge_type": l.edge_type,
-                    "context": l.context,
-                }))
+            let results: Vec<_> = links
+                .into_iter()
+                .map(|l| {
+                    json!({
+                        "target_slug": l.target_slug,
+                        "edge_type": l.edge_type,
+                        "context": l.context,
+                    })
+                })
                 .collect();
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
         "brain_delete" => {
             let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-            engine.delete_page(slug).await
+            engine
+                .delete_page(slug)
+                .await
                 .map(|_| format!("Page '{}' deleted", slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_link" => {
-            let from = arguments.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let to = arguments.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let link_type = arguments.get("link_type").and_then(|v| v.as_str()).unwrap_or("related").to_string();
-            let context = arguments.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
-            engine.add_link(&from, &to, &link_type, context.as_deref(), None).await
-                .map(|_| format!("Link created: {} --[{}]--> {}", from, link_type, to))
+            let from = arguments
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let to = arguments
+                .get("to")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let link_type = arguments
+                .get("link_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("related")
+                .to_string();
+            let chunk_id = arguments.get("chunk_id").and_then(|v| v.as_i64());
+            let context = if let Some(id) = chunk_id {
+                match engine.fetch_chunk_by_id(id).await {
+                    Ok(Some((text, _page_slug))) => Some(text),
+                    Ok(None) => {
+                        return Err((
+                            -32000,
+                            format!(
+                                "Chunk {} not found. Use chunk_id from brain_query results.",
+                                id
+                            ),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err((-32000, format!("Failed to fetch chunk: {}", e)));
+                    }
+                }
+            } else {
+                arguments
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+            engine
+                .add_link(&from, &to, &link_type, context.as_deref(), chunk_id)
+                .await
+                .map(|_| {
+                    if let Some(id) = chunk_id {
+                        format!(
+                            "Link created: {} --[{}]--> {} (context from chunk:{})",
+                            from, link_type, to, id
+                        )
+                    } else {
+                        format!("Link created: {} --[{}]--> {}", from, link_type, to)
+                    }
+                })
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_unlink" => {
             let from = arguments.get("from").and_then(|v| v.as_str()).unwrap_or("");
             let to = arguments.get("to").and_then(|v| v.as_str()).unwrap_or("");
             let link_type = arguments.get("link_type").and_then(|v| v.as_str());
-            engine.remove_link(from, to, link_type).await
+            engine
+                .remove_link(from, to, link_type)
+                .await
                 .map(|n| format!("Removed {} link(s)", n))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
         "brain_orphans" => {
-            let slugs = engine.orphan_pages().await
+            let slugs = engine
+                .orphan_pages()
+                .await
                 .map_err(|e| (-32000, format!("Failed: {}", e)))?;
             Ok(serde_json::to_string_pretty(&slugs).unwrap_or_default())
         }
@@ -383,6 +547,28 @@ async fn handle_tool_call(
 /// List available tools via HTTP GET /mcp/tools
 async fn list_tools() -> impl IntoResponse {
     let tools = json!([
+        {
+            "name": "brain_query",
+            "description": "Hybrid search combining vector similarity and keyword search. Returns ranked chunks with source page and chunk id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of chunks (1-50, default: 10)"
+                    },
+                    "expand": {
+                        "type": "boolean",
+                        "description": "Use LLM query expansion (default: false)"
+                    }
+                },
+                "required": ["query"]
+            }
+        },
         {
             "name": "brain_search",
             "description": "Search pages by title, content, and tags. Returns relevant pages sorted by relevance score.",
@@ -565,6 +751,54 @@ async fn list_tools() -> impl IntoResponse {
                     "slug": { "type": "string", "description": "Source page slug" }
                 },
                 "required": ["slug"]
+            }
+        },
+        {
+            "name": "brain_delete",
+            "description": "Delete a page and all associated chunks and embeddings.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Page slug to delete" }
+                },
+                "required": ["slug"]
+            }
+        },
+        {
+            "name": "brain_link",
+            "description": "Create a typed directed link between two pages. Optionally use chunk_id from brain_query to capture evidence context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source page slug" },
+                    "to": { "type": "string", "description": "Target page slug" },
+                    "link_type": { "type": "string", "description": "Relationship type, default: related" },
+                    "chunk_id": { "type": "integer", "description": "Chunk id from brain_query" },
+                    "context": { "type": "string", "description": "Free-text context when chunk_id is omitted" }
+                },
+                "required": ["from", "to"]
+            }
+        },
+        {
+            "name": "brain_unlink",
+            "description": "Remove links between two pages, optionally restricted to a link type.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source page slug" },
+                    "to": { "type": "string", "description": "Target page slug" },
+                    "link_type": { "type": "string", "description": "Relationship type to remove" }
+                },
+                "required": ["from", "to"]
+            }
+        },
+        {
+            "name": "brain_orphans",
+            "description": "List pages with no incoming links.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }
     ]);

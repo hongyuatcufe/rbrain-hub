@@ -1,13 +1,12 @@
+use rbrain_core::page::Page;
+use rbrain_engine::Engine;
+use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     schemars::{self, JsonSchema},
     tool, tool_router,
 };
-use rbrain_core::page::Page;
-use rbrain_engine::Engine;
-use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat, SaveTypeConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct RBrainMcpServer {
@@ -19,7 +18,6 @@ impl RBrainMcpServer {
         Self { engine }
     }
 }
-
 
 // ── Argument types ─────────────────────────────────────────────────────────
 
@@ -320,8 +318,18 @@ pub struct MutationResult {
 }
 
 impl MutationResult {
-    fn ok(msg: impl Into<String>) -> Self { Self { ok: true, message: msg.into() } }
-    fn err(msg: impl Into<String>) -> Self { Self { ok: false, message: msg.into() } }
+    fn ok(msg: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            message: msg.into(),
+        }
+    }
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: msg.into(),
+        }
+    }
 }
 
 // ── MCP Tools ───────────────────────────────────────────────────────────────
@@ -340,7 +348,11 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.query);
 
-        match self.engine.search_with_context(&args.query, &lang, limit, expand).await {
+        match self
+            .engine
+            .search_with_context(&args.query, &lang, limit, expand)
+            .await
+        {
             Ok(chunks) => Json(ChunkList {
                 results: chunks
                     .into_iter()
@@ -379,7 +391,10 @@ impl RBrainMcpServer {
                     updated_at: page.updated_at.to_string(),
                 }),
             }),
-            Err(_) => Json(GetResult { found: false, page: None }),
+            Err(_) => Json(GetResult {
+                found: false,
+                page: None,
+            }),
         }
     }
 
@@ -437,7 +452,8 @@ impl RBrainMcpServer {
                     .into_iter()
                     .map(|p| PageSummary {
                         snippet: rbrain_core::markdown::MarkdownParser::extract_snippet(
-                            &p.compiled_truth, 160,
+                            &p.compiled_truth,
+                            160,
                         ),
                         slug: p.slug,
                         title: p.title,
@@ -514,11 +530,7 @@ impl RBrainMcpServer {
                 total_chunks: s.total_chunks,
                 embedding_coverage_pct: s.embedding_coverage,
                 graph_density: s.graph_density,
-                pages_by_type: s
-                    .pages_by_type
-                    .into_iter()
-                    .map(|(k, v)| (k, v))
-                    .collect(),
+                pages_by_type: s.pages_by_type.into_iter().map(|(k, v)| (k, v)).collect(),
                 pages_by_language: s
                     .pages_by_language
                     .into_iter()
@@ -549,7 +561,11 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.topic);
 
-        match self.engine.generate_wiki(&args.topic, &lang, limit, expand, args.template.as_deref()).await {
+        match self
+            .engine
+            .generate_wiki(&args.topic, &lang, limit, expand, args.template.as_deref())
+            .await
+        {
             Ok(wiki) => {
                 let saved_as = if args.save.unwrap_or(false) {
                     let slug = args
@@ -568,7 +584,10 @@ impl RBrainMcpServer {
                 } else {
                     None
                 };
-                Json(GenerateResult { content: wiki, saved_as })
+                Json(GenerateResult {
+                    content: wiki,
+                    saved_as,
+                })
             }
             Err(e) => {
                 tracing::error!("brain_generate error: {}", e);
@@ -597,7 +616,8 @@ impl RBrainMcpServer {
                 Ok(Some((text, _page_slug))) => Some(text),
                 Ok(None) => {
                     return Json(MutationResult::err(format!(
-                        "Chunk {} not found. Use chunk_id from brain_query results.", chunk_id
+                        "Chunk {} not found. Use chunk_id from brain_query results.",
+                        chunk_id
                     )));
                 }
                 Err(e) => {
@@ -608,11 +628,27 @@ impl RBrainMcpServer {
             args.context.clone()
         };
 
-        match self.engine.add_link(&args.from, &args.to, link_type, context.as_deref(), args.chunk_id).await {
+        match self
+            .engine
+            .add_link(
+                &args.from,
+                &args.to,
+                link_type,
+                context.as_deref(),
+                args.chunk_id,
+            )
+            .await
+        {
             Ok(_) => Json(MutationResult::ok(format!(
                 "Link added: {} --[{}]--> {}{}",
-                args.from, link_type, args.to,
-                if args.chunk_id.is_some() { format!(" (context from chunk:{})", args.chunk_id.unwrap()) } else { String::new() }
+                args.from,
+                link_type,
+                args.to,
+                if args.chunk_id.is_some() {
+                    format!(" (context from chunk:{})", args.chunk_id.unwrap())
+                } else {
+                    String::new()
+                }
             ))),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
@@ -625,9 +661,19 @@ impl RBrainMcpServer {
             Specify link_type to remove only that type; omit to remove all links between these pages."
     )]
     async fn unlink(&self, Parameters(args): Parameters<UnlinkArgs>) -> Json<MutationResult> {
-        match self.engine.remove_link(&args.from, &args.to, args.link_type.as_deref()).await {
-            Ok(n) if n > 0 => Json(MutationResult::ok(format!("Removed {} link(s): {} --> {}", n, args.from, args.to))),
-            Ok(_) => Json(MutationResult::err(format!("No matching link found: {} --> {}", args.from, args.to))),
+        match self
+            .engine
+            .remove_link(&args.from, &args.to, args.link_type.as_deref())
+            .await
+        {
+            Ok(n) if n > 0 => Json(MutationResult::ok(format!(
+                "Removed {} link(s): {} --> {}",
+                n, args.from, args.to
+            ))),
+            Ok(_) => Json(MutationResult::err(format!(
+                "No matching link found: {} --> {}",
+                args.from, args.to
+            ))),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
     }
@@ -656,9 +702,21 @@ impl RBrainMcpServer {
         let lang = rbrain_core::page::Language::detect(&args.topic);
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
         let expand = args.expand.unwrap_or(false);
-        match self.engine.think(&args.topic, &lang, limit, expand, args.response_schema.as_deref()).await {
+        match self
+            .engine
+            .think(
+                &args.topic,
+                &lang,
+                limit,
+                expand,
+                args.response_schema.as_deref(),
+            )
+            .await
+        {
             Ok(result) => Json(ThinkResult { reasoning: result }),
-            Err(e) => Json(ThinkResult { reasoning: format!("Error: {}", e) }),
+            Err(e) => Json(ThinkResult {
+                reasoning: format!("Error: {}", e),
+            }),
         }
     }
 
@@ -705,10 +763,7 @@ impl RBrainMcpServer {
     }
 
     /// Remove a tag from a page.
-    #[tool(
-        name = "brain_remove_tag",
-        description = "Remove a tag from a page."
-    )]
+    #[tool(name = "brain_remove_tag", description = "Remove a tag from a page.")]
     async fn remove_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
         match self.engine.remove_tag(&args.slug, &args.tag).await {
             Ok(_) => Json(MutationResult::ok(format!(
@@ -768,7 +823,9 @@ impl RBrainMcpServer {
         let output_mode = match args.output_mode.as_deref().unwrap_or("return") {
             "save" => OutputMode::SaveAs {
                 page_type: args.output_page_type.unwrap_or_else(|| "note".to_string()),
-                slug_prefix: args.output_slug_prefix.unwrap_or_else(|| "processed/".to_string()),
+                slug_prefix: args
+                    .output_slug_prefix
+                    .unwrap_or_else(|| "processed/".to_string()),
                 embed: args.embed_output.unwrap_or(false),
             },
             "update_frontmatter" => OutputMode::UpdateFrontmatter,

@@ -10,10 +10,9 @@ use rbrain_llm::{DeepSeekClient, Intent};
 use rbrain_search::chunker::Chunker;
 use rbrain_search::keyword_index::TantivyIndex;
 use rbrain_search::rrf;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::SqlitePool;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use std::time::Duration;
 use strsim::levenshtein;
 use walkdir::WalkDir;
 
-use crate::links::{extract_links, LinkRef};
+use crate::links::{LinkRef, extract_links};
 use crate::pipeline::clean_json;
 
 #[derive(Clone)]
@@ -47,19 +46,34 @@ struct EngineInner {
 
 fn build_prompt_loader(config: &Config) -> PromptLoader {
     let mut builtins = std::collections::HashMap::new();
-    builtins.insert("think_cjk",          include_str!("prompts/think_cjk.md"));
-    builtins.insert("think_en",           include_str!("prompts/think_en.md"));
-    builtins.insert("compose_wiki",       include_str!("prompts/compose_wiki.md"));
-    builtins.insert("extract_academic",   include_str!("prompts/extract_academic.md"));
-    builtins.insert("synthesize_academic",   include_str!("prompts/synthesize_academic.md"));
-    builtins.insert("compose_literature_review", include_str!("prompts/compose_literature_review.md"));
+    builtins.insert("think_cjk", include_str!("prompts/think_cjk.md"));
+    builtins.insert("think_en", include_str!("prompts/think_en.md"));
+    builtins.insert("compose_wiki", include_str!("prompts/compose_wiki.md"));
+    builtins.insert(
+        "extract_academic",
+        include_str!("prompts/extract_academic.md"),
+    );
+    builtins.insert(
+        "synthesize_academic",
+        include_str!("prompts/synthesize_academic.md"),
+    );
+    builtins.insert(
+        "compose_literature_review",
+        include_str!("prompts/compose_literature_review.md"),
+    );
     PromptLoader::new(config.prompts_dir.clone(), builtins)
 }
 
 /// Built-in pipeline profile TOML files, embedded at compile time.
 const BUILTIN_PROFILES: &[(&str, &str)] = &[
-    ("literature_review", include_str!("profiles/literature_review.toml")),
-    ("policy_analysis",   include_str!("profiles/policy_analysis.toml")),
+    (
+        "literature_review",
+        include_str!("profiles/literature_review.toml"),
+    ),
+    (
+        "policy_analysis",
+        include_str!("profiles/policy_analysis.toml"),
+    ),
 ];
 
 impl Engine {
@@ -72,7 +86,9 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
+        let deepseek = DeepSeekClient::from_config(&config.deepseek)
+            .ok()
+            .map(Arc::new);
 
         let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);
         let prompts = build_prompt_loader(&config);
@@ -104,7 +120,9 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
+        let deepseek = DeepSeekClient::from_config(&config.deepseek)
+            .ok()
+            .map(Arc::new);
         let prompts = build_prompt_loader(&config);
 
         Ok(Self {
@@ -121,11 +139,11 @@ impl Engine {
     }
 
     pub async fn put_page(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, false).await
+        self.put_page_inner(page, false, true).await
     }
 
     pub async fn put_page_force(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, true).await
+        self.put_page_inner(page, true, true).await
     }
 
     fn validated_slug(slug: &str) -> Result<String> {
@@ -133,7 +151,9 @@ impl Engine {
         let path = Path::new(&normalized);
         if normalized.is_empty()
             || normalized.contains('\\')
-            || path.components().any(|component| !matches!(component, Component::Normal(_)))
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
         {
             return Err(BrainError::Conflict(format!("invalid page slug: {slug}")));
         }
@@ -142,28 +162,33 @@ impl Engine {
 
     fn page_path(&self, slug: &str) -> Result<(String, PathBuf)> {
         let normalized = Self::validated_slug(slug)?;
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{normalized}.md"));
+        let repo_path = self.inner.config.repo_dir.join(format!("{normalized}.md"));
         Ok((normalized, repo_path))
     }
 
-    async fn put_page_inner(&self, page: Page, force: bool) -> Result<()> {
+    fn deletion_tombstone_path(repo_path: &Path) -> PathBuf {
+        let file_name = repo_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("page.md");
+        repo_path.with_file_name(format!(".{file_name}.{}.deleted", uuid::Uuid::new_v4()))
+    }
+
+    async fn put_page_inner(&self, page: Page, force: bool, enqueue_embed: bool) -> Result<()> {
         let (normalized_slug, repo_path) = self.page_path(&page.slug)?;
 
         if !force && repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
             let existing_hash = MarkdownParser::content_hash(&existing_content);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?1",
-            )
-            .bind(&normalized_slug)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?1")
+                    .bind(&normalized_slug)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             if let Some(hash) = db_hash {
                 if hash != existing_hash {
@@ -182,21 +207,25 @@ impl Engine {
                 serde_json::Value::Object(map) => map.clone(),
                 _ => serde_json::Map::new(),
             };
-            m.insert("type".to_string(), serde_json::Value::String(page.page_type.clone()));
+            m.insert(
+                "type".to_string(),
+                serde_json::Value::String(page.page_type.clone()),
+            );
             if !page.title.is_empty() {
-                m.insert("title".to_string(), serde_json::Value::String(page.title.clone()));
+                m.insert(
+                    "title".to_string(),
+                    serde_json::Value::String(page.title.clone()),
+                );
             }
-            let tags_val: Vec<serde_json::Value> = page.tags.iter()
+            let tags_val: Vec<serde_json::Value> = page
+                .tags
+                .iter()
                 .map(|t| serde_json::Value::String(t.clone()))
                 .collect();
             m.insert("tags".to_string(), serde_json::Value::Array(tags_val));
             serde_json::Value::Object(m)
         };
-        let canonical = MarkdownParser::to_canonical(
-            &fm,
-            &page.compiled_truth,
-            &page.timeline,
-        );
+        let canonical = MarkdownParser::to_canonical(&fm, &page.compiled_truth, &page.timeline);
         let content_hash = MarkdownParser::content_hash(&canonical);
 
         if let Some(parent) = repo_path.parent() {
@@ -246,13 +275,17 @@ impl Engine {
         let links = extract_links(&full_content);
 
         // Determine source_chunk_idx for each link by simulating chunking of compiled_truth.
-        let link_lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
+        let link_lang = page
+            .language
+            .clone()
+            .unwrap_or(rbrain_core::page::Language::En);
         let link_chunker = rbrain_search::chunker::Chunker::new(&link_lang);
         let ct_chunks = link_chunker.chunk(&page.compiled_truth, &normalized_slug, &link_lang);
 
         for link in links {
             let cid = link.chunk_id.unwrap_or(-1);
-            let src_idx = ct_chunks.iter()
+            let src_idx = ct_chunks
+                .iter()
                 .find(|c| c.text.contains(link.target_slug.as_str()))
                 .map(|c| c.chunk_idx as i64)
                 .unwrap_or(-1);
@@ -272,7 +305,7 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
 
-        if self.inner.embedder.is_some() && self.inner.vector_store.is_some() {
+        if enqueue_embed && self.inner.embedder.is_some() && self.inner.vector_store.is_some() {
             self.submit_embed_job(&page.slug).await?;
         }
 
@@ -285,7 +318,7 @@ impl Engine {
 
         sqlx::query(
             "INSERT INTO jobs (queue, name, params, status, priority, depth, created_at) \
-             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))"
+             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))",
         )
         .bind(&params_str)
         .execute(&self.inner.db)
@@ -301,27 +334,36 @@ impl Engine {
     }
 
     pub async fn chunk_and_embed_page(&self, page: &Page) -> Result<()> {
-        let embedder = self.inner.embedder.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let embedder = self
+            .inner
+            .embedder
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "embedder".to_string(),
                 message: "Embedder not configured — run with a search-enabled engine".to_string(),
-            }
-        })?;
-        let vector_store = self.inner.vector_store.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
-                provider: "vector_store".to_string(),
-                message: "Vector store not configured".to_string(),
-            }
-        })?;
-        let keyword_index = self.inner.keyword_index.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
-                provider: "keyword_index".to_string(),
-                message: "Keyword index not configured".to_string(),
-            }
-        })?;
+            })?;
+        let vector_store =
+            self.inner
+                .vector_store
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "vector_store".to_string(),
+                    message: "Vector store not configured".to_string(),
+                })?;
+        let keyword_index =
+            self.inner
+                .keyword_index
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "keyword_index".to_string(),
+                    message: "Keyword index not configured".to_string(),
+                })?;
 
         let normalized_slug = Self::validated_slug(&page.slug)?;
-        let lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
+        let lang = page
+            .language
+            .clone()
+            .unwrap_or(rbrain_core::page::Language::En);
         let chunker = Chunker::new(&lang);
         let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &normalized_slug, &lang);
 
@@ -355,13 +397,12 @@ impl Engine {
         }
 
         // Remove old chunk vectors before deleting DB records (IDs are lost after DELETE).
-        let old_chunk_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM chunks WHERE page_slug = ?1"
-        )
-        .bind(&normalized_slug)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let old_chunk_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM chunks WHERE page_slug = ?1")
+                .bind(&normalized_slug)
+                .fetch_all(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         if !old_chunk_ids.is_empty() {
             if let Some(vs) = &self.inner.vector_store {
@@ -426,10 +467,17 @@ impl Engine {
             vector_items.push((*chunk_id, dense.clone(), sparse.clone()));
 
             let chunk_text = chunk_texts
-                .get(chunk_ids.iter().position(|&id| id == *chunk_id).unwrap_or(0))
+                .get(
+                    chunk_ids
+                        .iter()
+                        .position(|&id| id == *chunk_id)
+                        .unwrap_or(0),
+                )
                 .cloned()
                 .unwrap_or_default();
-            keyword_index.upsert(*chunk_id, &normalized_slug, &chunk_text, &lang).await?;
+            keyword_index
+                .upsert(*chunk_id, &normalized_slug, &chunk_text, &lang)
+                .await?;
         }
 
         vector_store.upsert_batch(&vector_items).await?;
@@ -489,37 +537,79 @@ impl Engine {
     pub async fn delete_page(&self, slug: &str) -> Result<()> {
         let (normalized, repo_path) = self.page_path(slug)?;
 
-        let chunk_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM chunks WHERE page_slug = ?1"
-        )
-        .bind(&normalized)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if repo_path.exists() && !repo_path.is_file() {
+            return Err(BrainError::Conflict(format!(
+                "page path is not a regular file: {}",
+                repo_path.display()
+            )));
+        }
 
-        // Delete from DB first — if index cleanup fails, the page is gone from DB
-        // (clean state). Stale index entries are harmless: searches hit the DB to
-        // verify existence and will skip them.
-        sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let tombstone_path = if repo_path.exists() {
+            let tombstone_path = Self::deletion_tombstone_path(&repo_path);
+            std::fs::rename(&repo_path, &tombstone_path)?;
+            Some(tombstone_path)
+        } else {
+            None
+        };
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1 OR target_slug = ?1")
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let delete_result = async {
+            let mut tx =
+                self.inner.db.begin().await.map_err(|e| {
+                    BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })?;
 
-        sqlx::query("DELETE FROM pages WHERE slug = ?1")
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let chunk_ids: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM chunks WHERE page_slug = ?1")
+                    .bind(&normalized)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
-        if repo_path.exists() {
-            std::fs::remove_file(&repo_path)?;
+            sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
+                .bind(&normalized)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            sqlx::query("DELETE FROM links WHERE source_slug = ?1 OR target_slug = ?1")
+                .bind(&normalized)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            sqlx::query("DELETE FROM pages WHERE slug = ?1")
+                .bind(&normalized)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            Ok(chunk_ids)
+        }
+        .await;
+
+        let chunk_ids = match delete_result {
+            Ok(chunk_ids) => chunk_ids,
+            Err(e) => {
+                if let Some(tombstone_path) = &tombstone_path {
+                    if let Err(restore_err) = std::fs::rename(tombstone_path, &repo_path) {
+                        return Err(BrainError::Conflict(format!(
+                            "delete failed: {e}; failed to restore {}: {restore_err}",
+                            repo_path.display()
+                        )));
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(tombstone_path) = tombstone_path {
+            std::fs::remove_file(tombstone_path)?;
         }
 
         if let Some(vector_store) = &self.inner.vector_store {
@@ -557,8 +647,11 @@ impl Engine {
             binds.push(pt.to_string());
         }
         if let Some(tg) = tag {
-            conditions.push(format!("tags LIKE ?{}", binds.len() + 1));
-            binds.push(format!("%{}%", tg));
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})",
+                binds.len() + 1
+            ));
+            binds.push(tg.to_string());
         }
         if let Some(lang) = language {
             conditions.push(format!("language = ?{}", binds.len() + 1));
@@ -578,7 +671,10 @@ impl Engine {
         } else {
             format!(" WHERE {}", conditions.join(" AND "))
         };
-        let sql = format!("{}{} ORDER BY {}{}", BASE, where_clause, order, limit_clause);
+        let sql = format!(
+            "{}{} ORDER BY {}{}",
+            BASE, where_clause, order, limit_clause
+        );
 
         let mut q = sqlx::query(&sql);
         for b in &binds {
@@ -591,8 +687,7 @@ impl Engine {
 
         let mut pages = Vec::new();
         for row in rows {
-            let tags: Vec<String> =
-                serde_json::from_str(row.get::<String, _>("tags").as_str())?;
+            let tags: Vec<String> = serde_json::from_str(row.get::<String, _>("tags").as_str())?;
             let frontmatter: serde_json::Value =
                 serde_json::from_str(row.get::<String, _>("frontmatter").as_str())?;
             let language = row
@@ -616,7 +711,6 @@ impl Engine {
 
         Ok(pages)
     }
-
 
     pub async fn find_page_fuzzy(&self, slug: &str) -> Result<(Page, f64)> {
         let normalized = MarkdownParser::normalize_slug(slug);
@@ -676,9 +770,14 @@ impl Engine {
                 // Skip hidden directories and common non-content directories
                 let name = e.file_name().to_string_lossy();
                 if e.file_type().is_dir() {
-                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
-                        && name != "target" && name != "dist" && name != "build"
-                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
+                    !name.starts_with('.')
+                        && name != "node_modules"
+                        && name != "__pycache__"
+                        && name != "target"
+                        && name != "dist"
+                        && name != "build"
+                        && !name.ends_with(".dist-info")
+                        && !name.ends_with(".data")
                 } else {
                     true
                 }
@@ -687,22 +786,25 @@ impl Engine {
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
         {
             let path = entry.path();
-            let relative = path.strip_prefix(repo_dir)
+            let relative = path
+                .strip_prefix(repo_dir)
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            let slug = relative.to_string_lossy()
+            let slug = relative
+                .to_string_lossy()
                 .trim_end_matches(".md")
                 .replace(std::path::MAIN_SEPARATOR, "/");
 
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?"
-            )
-            .bind(&slug)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
+                    .bind(&slug)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             match db_hash {
                 Some(existing_hash) if existing_hash == hash => {
@@ -734,14 +836,28 @@ impl Engine {
     async fn sync_file_to_db(&self, slug: &str, content: &str, hash: &str) -> Result<()> {
         let parse_result = MarkdownParser::parse(content);
         let fm = &parse_result.frontmatter;
-        let page_type = fm.get("type").and_then(|v| v.as_str()).unwrap_or("note").to_string();
-        let title = fm.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let tags: Vec<String> = fm.get("tags")
+        let page_type = fm
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("note")
+            .to_string();
+        let title = fm
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tags: Vec<String> = fm
+            .get("tags")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
-        let language = Some(rbrain_core::page::Language::detect(&parse_result.compiled_truth).to_string());
+        let language =
+            Some(rbrain_core::page::Language::detect(&parse_result.compiled_truth).to_string());
         let normalized_slug = Self::validated_slug(slug)?;
         let frontmatter_json = serde_json::to_string(fm).unwrap_or_else(|_| "{}".to_string());
 
@@ -821,9 +937,14 @@ impl Engine {
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
                 if e.file_type().is_dir() {
-                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
-                        && name != "target" && name != "dist" && name != "build"
-                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
+                    !name.starts_with('.')
+                        && name != "node_modules"
+                        && name != "__pycache__"
+                        && name != "target"
+                        && name != "dist"
+                        && name != "build"
+                        && !name.ends_with(".dist-info")
+                        && !name.ends_with(".data")
                 } else {
                     true
                 }
@@ -840,7 +961,11 @@ impl Engine {
             // would cause put_page to scatter files into the project root.
             // For files outside the repo (external import), fall back to
             // import-dir-relative path and prepend `raw/` to keep them organised.
-            let repo_canon = self.inner.config.repo_dir.canonicalize()
+            let repo_canon = self
+                .inner
+                .config
+                .repo_dir
+                .canonicalize()
                 .unwrap_or_else(|_| self.inner.config.repo_dir.clone());
             let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let slug = if let Ok(rel) = path_canon.strip_prefix(&repo_canon) {
@@ -849,22 +974,27 @@ impl Engine {
                     .trim()
                     .replace(std::path::MAIN_SEPARATOR, "/")
             } else {
-                let rel = path.strip_prefix(&prefix)
-                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-                format!("raw/{}", rel.to_string_lossy()
-                    .trim_end_matches(".md")
-                    .trim()
-                    .replace(std::path::MAIN_SEPARATOR, "/"))
+                let rel = path.strip_prefix(&prefix).map_err(|e| {
+                    BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })?;
+                format!(
+                    "raw/{}",
+                    rel.to_string_lossy()
+                        .trim_end_matches(".md")
+                        .trim()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                )
             };
             let normalized = MarkdownParser::normalize_slug(&slug);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?"
-            )
-            .bind(&normalized)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
+                    .bind(&normalized)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             if let Some(existing) = db_hash {
                 if existing == hash {
@@ -873,32 +1003,34 @@ impl Engine {
             }
 
             let parse_result = MarkdownParser::parse(&content);
-            let page_type = parse_result.frontmatter.get("type")
+            let page_type = parse_result
+                .frontmatter
+                .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("note")
                 .to_string();
 
-            let mut page = Page::new(
-                normalized.clone(),
-                page_type,
-                parse_result.compiled_truth,
-            );
+            let mut page = Page::new(normalized.clone(), page_type, parse_result.compiled_truth);
             page.timeline = parse_result.timeline;
             page.frontmatter = parse_result.frontmatter;
             if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
                 page.title = t.to_string();
             }
             if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array()) {
-                page.tags = tags_val.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                page.tags = tags_val
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
             }
 
             let full_text = format!("{} {}", page.compiled_truth, page.timeline);
             page.language = Some(rbrain_core::page::Language::detect(&full_text));
 
-            self.put_page(page.clone()).await?;
+            self.put_page_inner(page.clone(), false, false).await?;
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&page).await {
-                    tracing::warn!("embed failed for {}: {}", page.slug, e);
+                    tracing::warn!("embed failed for {}; queueing retry job: {}", page.slug, e);
+                    self.submit_embed_job(&page.slug).await?;
                 }
             }
             imported.push(slug);
@@ -907,8 +1039,14 @@ impl Engine {
         Ok(imported)
     }
 
-    pub async fn keyword_search(&self, query: &str, lang: &rbrain_core::page::Language, k: usize) -> Result<Vec<(i64, f32)>> {
-        self.keyword_search_filtered(query, lang, k, None, None).await
+    pub async fn keyword_search(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        self.keyword_search_filtered(query, lang, k, None, None)
+            .await
     }
 
     /// Keyword search with optional page_type and tag filters applied post-Tantivy.
@@ -920,14 +1058,14 @@ impl Engine {
         page_type: Option<&str>,
         tag: Option<&str>,
     ) -> Result<Vec<(i64, f32)>> {
-        let keyword_index = self
-            .inner
-            .keyword_index
-            .as_ref()
-            .ok_or_else(|| BrainError::ApiUnreachable {
-                provider: "search".to_string(),
-                message: "Keyword index not configured".to_string(),
-            })?;
+        let keyword_index =
+            self.inner
+                .keyword_index
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "search".to_string(),
+                    message: "Keyword index not configured".to_string(),
+                })?;
 
         // Fetch extra results so filtering doesn't starve the result set
         let raw = keyword_index.search(query, lang, k * 5).await?;
@@ -949,7 +1087,7 @@ impl Engine {
             conditions.push("p.page_type = ?");
         }
         if tag.is_some() {
-            conditions.push("p.tags LIKE ?");
+            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
         }
         if !conditions.is_empty() {
             sql.push_str(" AND ");
@@ -964,7 +1102,7 @@ impl Engine {
             q = q.bind(pt);
         }
         if let Some(tg) = tag {
-            q = q.bind(format!("%{}%", tg));
+            q = q.bind(tg);
         }
 
         let allowed: std::collections::HashSet<i64> = q
@@ -1006,7 +1144,9 @@ impl Engine {
         // Also run keyword search with the type/tag filter directly, to guarantee
         // that filtered pages aren't crowded out of the global hybrid ranking by
         // many high-scoring pages of other types.
-        let filtered_kw = self.keyword_search_filtered(query, lang, k * 5, page_type, tag).await?;
+        let filtered_kw = self
+            .keyword_search_filtered(query, lang, k * 5, page_type, tag)
+            .await?;
         if !filtered_kw.is_empty() {
             let existing_ids: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
             for (id, score) in filtered_kw {
@@ -1032,7 +1172,7 @@ impl Engine {
             conditions.push("p.page_type = ?");
         }
         if tag.is_some() {
-            conditions.push("p.tags LIKE ?");
+            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
         }
         if !conditions.is_empty() {
             sql.push_str(" AND ");
@@ -1047,7 +1187,7 @@ impl Engine {
             q = q.bind(pt);
         }
         if let Some(tg) = tag {
-            q = q.bind(format!("%{}%", tg));
+            q = q.bind(tg);
         }
 
         let allowed: std::collections::HashSet<i64> = q
@@ -1102,17 +1242,32 @@ impl Engine {
 
         if let Ok(r) = dense_results {
             if !r.is_empty() {
-                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+                ranked_lists.push(
+                    r.into_iter()
+                        .enumerate()
+                        .map(|(i, (id, _))| (id, i + 1))
+                        .collect(),
+                );
             }
         }
         if let Ok(r) = sparse_results {
             if !r.is_empty() {
-                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+                ranked_lists.push(
+                    r.into_iter()
+                        .enumerate()
+                        .map(|(i, (id, _))| (id, i + 1))
+                        .collect(),
+                );
             }
         }
         if let Ok(r) = keyword_results {
             if !r.is_empty() {
-                ranked_lists.push(r.into_iter().enumerate().map(|(i, (id, _))| (id, i + 1)).collect());
+                ranked_lists.push(
+                    r.into_iter()
+                        .enumerate()
+                        .map(|(i, (id, _))| (id, i + 1))
+                        .collect(),
+                );
             }
         }
 
@@ -1148,15 +1303,11 @@ impl Engine {
         let deepseek = self.inner.deepseek.as_ref().cloned();
 
         let (intent, expansions) = if let Some(client) = deepseek {
-            let intent_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.classify_intent(query)
-            ).await;
+            let intent_result =
+                tokio::time::timeout(Duration::from_secs(2), client.classify_intent(query)).await;
 
-            let expansions_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.expand_query(query, 3)
-            ).await;
+            let expansions_result =
+                tokio::time::timeout(Duration::from_secs(2), client.expand_query(query, 3)).await;
 
             let intent = match intent_result {
                 Ok(Ok(i)) => i,
@@ -1194,7 +1345,10 @@ impl Engine {
             let variant = &all_queries[idx];
 
             let vector_results = self.vector_search(variant, k).await.unwrap_or_default();
-            let keyword_results = self.keyword_search(variant, lang, k).await.unwrap_or_default();
+            let keyword_results = self
+                .keyword_search(variant, lang, k)
+                .await
+                .unwrap_or_default();
 
             let vector_rrf: Vec<(i64, usize)> = vector_results
                 .into_iter()
@@ -1224,12 +1378,13 @@ impl Engine {
         //   from synthesis/concept pages — a reasonable proxy for academic importance.
         // Temporal/Event: no boost (recency or specificity matters more than citation count).
         let boost_weight = match intent {
-            Intent::Entity  => 0.15,
+            Intent::Entity => 0.15,
             Intent::General => 0.05,
-            _               => 0.0,
+            _ => 0.0,
         };
         let boosted = if boost_weight > 0.0 {
-            self.apply_backlink_boost_weighted(&fused, boost_weight).await?
+            self.apply_backlink_boost_weighted(&fused, boost_weight)
+                .await?
         } else {
             fused
         };
@@ -1237,7 +1392,11 @@ impl Engine {
         Ok(boosted)
     }
 
-    async fn apply_backlink_boost_weighted(&self, results: &[(i64, f64)], weight: f64) -> Result<Vec<(i64, f64)>> {
+    async fn apply_backlink_boost_weighted(
+        &self,
+        results: &[(i64, f64)],
+        weight: f64,
+    ) -> Result<Vec<(i64, f64)>> {
         if results.is_empty() {
             return Ok(results.to_vec());
         }
@@ -1245,7 +1404,10 @@ impl Engine {
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
         let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
-        let query = format!("SELECT id, page_slug FROM chunks WHERE id IN ({})", placeholders);
+        let query = format!(
+            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
+            placeholders
+        );
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
             sql_query = sql_query.bind(chunk_id);
@@ -1266,8 +1428,15 @@ impl Engine {
             return Ok(results.to_vec());
         }
 
-        let slug_placeholders: String = unique_slugs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let indegree_query = format!("SELECT slug, indegree FROM page_stats WHERE slug IN ({})", slug_placeholders);
+        let slug_placeholders: String = unique_slugs
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let indegree_query = format!(
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
+            slug_placeholders
+        );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
@@ -1308,14 +1477,14 @@ impl Engine {
                 provider: "search".to_string(),
                 message: "Vector search not configured".to_string(),
             })?;
-        let vector_store = self
-            .inner
-            .vector_store
-            .as_ref()
-            .ok_or_else(|| BrainError::ApiUnreachable {
-                provider: "search".to_string(),
-                message: "Vector store not configured".to_string(),
-            })?;
+        let vector_store =
+            self.inner
+                .vector_store
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "search".to_string(),
+                    message: "Vector store not configured".to_string(),
+                })?;
 
         let query_embedding = embedder.embed_one(query).await?;
         let mut results = vector_store.search_dense(&query_embedding, k).await?;
@@ -1326,7 +1495,10 @@ impl Engine {
 
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
         let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!("SELECT id, page_slug FROM chunks WHERE id IN ({})", placeholders);
+        let query = format!(
+            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
+            placeholders
+        );
 
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
@@ -1351,8 +1523,15 @@ impl Engine {
             return Ok(vec![]);
         }
 
-        let slug_placeholders: String = unique_slugs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let indegree_query = format!("SELECT slug, indegree FROM page_stats WHERE slug IN ({})", slug_placeholders);
+        let slug_placeholders: String = unique_slugs
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let indegree_query = format!(
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
+            slug_placeholders
+        );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
@@ -1385,7 +1564,10 @@ impl Engine {
     }
 
     /// Fetch chunk text, page_slug, and page_type for a set of chunk IDs, preserving rank order.
-    pub async fn fetch_chunks_text(&self, ids: &[i64]) -> Result<Vec<(i64, String, String, String)>> {
+    pub async fn fetch_chunks_text(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, String, String, String)>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
@@ -1407,10 +1589,16 @@ impl Engine {
 
         let mut map: HashMap<i64, (String, String, String)> = rows
             .iter()
-            .map(|r| (
-                r.get::<i64, _>("id"),
-                (r.get::<String, _>("text"), r.get::<String, _>("page_slug"), r.get::<String, _>("page_type")),
-            ))
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id"),
+                    (
+                        r.get::<String, _>("text"),
+                        r.get::<String, _>("page_slug"),
+                        r.get::<String, _>("page_type"),
+                    ),
+                )
+            })
             .collect();
 
         Ok(ids
@@ -1648,13 +1836,16 @@ impl Engine {
         let rows = sqlx::query(
             "SELECT p.slug, COALESCE(ps.indegree, 0) as indegree \
              FROM pages p LEFT JOIN page_stats ps ON p.slug = ps.slug \
-             ORDER BY indegree DESC LIMIT ?1"
+             ORDER BY indegree DESC LIMIT ?1",
         )
         .bind(n as i64)
         .fetch_all(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(rows.iter().map(|r| (r.get::<String, _>("slug"), r.get::<i64, _>("indegree"))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("slug"), r.get::<i64, _>("indegree")))
+            .collect())
     }
 
     /// Return (embedded_chunks, total_chunks) counts by page_type.
@@ -1664,16 +1855,21 @@ impl Engine {
              COUNT(c.id) as total, \
              SUM(CASE WHEN c.has_embedding = 1 THEN 1 ELSE 0 END) as embedded \
              FROM pages p LEFT JOIN chunks c ON c.page_slug = p.slug \
-             GROUP BY p.page_type ORDER BY total DESC"
+             GROUP BY p.page_type ORDER BY total DESC",
         )
         .fetch_all(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(rows.iter().map(|r| (
-            r.get::<String, _>("page_type"),
-            r.get::<i64, _>("embedded"),
-            r.get::<i64, _>("total"),
-        )).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("page_type"),
+                    r.get::<i64, _>("embedded"),
+                    r.get::<i64, _>("total"),
+                )
+            })
+            .collect())
     }
 
     /// Prepend a dated entry to a page's timeline section.
@@ -1700,21 +1896,23 @@ impl Engine {
 
         // Write file first; only update DB after filesystem succeeds.
         let new_hash = if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            let canonical = MarkdownParser::to_canonical(
+                &page.frontmatter,
+                &page.compiled_truth,
+                &new_timeline,
+            );
             std::fs::write(&repo_path, &canonical)?;
             Some(MarkdownParser::content_hash(&canonical))
         } else {
             None
         };
 
-        sqlx::query(
-            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
-        )
-        .bind(&new_timeline)
-        .bind(&normalized)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
+            .bind(&new_timeline)
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         if let Some(hash) = new_hash {
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
@@ -1729,12 +1927,7 @@ impl Engine {
 
     /// Append a short interpretive take to a page's timeline section.
     /// Direct SQL UPDATE — does NOT touch the links table, preserving explicit graph links.
-    pub async fn add_take(
-        &self,
-        slug: &str,
-        content: &str,
-        kind: &str,
-    ) -> Result<()> {
+    pub async fn add_take(&self, slug: &str, content: &str, kind: &str) -> Result<()> {
         let (normalized, repo_path) = self.page_path(slug)?;
         let page = self.get_page(&normalized).await?;
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -1747,21 +1940,23 @@ impl Engine {
 
         // Write file first; only update DB after filesystem succeeds.
         let new_hash = if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            let canonical = MarkdownParser::to_canonical(
+                &page.frontmatter,
+                &page.compiled_truth,
+                &new_timeline,
+            );
             std::fs::write(&repo_path, &canonical)?;
             Some(MarkdownParser::content_hash(&canonical))
         } else {
             None
         };
 
-        sqlx::query(
-            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
-        )
-        .bind(&new_timeline)
-        .bind(&normalized)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
+            .bind(&new_timeline)
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         if let Some(hash) = new_hash {
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
@@ -1828,9 +2023,15 @@ impl Engine {
     /// original sources so the LLM can attribute ideas to the correct primary authors.
     async fn build_chunk_block(&self, c: &ChunkResult, is_cjk: bool) -> String {
         let header = if is_cjk {
-            format!("[来源: {} | chunk:{} | 类型: {}]", c.page_slug, c.chunk_id, c.page_type)
+            format!(
+                "[来源: {} | chunk:{} | 类型: {}]",
+                c.page_slug, c.chunk_id, c.page_type
+            )
         } else {
-            format!("[source: {} | chunk:{} | type: {}]", c.page_slug, c.chunk_id, c.page_type)
+            format!(
+                "[source: {} | chunk:{} | type: {}]",
+                c.page_slug, c.chunk_id, c.page_type
+            )
         };
 
         let mut block = format!("{}\n{}", header, c.text);
@@ -1838,7 +2039,11 @@ impl Engine {
         if matches!(c.page_type.as_str(), "synthesis" | "wiki") {
             let sources = self.fetch_synthesis_sources(&c.page_slug, c.chunk_id).await;
             if !sources.is_empty() {
-                let label = if is_cjk { "[本段所引原始文献]" } else { "[Original sources for this synthesis]" };
+                let label = if is_cjk {
+                    "[本段所引原始文献]"
+                } else {
+                    "[Original sources for this synthesis]"
+                };
                 block.push_str(&format!("\n\n{}", label));
                 for (slug, display, ctx) in &sources {
                     block.push_str(&format!("\n- {} → {}", display, slug));
@@ -1865,15 +2070,19 @@ impl Engine {
         expand: bool,
         response_schema: Option<&str>,
     ) -> Result<String> {
-        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let deepseek = self
+            .inner
+            .deepseek
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "deepseek".to_string(),
                 message: "deepseek.api_key not configured".to_string(),
-            }
-        })?;
+            })?;
 
         let candidates = limit.saturating_mul(5).max(limit);
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
+        let chunks: Vec<ChunkResult> = self
+            .search_with_context(topic, lang, candidates, expand)
+            .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
             .take(limit)
@@ -1882,11 +2091,12 @@ impl Engine {
             return Ok(format!("No relevant content found in brain for: {}", topic));
         }
 
-        let is_cjk = matches!(lang,
+        let is_cjk = matches!(
+            lang,
             rbrain_core::page::Language::ZhHans
-            | rbrain_core::page::Language::ZhHant
-            | rbrain_core::page::Language::Ja
-            | rbrain_core::page::Language::Ko
+                | rbrain_core::page::Language::ZhHant
+                | rbrain_core::page::Language::Ja
+                | rbrain_core::page::Language::Ko
         );
 
         let mut context_parts = Vec::new();
@@ -1898,7 +2108,10 @@ impl Engine {
         let (system, user) = if is_cjk {
             let raw = self.inner.prompts.load("think_cjk");
             let sys = if let Some(schema) = response_schema {
-                PromptLoader::render(&raw, &std::collections::HashMap::from([("response_schema", schema)]))
+                PromptLoader::render(
+                    &raw,
+                    &std::collections::HashMap::from([("response_schema", schema)]),
+                )
             } else {
                 raw
             };
@@ -1907,7 +2120,10 @@ impl Engine {
         } else {
             let raw = self.inner.prompts.load("think_en");
             let sys = if let Some(schema) = response_schema {
-                PromptLoader::render(&raw, &std::collections::HashMap::from([("response_schema", schema)]))
+                PromptLoader::render(
+                    &raw,
+                    &std::collections::HashMap::from([("response_schema", schema)]),
+                )
             } else {
                 raw
             };
@@ -1915,7 +2131,9 @@ impl Engine {
             (sys, usr)
         };
 
-        deepseek.chat(&system, &user).await
+        deepseek
+            .chat(&system, &user)
+            .await
             .map(|s| MarkdownParser::normalize_llm_output(&s))
     }
 
@@ -1933,29 +2151,29 @@ impl Engine {
         let query = match direction {
             "out" => {
                 "WITH RECURSIVE graph AS (
-                    SELECT target_slug, edge_type, 1 AS depth
+                    SELECT target_slug, edge_type, 1 AS depth, 'out' AS dir
                     FROM links
                     WHERE source_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
                     UNION ALL
-                    SELECT l.target_slug, l.edge_type, g.depth + 1
+                    SELECT l.target_slug, l.edge_type, g.depth + 1, 'out'
                     FROM links l
                     JOIN graph g ON l.source_slug = g.target_slug
                     WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
                 )
-                SELECT DISTINCT target_slug, edge_type, depth FROM graph ORDER BY depth"
+                SELECT DISTINCT target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
             }
             "in" => {
                 "WITH RECURSIVE graph AS (
-                    SELECT source_slug, edge_type, 1 AS depth
+                    SELECT source_slug, edge_type, 1 AS depth, 'in' AS dir
                     FROM links
                     WHERE target_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
                     UNION ALL
-                    SELECT l.source_slug, l.edge_type, g.depth + 1
+                    SELECT l.source_slug, l.edge_type, g.depth + 1, 'in'
                     FROM links l
                     JOIN graph g ON l.target_slug = g.source_slug
                     WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
                 )
-                SELECT DISTINCT source_slug AS target_slug, edge_type, depth FROM graph ORDER BY depth"
+                SELECT DISTINCT source_slug AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
             }
             "both" | _ => {
                 "WITH RECURSIVE graph AS (
@@ -1977,7 +2195,7 @@ impl Engine {
                     JOIN graph g ON l.target_slug = g.node
                     WHERE g.dir = 'in' AND g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
                 )
-                SELECT DISTINCT node AS target_slug, edge_type, depth FROM graph ORDER BY depth"
+                SELECT DISTINCT node AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
             }
         };
 
@@ -1989,7 +2207,9 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
+        let mut edge_dirs: Vec<String> = Vec::new();
         for row in rows {
+            edge_dirs.push(row.get("dir"));
             edges.push(GraphEdge {
                 target: row.get("target_slug"),
                 edge_type: row.get("edge_type"),
@@ -1998,42 +2218,27 @@ impl Engine {
             });
         }
 
-        // Enrich depth-1 edges with context from the links table
-        let depth1_targets: Vec<String> = edges.iter()
-            .filter(|e| e.depth == 1)
-            .map(|e| e.target.clone())
-            .collect();
-
-        if !depth1_targets.is_empty() {
-            // Use all-? style (no ?N mixing) to avoid sqlx binding confusion
-            let ph = depth1_targets.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let ctx_sql = format!(
-                "SELECT target_slug, edge_type, context FROM links WHERE source_slug = ? AND target_slug IN ({})",
-                ph
-            );
-            let mut ctx_q = sqlx::query(&ctx_sql).bind(&normalized);
-            for t in &depth1_targets {
-                ctx_q = ctx_q.bind(t);
+        for (edge, dir) in edges.iter_mut().zip(edge_dirs.iter()) {
+            if edge.depth != 1 {
+                continue;
             }
-            let ctx_rows = ctx_q
-                .fetch_all(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-            let mut ctx_map: HashMap<(String, String), String> = HashMap::new();
-            for r in ctx_rows {
-                let tgt: String = r.get("target_slug");
-                let et: String = r.get("edge_type");
-                let ctx: Option<String> = r.get("context");
-                if let Some(c) = ctx {
-                    ctx_map.insert((tgt, et), c);
-                }
-            }
-            for edge in edges.iter_mut() {
-                if edge.depth == 1 {
-                    edge.context = ctx_map.get(&(edge.target.clone(), edge.edge_type.clone())).cloned();
-                }
-            }
+            let (source, target) = if dir == "in" {
+                (edge.target.as_str(), normalized.as_str())
+            } else {
+                (normalized.as_str(), edge.target.as_str())
+            };
+            edge.context = sqlx::query_scalar(
+                "SELECT context FROM links \
+                 WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 \
+                 ORDER BY id LIMIT 1",
+            )
+            .bind(source)
+            .bind(target)
+            .bind(&edge.edge_type)
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .flatten();
         }
 
         Ok(edges)
@@ -2053,14 +2258,17 @@ impl Engine {
         // LanceDB auto-persists; no explicit save needed.
 
         let stale_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0"
+            "SELECT COUNT(*) FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0",
         )
         .fetch_one(&self.inner.db)
         .await
         .unwrap_or(0);
 
         if stale_count > 0 {
-            issues.push(format!("{} stale chunks need embedding/indexing", stale_count));
+            issues.push(format!(
+                "{} stale chunks need embedding/indexing",
+                stale_count
+            ));
         }
 
         let repo_dir = &self.inner.config.repo_dir;
@@ -2083,12 +2291,10 @@ impl Engine {
 
     /// Get statistics about the knowledge base
     pub async fn get_stats(&self) -> Result<BrainStats> {
-        let rows = sqlx::query(
-            "SELECT page_type, COUNT(*) as cnt FROM pages GROUP BY page_type"
-        )
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let rows = sqlx::query("SELECT page_type, COUNT(*) as cnt FROM pages GROUP BY page_type")
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages_by_type: HashMap<String, i64> = HashMap::new();
         for row in rows {
@@ -2097,12 +2303,11 @@ impl Engine {
             pages_by_type.insert(page_type, count);
         }
 
-        let lang_rows = sqlx::query(
-            "SELECT language, COUNT(*) as cnt FROM pages GROUP BY language"
-        )
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let lang_rows =
+            sqlx::query("SELECT language, COUNT(*) as cnt FROM pages GROUP BY language")
+                .fetch_all(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages_by_language: HashMap<String, i64> = HashMap::new();
         for row in lang_rows {
@@ -2116,10 +2321,11 @@ impl Engine {
             .await
             .unwrap_or(0);
 
-        let with_embedding: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE has_embedding = 1")
-            .fetch_one(&self.inner.db)
-            .await
-            .unwrap_or(0);
+        let with_embedding: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE has_embedding = 1")
+                .fetch_one(&self.inner.db)
+                .await
+                .unwrap_or(0);
 
         let embedding_coverage = if total_chunks > 0 {
             (with_embedding as f64 / total_chunks as f64) * 100.0
@@ -2144,7 +2350,7 @@ impl Engine {
         };
 
         let recent_activity: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pages WHERE updated_at > datetime('now', '-7 days')"
+            "SELECT COUNT(*) FROM pages WHERE updated_at > datetime('now', '-7 days')",
         )
         .fetch_one(&self.inner.db)
         .await
@@ -2219,16 +2425,20 @@ impl Engine {
         expand: bool,
         template: Option<&str>,
     ) -> Result<String> {
-        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let deepseek = self
+            .inner
+            .deepseek
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "deepseek".to_string(),
                 message: "DeepSeek not configured — set deepseek.api_key in ~/.rbrain/config.toml"
                     .to_string(),
-            }
-        })?;
+            })?;
 
         let candidates = limit.saturating_mul(5).max(limit);
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
+        let chunks: Vec<ChunkResult> = self
+            .search_with_context(topic, lang, candidates, expand)
+            .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
             .take(limit)
@@ -2248,13 +2458,16 @@ impl Engine {
         let context = context_parts.join("\n\n---\n\n");
 
         let prompt_name = format!("compose_{}", template.unwrap_or("wiki"));
-        let system = self.inner.prompts.try_load(&prompt_name)
+        let system = self
+            .inner
+            .prompts
+            .try_load(&prompt_name)
             .map_err(|e| BrainError::Conflict(e))?;
-        let user = format!(
-            "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成页面。"
-        );
+        let user = format!("主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成页面。");
 
-        deepseek.chat(&system, &user).await
+        deepseek
+            .chat(&system, &user)
+            .await
             .map(|s| MarkdownParser::normalize_llm_output(&s))
     }
 
@@ -2294,8 +2507,7 @@ impl Engine {
                     .collect(),
             ),
         );
-        let frontmatter_json =
-            serde_json::to_string(&serde_json::Value::Object(frontmatter))?;
+        let frontmatter_json = serde_json::to_string(&serde_json::Value::Object(frontmatter))?;
         // Write file first; only update DB after filesystem succeeds.
         let (_, repo_path) = self.page_path(&page.slug)?;
         let new_hash = if repo_path.exists() {
@@ -2360,7 +2572,11 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         for row in rows {
-            warnings.push(("WARN".into(), row.get::<String, _>("slug"), "missing title".into()));
+            warnings.push((
+                "WARN".into(),
+                row.get::<String, _>("slug"),
+                "missing title".into(),
+            ));
         }
 
         // Pages with no embedded chunks
@@ -2371,7 +2587,11 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         for slug in unembedded {
-            warnings.push(("WARN".into(), slug, "not embedded (run: rbrain embed --stale)".into()));
+            warnings.push((
+                "WARN".into(),
+                slug,
+                "not embedded (run: rbrain embed --stale)".into(),
+            ));
         }
 
         // Orphan pages (no incoming links) — skip for small brains (<= 5 pages)
@@ -2382,14 +2602,18 @@ impl Engine {
         if total > 5 {
             let orphans = self.orphan_pages().await?;
             for slug in orphans {
-                warnings.push(("INFO".into(), slug, "orphan page — no incoming links".into()));
+                warnings.push((
+                    "INFO".into(),
+                    slug,
+                    "orphan page — no incoming links".into(),
+                ));
             }
         }
 
         // Broken links (target page does not exist)
         let broken: Vec<(String, String)> = sqlx::query_as(
             "SELECT source_slug, target_slug FROM links \
-             WHERE target_slug NOT IN (SELECT slug FROM pages)"
+             WHERE target_slug NOT IN (SELECT slug FROM pages)",
         )
         .fetch_all(&self.inner.db)
         .await
@@ -2456,8 +2680,7 @@ impl Engine {
     pub fn load_profile(&self, name: &str) -> Result<crate::pipeline::PipelineProfile> {
         let path = self.inner.config.profiles_dir.join(format!("{name}.toml"));
         let toml_str = if path.exists() {
-            std::fs::read_to_string(&path)
-                .map_err(|e| BrainError::Io(e))?
+            std::fs::read_to_string(&path).map_err(|e| BrainError::Io(e))?
         } else {
             BUILTIN_PROFILES
                 .iter()
@@ -2465,8 +2688,12 @@ impl Engine {
                 .map(|(_, v)| v.to_string())
                 .ok_or_else(|| BrainError::Conflict(format!("profile '{name}' not found")))?
         };
-        toml::from_str::<crate::pipeline::PipelineProfile>(&toml_str)
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
+        toml::from_str::<crate::pipeline::PipelineProfile>(&toml_str).map_err(|e| {
+            BrainError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ))
+        })
     }
 
     /// List available built-in profile names.
@@ -2496,18 +2723,28 @@ impl Engine {
 
         // ── Load system prompt (needed early for AggregateContent early return) ─
         let system_prompt = match &step.prompt {
-            PromptSpec::File(name) => self.inner.prompts.try_load(name)
+            PromptSpec::File(name) => self
+                .inner
+                .prompts
+                .try_load(name)
                 .map_err(|e| BrainError::Conflict(e))?,
             PromptSpec::Inline(text) => text.clone(),
         };
 
         // ── 1. Fetch input pages ───────────────────────────────────────────────
         let input_pages: Vec<Page> = match &step.input {
-            InputSpec::SelfContent { page_type, tag, language, slugs } => {
+            InputSpec::SelfContent {
+                page_type,
+                tag,
+                language,
+                slugs,
+            } => {
                 if let Some(specific) = slugs {
                     let mut pages = Vec::new();
                     for s in specific {
-                        if let Ok(p) = self.get_page(s).await { pages.push(p); }
+                        if let Ok(p) = self.get_page(s).await {
+                            pages.push(p);
+                        }
                     }
                     pages
                 } else {
@@ -2517,25 +2754,30 @@ impl Engine {
                         language.as_deref(),
                         step.max_inputs.map(|n| n as i64),
                         None,
-                    ).await?
+                    )
+                    .await?
                 }
             }
-            InputSpec::LinkedSources { anchor_page_type, .. } => {
+            InputSpec::LinkedSources {
+                anchor_page_type, ..
+            } => {
                 // For LinkedSources, anchor pages drive the loop — fetch them here.
-                self.list_pages(Some(anchor_page_type.as_str()), None, None, None, None).await?
+                self.list_pages(Some(anchor_page_type.as_str()), None, None, None, None)
+                    .await?
             }
-            InputSpec::AggregateContent { page_type, tag, max_pages, chars_per_page } => {
+            InputSpec::AggregateContent {
+                page_type,
+                tag,
+                max_pages,
+                chars_per_page,
+            } => {
                 // AggregateContent is handled as a single synthetic "page" carrying all content.
                 // We build the combined context here and return a single placeholder entry.
                 // Fetch without SQL LIMIT to avoid the internal clamp(1,200) cap;
                 // sort and truncate in Rust so we always get the most-recently-updated pages.
-                let mut pages = self.list_pages(
-                    Some(page_type.as_str()),
-                    tag.as_deref(),
-                    None,
-                    None,
-                    None,
-                ).await?;
+                let mut pages = self
+                    .list_pages(Some(page_type.as_str()), tag.as_deref(), None, None, None)
+                    .await?;
                 pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 pages.truncate(*max_pages);
 
@@ -2543,13 +2785,44 @@ impl Engine {
                     return Ok(vec![]);
                 }
 
-                let combined = pages.iter().enumerate().map(|(i, p)| {
-                    let body: String = p.compiled_truth.chars().take(*chars_per_page).collect();
-                    format!("## [{}/{}] {}\nSlug: {}\n\n{}", i + 1, pages.len(), p.title, p.slug, body)
-                }).collect::<Vec<_>>().join("\n\n---\n\n");
+                // Incremental check: skip if output is newer than all input pages.
+                // AggregateContent returns early so the normal incremental filter never runs.
+                if step.incremental {
+                    if let OutputMode::SaveAs { slug_prefix, .. } = &step.output_mode {
+                        let out_slug = format!("{}{}", slug_prefix, step.id);
+                        if let Some(out_updated) = self.get_page_updated_at_blocking(&out_slug) {
+                            let any_newer = pages.iter().any(|p| p.updated_at > out_updated);
+                            if !any_newer {
+                                println!("  [{}] output up-to-date, skipping.", step.id);
+                                return Ok(vec![]);
+                            }
+                        }
+                    }
+                }
 
-                println!("  [{}] Aggregating {} {} page(s) into single compose call...",
-                    step.id, pages.len(), page_type);
+                let combined = pages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let body: String = p.compiled_truth.chars().take(*chars_per_page).collect();
+                        format!(
+                            "## [{}/{}] {}\nSlug: {}\n\n{}",
+                            i + 1,
+                            pages.len(),
+                            p.title,
+                            p.slug,
+                            body
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
+
+                println!(
+                    "  [{}] Aggregating {} {} page(s) into single compose call...",
+                    step.id,
+                    pages.len(),
+                    page_type
+                );
 
                 // Build a synthetic placeholder page to carry the combined context through the loop
                 let mut synthetic = Page::new(
@@ -2558,7 +2831,9 @@ impl Engine {
                     combined,
                 );
                 synthetic.title = format!("Aggregated {} pages", pages.len());
-                return self.run_aggregate_step(step, synthetic, &system_prompt, &deepseek).await;
+                return self
+                    .run_aggregate_step(step, synthetic, &system_prompt, &deepseek)
+                    .await;
             }
         };
 
@@ -2570,15 +2845,25 @@ impl Engine {
         // (LinkedSources staleness is handled per-anchor in the loop below)
         let pages_to_process: Vec<Page> = if step.incremental {
             match &step.output_mode {
-                OutputMode::SaveAs { page_type, slug_prefix, .. } => {
-                    input_pages.into_iter().filter(|p| {
-                        let out_slug = format!("{}{}", slug_prefix,
-                            p.slug.split('/').last().unwrap_or(&p.slug));
-                        // Skip if output page already exists and is newer than input
-                        self.get_page_updated_at_blocking(&out_slug)
-                            .map(|out_updated| p.updated_at > out_updated)
-                            .unwrap_or(true)
-                    }).collect()
+                OutputMode::SaveAs {
+                    page_type: _,
+                    slug_prefix,
+                    ..
+                } => {
+                    input_pages
+                        .into_iter()
+                        .filter(|p| {
+                            let out_slug = format!(
+                                "{}{}",
+                                slug_prefix,
+                                p.slug.split('/').last().unwrap_or(&p.slug)
+                            );
+                            // Skip if output page already exists and is newer than input
+                            self.get_page_updated_at_blocking(&out_slug)
+                                .map(|out_updated| p.updated_at > out_updated)
+                                .unwrap_or(true)
+                        })
+                        .collect()
                 }
                 OutputMode::SaveMulti { .. } => {
                     // For SaveMulti incremental: a source page is considered "done" if it
@@ -2612,9 +2897,11 @@ impl Engine {
         // When inject_existing_titles is set, we build a list of existing page titles
         // of that type and inject it into each LLM prompt. This prevents the LLM from
         // creating synonym variants of concepts that already exist.
-        let known_titles_block: Option<String> = if let Some(ref type_name) = step.inject_existing_titles {
+        let known_titles_block: Option<String> = if let Some(ref type_name) =
+            step.inject_existing_titles
+        {
             let titles: Vec<String> = sqlx::query_scalar(
-                "SELECT title FROM pages WHERE page_type = ?1 AND title != '' ORDER BY title"
+                "SELECT title FROM pages WHERE page_type = ?1 AND title != '' ORDER BY title",
             )
             .bind(type_name.as_str())
             .fetch_all(&self.inner.db)
@@ -2626,7 +2913,11 @@ impl Engine {
                 Some(format!(
                     "\n\nAlready-known {} names (if you extract something semantically equivalent, use the EXACT existing name — do NOT create a variant):\n{}",
                     type_name,
-                    titles.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+                    titles
+                        .iter()
+                        .map(|s| format!("- {}", s))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ))
             }
         } else {
@@ -2640,16 +2931,18 @@ impl Engine {
             source_page_type,
             dedup_sources_threshold,
             ..
-        } = &step.input {
+        } = &step.input
+        {
             if *dedup_sources_threshold > 0.0 {
                 let threshold = *dedup_sources_threshold;
                 // Build source sets for every anchor
-                let mut anchor_sources: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
+                let mut anchor_sources: Vec<(String, std::collections::HashSet<String>)> =
+                    Vec::new();
                 for page in &pages_to_process {
                     let srcs: std::collections::HashSet<String> = sqlx::query_scalar(
                         "SELECT DISTINCT l.source_slug FROM links l
                          JOIN pages p ON p.slug = l.source_slug
-                         WHERE l.target_slug = ?1 AND p.page_type = ?2"
+                         WHERE l.target_slug = ?1 AND p.page_type = ?2",
                     )
                     .bind(&page.slug)
                     .bind(source_page_type.as_str())
@@ -2664,31 +2957,44 @@ impl Engine {
                 // Mark the anchor with fewer sources in each near-duplicate pair
                 let mut skip: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for i in 0..anchor_sources.len() {
-                    if skip.contains(&anchor_sources[i].0) { continue; }
+                    if skip.contains(&anchor_sources[i].0) {
+                        continue;
+                    }
                     for j in (i + 1)..anchor_sources.len() {
-                        if skip.contains(&anchor_sources[j].0) { continue; }
+                        if skip.contains(&anchor_sources[j].0) {
+                            continue;
+                        }
                         let a = &anchor_sources[i].1;
                         let b = &anchor_sources[j].1;
                         let intersection = a.intersection(b).count();
                         let union = a.len() + b.len() - intersection;
-                        if union == 0 { continue; }
+                        if union == 0 {
+                            continue;
+                        }
                         let jaccard = intersection as f32 / union as f32;
                         if jaccard >= threshold {
                             // Skip the anchor with fewer sources; on tie, skip the later one
                             if a.len() >= b.len() {
                                 skip.insert(anchor_sources[j].0.clone());
-                                                println!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
-                                    anchor_sources[j].0, jaccard, anchor_sources[i].0);
+                                println!(
+                                    "  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[j].0, jaccard, anchor_sources[i].0
+                                );
                             } else {
                                 skip.insert(anchor_sources[i].0.clone());
-                                println!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
-                                    anchor_sources[i].0, jaccard, anchor_sources[j].0);
+                                println!(
+                                    "  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[i].0, jaccard, anchor_sources[j].0
+                                );
                                 break; // i is now skipped, move to next i
                             }
                         }
                     }
                 }
-                pages_to_process.into_iter().filter(|p| !skip.contains(&p.slug)).collect()
+                pages_to_process
+                    .into_iter()
+                    .filter(|p| !skip.contains(&p.slug))
+                    .collect()
             } else {
                 pages_to_process
             }
@@ -2705,25 +3011,37 @@ impl Engine {
         println!("  [{}] Processing {} page(s)...", step.id, total_pages);
 
         for (page_idx, page) in pages_to_process.iter().enumerate() {
-            println!("  [{}/{}] {} '{}'",
-                page_idx + 1, total_pages, step.id, page.slug);
+            println!(
+                "  [{}/{}] {} '{}'",
+                page_idx + 1,
+                total_pages,
+                step.id,
+                page.slug
+            );
             // Build user context
             let user_context = match &step.input {
                 InputSpec::SelfContent { .. } => {
-                    let base = format!("Slug: {}\nType: {}\nTitle: {}\n\n{}",
-                        page.slug, page.page_type, page.title, page.compiled_truth);
+                    let base = format!(
+                        "Slug: {}\nType: {}\nTitle: {}\n\n{}",
+                        page.slug, page.page_type, page.title, page.compiled_truth
+                    );
                     if let Some(ref block) = known_titles_block {
                         format!("{}{}", base, block)
                     } else {
                         base
                     }
                 }
-                InputSpec::LinkedSources { source_page_type, min_sources, use_chunks, .. } => {
+                InputSpec::LinkedSources {
+                    source_page_type,
+                    min_sources,
+                    use_chunks,
+                    ..
+                } => {
                     // Gather source pages linked to this anchor
                     let source_slugs: Vec<String> = sqlx::query_scalar(
                         "SELECT DISTINCT l.source_slug FROM links l
                          JOIN pages p ON p.slug = l.source_slug
-                         WHERE l.target_slug = ?1 AND p.page_type = ?2"
+                         WHERE l.target_slug = ?1 AND p.page_type = ?2",
                     )
                     .bind(&page.slug)
                     .bind(source_page_type.as_str())
@@ -2732,17 +3050,24 @@ impl Engine {
                     .unwrap_or_default();
 
                     if source_slugs.len() < *min_sources {
-                        println!("    → skip: only {}/{} source(s) required",
-                            source_slugs.len(), min_sources);
+                        println!(
+                            "    → skip: only {}/{} source(s) required",
+                            source_slugs.len(),
+                            min_sources
+                        );
                         continue; // not enough sources — skip this anchor
                     }
 
                     // Incremental staleness check for LinkedSources
                     if step.incremental {
                         if let OutputMode::SaveAs { slug_prefix, .. } = &step.output_mode {
-                            let out_slug = format!("{}{}", slug_prefix,
-                                page.slug.split('/').last().unwrap_or(&page.slug));
-                            if let Some(out_updated) = self.get_page_updated_at_blocking(&out_slug) {
+                            let out_slug = format!(
+                                "{}{}",
+                                slug_prefix,
+                                page.slug.split('/').last().unwrap_or(&page.slug)
+                            );
+                            if let Some(out_updated) = self.get_page_updated_at_blocking(&out_slug)
+                            {
                                 let any_newer = source_slugs.iter().any(|s| {
                                     self.get_page_updated_at_blocking(s)
                                         .map(|t| t > out_updated)
@@ -2755,7 +3080,10 @@ impl Engine {
                             }
                         }
                     }
-                    println!("    → synthesizing from {} source(s)...", source_slugs.len());
+                    println!(
+                        "    → synthesizing from {} source(s)...",
+                        source_slugs.len()
+                    );
 
                     // Build context from source pages
                     let mut context_items = Vec::new();
@@ -2764,7 +3092,7 @@ impl Engine {
                             if *use_chunks {
                                 let db_chunks: Vec<(i64, String)> = sqlx::query(
                                     "SELECT id, text FROM chunks WHERE page_slug = ?1
-                                     AND is_compiled_truth = 1 ORDER BY chunk_idx"
+                                     AND is_compiled_truth = 1 ORDER BY chunk_idx",
                                 )
                                 .bind(s)
                                 .fetch_all(&self.inner.db)
@@ -2775,32 +3103,49 @@ impl Engine {
                                 .collect();
 
                                 if db_chunks.is_empty() {
-                                    let snippet: String = src.compiled_truth.chars().take(800).collect();
-                                    context_items.push(format!("Source: {} | {}\n{}",
-                                        src.slug, src.title, snippet));
+                                    let snippet: String =
+                                        src.compiled_truth.chars().take(800).collect();
+                                    context_items.push(format!(
+                                        "Source: {} | {}\n{}",
+                                        src.slug, src.title, snippet
+                                    ));
                                 } else {
                                     let slug = &src.slug;
-                                    let chunks_text = db_chunks.iter()
-                                        .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
+                                    let chunks_text = db_chunks
+                                        .iter()
+                                        .map(|(id, text)| {
+                                            format!("[chunk:{} | {}] {}", id, slug, text)
+                                        })
                                         .collect::<Vec<_>>()
                                         .join("\n");
-                                    context_items.push(format!("Source: {} | {}\n{}",
-                                        src.slug, src.title, chunks_text));
+                                    context_items.push(format!(
+                                        "Source: {} | {}\n{}",
+                                        src.slug, src.title, chunks_text
+                                    ));
                                 }
                             } else {
-                                let snippet: String = src.compiled_truth.chars().take(800).collect();
-                                context_items.push(format!("Source: {} | {}\n{}",
-                                    src.slug, src.title, snippet));
+                                let snippet: String =
+                                    src.compiled_truth.chars().take(800).collect();
+                                context_items.push(format!(
+                                    "Source: {} | {}\n{}",
+                                    src.slug, src.title, snippet
+                                ));
                             }
                         }
                     }
                     let anchor_desc: String = page.compiled_truth.chars().take(500).collect();
-                    format!("Anchor: {} ({})\nDescription: {}\n\nSources:\n\n{}",
-                        page.title, page.slug, anchor_desc,
-                        context_items.join("\n\n---\n\n"))
+                    format!(
+                        "Anchor: {} ({})\nDescription: {}\n\nSources:\n\n{}",
+                        page.title,
+                        page.slug,
+                        anchor_desc,
+                        context_items.join("\n\n---\n\n")
+                    )
                 }
                 // AggregateContent never reaches this loop — it returns early via run_aggregate_step.
-                InputSpec::AggregateContent { .. } => unreachable!("AggregateContent is handled before the page loop"),
+                InputSpec::AggregateContent { .. } => {
+                    unreachable!("AggregateContent is handled before the page loop")
+                }
             };
 
             // Build the full user message — inject output_schema if present
@@ -2811,8 +3156,13 @@ impl Engine {
             };
 
             // ── 5. LLM call ────────────────────────────────────────────────────
-            println!("    → calling LLM (prompt: {})...",
-                match &step.prompt { PromptSpec::File(n) => n.as_str(), PromptSpec::Inline(_) => "<inline>" });
+            println!(
+                "    → calling LLM (prompt: {})...",
+                match &step.prompt {
+                    PromptSpec::File(n) => n.as_str(),
+                    PromptSpec::Inline(_) => "<inline>",
+                }
+            );
             let response = match deepseek.chat(&system_prompt, &user_msg).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -2827,17 +3177,25 @@ impl Engine {
                     let schema_hint = step.output_schema.as_deref();
                     let ds_clone = deepseek.clone();
                     let sys_clone = system_prompt.clone();
-                    match retry_parser.parse_with_retry::<Vec<serde_json::Value>, _, _>(
-                        &response,
-                        schema_hint,
-                        |fix_prompt| {
-                            let client = ds_clone.clone();
-                            let sys = sys_clone.clone();
-                            async move { client.chat(&sys, &fix_prompt).await.map_err(|e| BrainError::Io(
-                                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                            ))}
-                        },
-                    ).await {
+                    match retry_parser
+                        .parse_with_retry::<Vec<serde_json::Value>, _, _>(
+                            &response,
+                            schema_hint,
+                            |fix_prompt| {
+                                let client = ds_clone.clone();
+                                let sys = sys_clone.clone();
+                                async move {
+                                    client.chat(&sys, &fix_prompt).await.map_err(|e| {
+                                        BrainError::Io(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        ))
+                                    })
+                                }
+                            },
+                        )
+                        .await
+                    {
                         Ok(v) => v,
                         Err(_) => {
                             // Try as single object
@@ -2845,7 +3203,10 @@ impl Engine {
                             match serde_json::from_str::<serde_json::Value>(cleaned) {
                                 Ok(v) => vec![v],
                                 Err(e) => {
-                                    eprintln!("  [pipeline] WARN: JSON parse failed for {}: {}", page.slug, e);
+                                    eprintln!(
+                                        "  [pipeline] WARN: JSON parse failed for {}: {}",
+                                        page.slug, e
+                                    );
                                     continue;
                                 }
                             }
@@ -2864,16 +3225,23 @@ impl Engine {
                     all_results.extend(parsed_items);
                 }
 
-                OutputMode::SaveAs { page_type, slug_prefix, embed } => {
+                OutputMode::SaveAs {
+                    page_type,
+                    slug_prefix,
+                    embed,
+                } => {
                     for item in &parsed_items {
-                        let content = item.get("content")
+                        let content = item
+                            .get("content")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
                         let suffix = page.slug.split('/').last().unwrap_or(&page.slug);
                         let out_slug = format!("{}{}", slug_prefix, suffix);
                         let mut out_page = Page::new(out_slug.clone(), page_type.clone(), content);
-                        out_page.language = Some(rbrain_core::page::Language::detect(&out_page.compiled_truth));
+                        out_page.language = Some(rbrain_core::page::Language::detect(
+                            &out_page.compiled_truth,
+                        ));
                         self.put_page(out_page.clone()).await?;
                         if *embed && self.has_embedder() {
                             println!("    → embedding {}...", out_slug);
@@ -2892,7 +3260,8 @@ impl Engine {
                             if let Ok(mut p) = self.get_page(&page.slug).await {
                                 // Coerce non-object frontmatter to {} before merging
                                 if !p.frontmatter.is_object() {
-                                    p.frontmatter = serde_json::Value::Object(serde_json::Map::new());
+                                    p.frontmatter =
+                                        serde_json::Value::Object(serde_json::Map::new());
                                 }
                                 if let Some(fm) = p.frontmatter.as_object_mut() {
                                     for (k, v) in obj {
@@ -2915,11 +3284,15 @@ impl Engine {
                         for (key, cfg) in type_map {
                             if let Some(arr) = item.get(key).and_then(|v| v.as_array()) {
                                 for entry in arr {
-                                    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                                    let name = entry
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unnamed");
                                     if name.trim().is_empty() {
                                         continue;
                                     }
-                                    let content = entry.get("description")
+                                    let content = entry
+                                        .get("description")
                                         .or_else(|| entry.get("content"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
@@ -2943,16 +3316,20 @@ impl Engine {
                                     // enrich_existing: append new perspective to existing page
                                     // instead of overwriting (prevents losing earlier descriptions).
                                     let already_exists = sqlx::query_scalar::<_, i64>(
-                                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
+                                        "SELECT COUNT(*) FROM pages WHERE slug = ?1",
                                     )
                                     .bind(&out_slug)
                                     .fetch_one(&self.inner.db)
                                     .await
-                                    .unwrap_or(0) > 0;
+                                    .unwrap_or(0)
+                                        > 0;
 
                                     // Track whether content was actually appended this call.
                                     let mut did_enrich = false;
-                                    if cfg.enrich_existing && already_exists && !content.trim().is_empty() {
+                                    if cfg.enrich_existing
+                                        && already_exists
+                                        && !content.trim().is_empty()
+                                    {
                                         // Idempotency: only enrich if this source hasn't linked to
                                         // this concept before (prevents duplicate appends on re-run).
                                         let already_linked = sqlx::query_scalar::<_, i64>(
@@ -2965,9 +3342,13 @@ impl Engine {
                                         .unwrap_or(0) > 0;
 
                                         if !already_linked {
-                                            if let Ok(mut existing) = self.get_page(&out_slug).await {
+                                            if let Ok(mut existing) = self.get_page(&out_slug).await
+                                            {
+                                                // Use a heading separator instead of `---` to avoid
+                                                // corrupting split_body(), which uses rfind("\n---\n")
+                                                // to locate the timeline section.
                                                 let append = format!(
-                                                    "\n\n---\n\n*来源：{}*\n\n{}",
+                                                    "\n\n### 来源：{}\n\n{}",
                                                     page.slug,
                                                     content.trim()
                                                 );
@@ -2978,22 +3359,35 @@ impl Engine {
                                             }
                                         }
                                     } else {
-                                        let mut out_page = Page::new(out_slug.clone(), cfg.page_type.clone(), content);
+                                        let mut out_page = Page::new(
+                                            out_slug.clone(),
+                                            cfg.page_type.clone(),
+                                            content,
+                                        );
                                         out_page.title = name.to_string();
                                         self.put_page(out_page.clone()).await?;
                                         if cfg.embed && self.has_embedder() {
-                                            if let Err(e) = self.chunk_and_embed_page(&out_page).await {
-                                                eprintln!("    WARN: embed failed for {}: {}", out_slug, e);
+                                            if let Err(e) =
+                                                self.chunk_and_embed_page(&out_page).await
+                                            {
+                                                eprintln!(
+                                                    "    WARN: embed failed for {}: {}",
+                                                    out_slug, e
+                                                );
                                             }
                                         }
                                         created_count += 1;
                                     }
 
                                     // Link source page → extracted entity so LinkedSources can find it
-                                    if let Err(e) = self.add_link(
-                                        &page.slug, &out_slug, "mentions", None, None
-                                    ).await {
-                                        eprintln!("    WARN: link creation failed {}->{}: {}", page.slug, out_slug, e);
+                                    if let Err(e) = self
+                                        .add_link(&page.slug, &out_slug, "mentions", None, None)
+                                        .await
+                                    {
+                                        eprintln!(
+                                            "    WARN: link creation failed {}->{}: {}",
+                                            page.slug, out_slug, e
+                                        );
                                     }
                                     let action = if did_enrich {
                                         "enriched"
@@ -3011,7 +3405,10 @@ impl Engine {
                             }
                         }
                     }
-                    println!("    → extracted: {} new, {} enriched", created_count, enriched_count);
+                    println!(
+                        "    → extracted: {} new, {} enriched",
+                        created_count, enriched_count
+                    );
                 }
             }
         }
@@ -3030,13 +3427,26 @@ impl Engine {
     ) -> Result<Vec<serde_json::Value>> {
         use crate::pipeline::{OutputMode, PromptSpec, ResponseFormat};
 
-        let user_msg = format!("Topic: {}\n\n{}", synthetic_page.title, synthetic_page.compiled_truth);
-        println!("    → calling LLM (prompt: {})...",
-            match &step.prompt { PromptSpec::File(n) => n.as_str(), PromptSpec::Inline(_) => "<inline>" });
+        let user_msg = format!(
+            "Topic: {}\n\n{}",
+            synthetic_page.title, synthetic_page.compiled_truth
+        );
+        println!(
+            "    → calling LLM (prompt: {})...",
+            match &step.prompt {
+                PromptSpec::File(n) => n.as_str(),
+                PromptSpec::Inline(_) => "<inline>",
+            }
+        );
 
         let response = match deepseek.chat(system_prompt, &user_msg).await {
             Ok(r) => r,
-            Err(e) => return Err(BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+            Err(e) => {
+                return Err(BrainError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
+            }
         };
 
         let content = match step.response_format {
@@ -3051,10 +3461,16 @@ impl Engine {
 
         let mut results = vec![];
         match &step.output_mode {
-            OutputMode::SaveAs { page_type, slug_prefix, embed } => {
-                let out_slug = format!("{}compose", slug_prefix);
+            OutputMode::SaveAs {
+                page_type,
+                slug_prefix,
+                embed,
+            } => {
+                let out_slug = format!("{}{}", slug_prefix, step.id);
                 let mut out_page = Page::new(out_slug.clone(), page_type.clone(), content);
-                out_page.language = Some(rbrain_core::page::Language::detect(&out_page.compiled_truth));
+                out_page.language = Some(rbrain_core::page::Language::detect(
+                    &out_page.compiled_truth,
+                ));
                 self.put_page(out_page.clone()).await?;
                 if *embed && self.has_embedder() {
                     println!("    → embedding {}...", out_slug);
@@ -3087,7 +3503,7 @@ impl Engine {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-                    "SELECT updated_at FROM pages WHERE slug = ?1"
+                    "SELECT updated_at FROM pages WHERE slug = ?1",
                 )
                 .bind(&slug)
                 .fetch_optional(&db)
@@ -3104,7 +3520,7 @@ impl Engine {
         let run_embed = stage.is_none() || stage == Some("embed");
         let run_extract = stage.is_none() || stage == Some("extract");
         let run_synthesize = stage.is_none() || stage == Some("synthesize");
-        
+
         if run_lint {
             self.dream_lint().await?;
         }
@@ -3160,7 +3576,7 @@ impl Engine {
             println!("  No embedder configured, skipping embedding phase.");
             return Ok(());
         }
-        
+
         let pages = self.list_stale_pages().await?;
         if pages.is_empty() {
             println!("  All pages are up-to-date.");
@@ -3178,7 +3594,7 @@ impl Engine {
 
     async fn dream_extract(&self) -> Result<()> {
         println!("\n[Dream Cycle] Phase 3: Extracting concepts, figures, and timeline events...");
-        
+
         let query = "
             SELECT p.slug, p.page_type, p.title, p.compiled_truth, p.timeline, p.updated_at 
             FROM pages p 
@@ -3186,28 +3602,28 @@ impl Engine {
             WHERE (d.last_extracted_at IS NULL OR p.updated_at > d.last_extracted_at) 
               AND p.page_type = 'note'
         ";
-        
+
         let rows = sqlx::query(query)
             .fetch_all(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            
+
         if rows.is_empty() {
             println!("  No pages require extraction.");
             return Ok(());
         }
-        
+
         let deepseek = self.inner.deepseek.as_ref();
-        
+
         for row in rows {
             let slug: String = row.get("slug");
             let page_type: String = row.get("page_type");
             let title: String = row.get("title");
             let compiled_truth: String = row.get("compiled_truth");
             let timeline: String = row.get("timeline");
-            
+
             println!("  Extracting from page: {}", slug);
-            
+
             let knowledge = if let Some(client) = deepseek {
                 let system = self.inner.prompts.load("extract_academic");
 
@@ -3219,23 +3635,37 @@ impl Engine {
                 .await
                 .unwrap_or_default();
 
-                let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
+                let display_title = if title.trim().is_empty() {
+                    slug.as_str()
+                } else {
+                    title.as_str()
+                };
                 let known_concepts_block = if existing_concepts.is_empty() {
                     String::new()
                 } else {
                     format!(
                         "\n\nAlready-known concepts (if a concept you extract is semantically equivalent to one of these, use that EXACT name — do NOT create a variant):\n{}",
-                        existing_concepts.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+                        existing_concepts
+                            .iter()
+                            .map(|s| format!("- {}", s))
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     )
                 };
-                let user = format!("Source slug: {}\nTitle: {}\nType: {}{}\n\nContent:\n{}", slug, display_title, page_type, known_concepts_block, compiled_truth);
+                let user = format!(
+                    "Source slug: {}\nTitle: {}\nType: {}{}\n\nContent:\n{}",
+                    slug, display_title, page_type, known_concepts_block, compiled_truth
+                );
                 match client.chat(&system, &user).await {
                     Ok(resp) => {
                         let cleaned = clean_json(&resp);
                         match serde_json::from_str::<ExtractedKnowledge>(cleaned) {
                             Ok(k) => k,
                             Err(e) => {
-                                eprintln!("    WARN: failed to parse JSON from LLM: {}. Response was: {}", e, resp);
+                                eprintln!(
+                                    "    WARN: failed to parse JSON from LLM: {}. Response was: {}",
+                                    e, resp
+                                );
                                 continue;
                             }
                         }
@@ -3262,19 +3692,21 @@ impl Engine {
                 };
                 self.mock_extract_knowledge(&page)
             };
-            
+
             // 1. Save extracted concepts
             for concept in &knowledge.concepts {
                 if concept.name.trim().is_empty() {
                     continue;
                 }
                 let concept_slug = format!("research/concepts/{}", slugify(&concept.name));
-                let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
-                    .bind(&concept_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
-                    
+                let exists =
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                        .bind(&concept_slug)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0)
+                        > 0;
+
                 if !exists {
                     let desc = MarkdownParser::normalize_llm_output(&concept.description);
                     let mut cp = Page::new(concept_slug.clone(), "concept".to_string(), desc);
@@ -3297,42 +3729,79 @@ impl Engine {
                 }
 
                 // Link source -> concept (anchor to chunk if context can be located)
-                let link_ctx = if concept.context.is_empty() { None } else { Some(concept.context.clone()) };
-                let chunk_id = self.find_chunk_id_for_context(&slug, &concept.context).await;
-                if let Err(e) = self.add_link(&slug, &concept_slug, "related", link_ctx.as_deref(), chunk_id).await {
-                    eprintln!("    WARN: failed to create link from {} to {}: {}", slug, concept_slug, e);
+                let link_ctx = if concept.context.is_empty() {
+                    None
+                } else {
+                    Some(concept.context.clone())
+                };
+                let chunk_id = self
+                    .find_chunk_id_for_context(&slug, &concept.context)
+                    .await;
+                if let Err(e) = self
+                    .add_link(
+                        &slug,
+                        &concept_slug,
+                        "related",
+                        link_ctx.as_deref(),
+                        chunk_id,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "    WARN: failed to create link from {} to {}: {}",
+                        slug, concept_slug, e
+                    );
                 }
             }
-            
+
             // 2. Save extracted figures
             for figure in &knowledge.figures {
                 if figure.name.trim().is_empty() {
                     continue;
                 }
                 let figure_slug = format!("research/figures/{}", slugify(&figure.name));
-                let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
-                    .bind(&figure_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
-                    
+                let exists =
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                        .bind(&figure_slug)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0)
+                        > 0;
+
                 if !exists {
                     let fig_desc = MarkdownParser::normalize_llm_output(&figure.description);
-                    let mut fp = Page::new(figure_slug.clone(), "figure".to_string(), fig_desc.clone());
+                    let mut fp =
+                        Page::new(figure_slug.clone(), "figure".to_string(), fig_desc.clone());
                     fp.title = figure.name.clone();
                     fp.language = Some(rbrain_core::page::Language::detect(&fig_desc));
                     self.put_page(fp).await?;
                     println!("    Created figure page: {}", figure_slug);
                 }
-                
+
                 // Link source -> figure (anchor to chunk if context can be located)
-                let link_ctx = if figure.context.is_empty() { None } else { Some(figure.context.clone()) };
+                let link_ctx = if figure.context.is_empty() {
+                    None
+                } else {
+                    Some(figure.context.clone())
+                };
                 let chunk_id = self.find_chunk_id_for_context(&slug, &figure.context).await;
-                if let Err(e) = self.add_link(&slug, &figure_slug, "related", link_ctx.as_deref(), chunk_id).await {
-                    eprintln!("    WARN: failed to create link from {} to {}: {}", slug, figure_slug, e);
+                if let Err(e) = self
+                    .add_link(
+                        &slug,
+                        &figure_slug,
+                        "related",
+                        link_ctx.as_deref(),
+                        chunk_id,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "    WARN: failed to create link from {} to {}: {}",
+                        slug, figure_slug, e
+                    );
                 }
             }
-            
+
             // 3. Save extracted events on a related figure page when possible.
             // Otherwise preserve them on a derived evidence page. Source notes,
             // especially raw articles, are immutable evidence and must not receive
@@ -3356,27 +3825,30 @@ impl Engine {
                 let fig_exists = if fig.is_empty() {
                     false
                 } else {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
-                    )
-                    .bind(fig)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                        .bind(fig)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0)
+                        > 0
                 };
                 let target_slug = if fig_exists {
                     fig.to_string()
                 } else {
                     let evidence_slug = format!("research/evidence/events/{}", slug);
-                    let evidence_exists = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
-                    )
-                    .bind(&evidence_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
+                    let evidence_exists =
+                        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                            .bind(&evidence_slug)
+                            .fetch_one(&self.inner.db)
+                            .await
+                            .unwrap_or(0)
+                            > 0;
                     if !evidence_exists {
-                        let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
+                        let display_title = if title.trim().is_empty() {
+                            slug.as_str()
+                        } else {
+                            title.as_str()
+                        };
                         let body = format!(
                             "从来源文献 `{}` 自动抽取的时间线证据记录。\n\n\
                              本页为研究辅助材料，事件表述需回到原文核验。",
@@ -3388,21 +3860,40 @@ impl Engine {
                         self.put_page(ep).await?;
                         println!("    Created event evidence page: {}", evidence_slug);
                     }
-                    let link_ctx = if event.context.is_empty() { None } else { Some(event.context.as_str()) };
+                    let link_ctx = if event.context.is_empty() {
+                        None
+                    } else {
+                        Some(event.context.as_str())
+                    };
                     let chunk_id = self.find_chunk_id_for_context(&slug, &event.context).await;
-                    if let Err(e) = self.add_link(&evidence_slug, &slug, "evidence", link_ctx, chunk_id).await {
-                        eprintln!("    WARN: failed to link event evidence {} to {}: {}", evidence_slug, slug, e);
+                    if let Err(e) = self
+                        .add_link(&evidence_slug, &slug, "evidence", link_ctx, chunk_id)
+                        .await
+                    {
+                        eprintln!(
+                            "    WARN: failed to link event evidence {} to {}: {}",
+                            evidence_slug, slug, e
+                        );
                     }
                     evidence_slug
                 };
 
-                if let Err(e) = self.add_timeline_entry(&target_slug, date_str, &event.description, event_src).await {
-                    eprintln!("    WARN: failed to add timeline entry to {}: {}", target_slug, e);
+                if let Err(e) = self
+                    .add_timeline_entry(&target_slug, date_str, &event.description, event_src)
+                    .await
+                {
+                    eprintln!(
+                        "    WARN: failed to add timeline entry to {}: {}",
+                        target_slug, e
+                    );
                 } else {
-                    println!("    Added timeline event to {}: {} on {}", target_slug, event.description, date_str);
+                    println!(
+                        "    Added timeline event to {}: {} on {}",
+                        target_slug, event.description, date_str
+                    );
                 }
             }
-            
+
             // 4. Write academic_meta to note page frontmatter (only fills missing fields)
             {
                 let meta = &knowledge.academic_meta;
@@ -3416,7 +3907,10 @@ impl Engine {
                         {
                             if let Some(fm) = page.frontmatter.as_object_mut() {
                                 if !meta.authors.is_empty() && !fm.contains_key("authors") {
-                                    fm.insert("authors".to_string(), serde_json::json!(meta.authors));
+                                    fm.insert(
+                                        "authors".to_string(),
+                                        serde_json::json!(meta.authors),
+                                    );
                                     for a in &meta.authors {
                                         if !page.tags.contains(a) {
                                             page.tags.push(a.clone());
@@ -3426,22 +3920,28 @@ impl Engine {
                                 }
                                 if let Some(y) = meta.year {
                                     if !fm.contains_key("year") {
-                                        fm.insert("year".to_string(),
-                                            serde_json::Value::String(y.to_string()));
+                                        fm.insert(
+                                            "year".to_string(),
+                                            serde_json::Value::String(y.to_string()),
+                                        );
                                         changed = true;
                                     }
                                 }
                                 if let Some(ref j) = meta.journal {
                                     if !fm.contains_key("journal") && !j.trim().is_empty() {
-                                        fm.insert("journal".to_string(),
-                                            serde_json::Value::String(j.clone()));
+                                        fm.insert(
+                                            "journal".to_string(),
+                                            serde_json::Value::String(j.clone()),
+                                        );
                                         changed = true;
                                     }
                                 }
                                 if let Some(ref d) = meta.doi {
                                     if !fm.contains_key("doi") && !d.trim().is_empty() {
-                                        fm.insert("doi".to_string(),
-                                            serde_json::Value::String(d.clone()));
+                                        fm.insert(
+                                            "doi".to_string(),
+                                            serde_json::Value::String(d.clone()),
+                                        );
                                         changed = true;
                                     }
                                 }
@@ -3449,7 +3949,10 @@ impl Engine {
                         }
                         if changed {
                             if let Err(e) = self.put_page_force(page).await {
-                                eprintln!("    WARN: failed to write academic_meta for {}: {}", slug, e);
+                                eprintln!(
+                                    "    WARN: failed to write academic_meta for {}: {}",
+                                    slug, e
+                                );
                             } else {
                                 println!("    Written academic_meta to frontmatter of {}", slug);
                             }
@@ -3465,7 +3968,7 @@ impl Engine {
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
-        
+
         Ok(())
     }
 
@@ -3474,7 +3977,8 @@ impl Engine {
 
         // Collect all concept pages
         let all_pages = self.list_pages(None, None, None, None, None).await?;
-        let concept_pages: Vec<Page> = all_pages.into_iter()
+        let concept_pages: Vec<Page> = all_pages
+            .into_iter()
             .filter(|p| p.page_type == "concept")
             .collect();
 
@@ -3495,7 +3999,7 @@ impl Engine {
                 "SELECT DISTINCT l.source_slug FROM links l
                  JOIN pages p ON p.slug = l.source_slug
                  WHERE l.target_slug = ?1
-                 AND p.page_type = 'note'"
+                 AND p.page_type = 'note'",
             )
             .bind(&concept.slug)
             .fetch_all(&self.inner.db)
@@ -3512,16 +4016,24 @@ impl Engine {
             let is_near_duplicate = committed_sources.iter().any(|(prev_slug, prev_set)| {
                 let intersection = src_set.intersection(prev_set).count();
                 let union = src_set.len() + prev_set.len() - intersection;
-                let jaccard = if union == 0 { 0.0 } else { intersection as f32 / union as f32 };
+                let jaccard = if union == 0 {
+                    0.0
+                } else {
+                    intersection as f32 / union as f32
+                };
                 if jaccard >= dedup_threshold {
-                    eprintln!("  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
-                        concept.slug, jaccard, prev_slug);
+                    eprintln!(
+                        "  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                        concept.slug, jaccard, prev_slug
+                    );
                     true
                 } else {
                     false
                 }
             });
-            if is_near_duplicate { continue; }
+            if is_near_duplicate {
+                continue;
+            }
             committed_sources.push((concept.slug.clone(), src_set));
 
             // Fetch the actual source pages
@@ -3532,14 +4044,18 @@ impl Engine {
                 }
             }
 
-            let synthesis_slug = format!("research/synthesis/{}", concept.slug.trim_start_matches("research/concepts/"));
+            let synthesis_slug = format!(
+                "research/synthesis/{}",
+                concept.slug.trim_start_matches("research/concepts/")
+            );
             let existing_synth = self.get_page(&synthesis_slug).await.ok();
 
             // Staleness check: re-synthesize if any source is newer than the synthesis
             let mut is_stale = true;
             if let Some(ref synth) = existing_synth {
                 let synth_updated = synth.updated_at;
-                let max_source_updated = source_pages.iter()
+                let max_source_updated = source_pages
+                    .iter()
                     .map(|p| p.updated_at)
                     .max()
                     .unwrap_or(synth_updated);
@@ -3553,18 +4069,23 @@ impl Engine {
                 continue;
             }
 
-            println!("  Synthesizing '{}' ({} source articles)...", concept.slug, source_pages.len());
+            println!(
+                "  Synthesizing '{}' ({} source articles)...",
+                concept.slug,
+                source_pages.len()
+            );
 
             let concept_desc = if concept.compiled_truth.is_empty() {
                 concept.title.clone()
             } else {
                 let mut idx = 500;
-                while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) { idx -= 1; }
+                while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) {
+                    idx -= 1;
+                }
                 concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
             };
 
             let synthesized_content = if let Some(client) = deepseek {
-
                 let system = self.inner.prompts.load("synthesize_academic");
 
                 let mut context_items = Vec::new();
@@ -3586,17 +4107,23 @@ impl Engine {
                     if db_chunks.is_empty() {
                         // Fallback: page not yet chunked, use text snippet
                         let mut idx = 800;
-                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) { idx -= 1; }
-                        let snippet = p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
-                        context_items.push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
+                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
+                            idx -= 1;
+                        }
+                        let snippet =
+                            p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
+                        context_items
+                            .push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
                     } else {
                         let slug = &p.slug;
-                        let chunk_blocks: Vec<String> = db_chunks.iter()
+                        let chunk_blocks: Vec<String> = db_chunks
+                            .iter()
                             .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
                             .collect();
                         context_items.push(format!(
                             "Source: {} | {}\n{}",
-                            p.slug, p.title,
+                            p.slug,
+                            p.title,
                             chunk_blocks.join("\n")
                         ));
                     }
@@ -3604,14 +4131,19 @@ impl Engine {
 
                 let user = format!(
                     "Concept: {} (slug: {})\nDescription: {}\n\nSource Articles:\n\n{}",
-                    concept.title, concept.slug, concept_desc,
+                    concept.title,
+                    concept.slug,
+                    concept_desc,
                     context_items.join("\n\n---\n\n")
                 );
 
                 match client.chat(&system, &user).await {
                     Ok(resp) => MarkdownParser::normalize_llm_output(&resp),
                     Err(e) => {
-                        eprintln!("    WARN: LLM call failed for {}: {}. Using mock.", concept.slug, e);
+                        eprintln!(
+                            "    WARN: LLM call failed for {}: {}. Using mock.",
+                            concept.slug, e
+                        );
                         self.generate_mock_concept_synthesis(concept, &source_pages)
                     }
                 }
@@ -3619,10 +4151,16 @@ impl Engine {
                 self.generate_mock_concept_synthesis(concept, &source_pages)
             };
 
-            let mut synth_page = Page::new(synthesis_slug.clone(), "synthesis".to_string(), synthesized_content);
+            let mut synth_page = Page::new(
+                synthesis_slug.clone(),
+                "synthesis".to_string(),
+                synthesized_content,
+            );
             synth_page.title = format!("综合分析：{}", concept.title);
             synth_page.tags = concept.tags.clone();
-            synth_page.language = Some(rbrain_core::page::Language::detect(&synth_page.compiled_truth));
+            synth_page.language = Some(rbrain_core::page::Language::detect(
+                &synth_page.compiled_truth,
+            ));
 
             self.put_page(synth_page.clone()).await?;
             println!("    Saved: {}", synthesis_slug);
@@ -3634,10 +4172,20 @@ impl Engine {
             }
 
             // Link the synthesis back to the concept and its sources
-            let _ = self.add_link(&synthesis_slug, &concept.slug, "develops", Some(&concept_desc), None).await;
+            let _ = self
+                .add_link(
+                    &synthesis_slug,
+                    &concept.slug,
+                    "develops",
+                    Some(&concept_desc),
+                    None,
+                )
+                .await;
             for p in &source_pages {
                 let ctx = format!("{} ({})", p.title, p.slug);
-                let _ = self.add_link(&synthesis_slug, &p.slug, "evidence", Some(&ctx), None).await;
+                let _ = self
+                    .add_link(&synthesis_slug, &p.slug, "evidence", Some(&ctx), None)
+                    .await;
             }
 
             synthesized += 1;
@@ -3651,7 +4199,7 @@ impl Engine {
 
         Ok(())
     }
-    
+
     fn generate_mock_concept_synthesis(&self, concept: &Page, source_pages: &[Page]) -> String {
         let mut md = format!("# 综合分析：{}\n\n", concept.title);
         md.push_str("## 概念说明\n\n");
@@ -3676,23 +4224,34 @@ impl Engine {
         if text.contains("预训练") || text.contains("pretrained") {
             concepts.push(ExtractedConcept {
                 name: "预训练语言模型".to_string(),
-                description: "Pre-trained Language Models (PLMs) that are trained on large scale corpora.".to_string(),
+                description:
+                    "Pre-trained Language Models (PLMs) that are trained on large scale corpora."
+                        .to_string(),
                 context: "近年来，预训练语言模型在自然语言处理领域取得了显著的进展。".to_string(),
             });
             figures.push(ExtractedFigure {
                 name: "BERT".to_string(),
-                description: "A popular bidirectional encoder representation model from Google.".to_string(),
-                context: "对比了基于BERT and RoBERTa等不同架构的模型在多个数据集上的表现。".to_string(),
+                description: "A popular bidirectional encoder representation model from Google."
+                    .to_string(),
+                context: "对比了基于BERT and RoBERTa等不同架构的模型在多个数据集上的表现。"
+                    .to_string(),
             });
             events.push(ExtractedEvent {
                 date: "2018-10-11".to_string(),
-                description: "BERT model was officially released by Google researchers.".to_string(),
-                context: "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。".to_string(),
+                description: "BERT model was officially released by Google researchers."
+                    .to_string(),
+                context:
+                    "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。"
+                        .to_string(),
                 figure_slug: "research/figures/bert".to_string(),
             });
         } else {
             let words: Vec<&str> = page.title.split_whitespace().collect();
-            let name = if !words.is_empty() { words[0] } else { "Mock Concept" };
+            let name = if !words.is_empty() {
+                words[0]
+            } else {
+                "Mock Concept"
+            };
             concepts.push(ExtractedConcept {
                 name: format!("Concept {}", name),
                 description: format!("A mock academic concept extracted for {}", page.title),
@@ -3711,7 +4270,12 @@ impl Engine {
             });
         }
 
-        ExtractedKnowledge { concepts, figures, events, academic_meta: AcademicMeta::default() }
+        ExtractedKnowledge {
+            concepts,
+            figures,
+            events,
+            academic_meta: AcademicMeta::default(),
+        }
     }
 
     /// Rebuild the link index for a single page from its wikilink content (no re-embed).
@@ -3762,20 +4326,31 @@ impl Engine {
             let slug_norm = MarkdownParser::normalize_slug(&link.target_slug);
             cited_slugs.insert(slug_norm.clone());
 
-            let pt: Option<String> = sqlx::query_scalar(
-                "SELECT page_type FROM pages WHERE slug = ?1"
-            )
-            .bind(&slug_norm)
-            .fetch_optional(&self.inner.db)
-            .await
-            .unwrap_or(None);
+            let pt: Option<String> =
+                sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
+                    .bind(&slug_norm)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .unwrap_or(None);
 
             if let Some(page_type) = pt {
                 if matches!(page_type.as_str(), "draft" | "synthesis" | "wiki") {
                     let (severity, msg) = if page_type == "draft" {
-                        ("ERROR", format!("自引草稿: [[{}]] 是会话草稿，应替换为原始 raw 文章", slug_norm))
+                        (
+                            "ERROR",
+                            format!(
+                                "自引草稿: [[{}]] 是会话草稿，应替换为原始 raw 文章",
+                                slug_norm
+                            ),
+                        )
                     } else {
-                        ("ERROR", format!("非原始文献: [[{}]] 是系统生成的 {} 页，应追溯至 raw 原始文章", slug_norm, page_type))
+                        (
+                            "ERROR",
+                            format!(
+                                "非原始文献: [[{}]] 是系统生成的 {} 页，应追溯至 raw 原始文章",
+                                slug_norm, page_type
+                            ),
+                        )
                     };
 
                     // Suggest replacements: first try direct outlinks to raw/note,
@@ -3785,7 +4360,7 @@ impl Engine {
                          JOIN pages p ON p.slug = l.target_slug \
                          WHERE l.source_slug = ?1 AND p.page_type IN ('raw', 'note') \
                          ORDER BY l.created_at DESC \
-                         LIMIT 5"
+                         LIMIT 5",
                     )
                     .bind(&slug_norm)
                     .fetch_all(&self.inner.db)
@@ -3802,7 +4377,7 @@ impl Engine {
                              WHERE l1.source_slug = ?1 AND p1.page_type = 'concept' \
                                AND p2.page_type IN ('raw', 'note') \
                              ORDER BY l2.created_at DESC \
-                             LIMIT 5"
+                             LIMIT 5",
                         )
                         .bind(&slug_norm)
                         .fetch_all(&self.inner.db)
@@ -3831,7 +4406,8 @@ impl Engine {
 
         // ── Parse bibliography section ─────────────────────────────────────────────
         // Format: "[N] Title [Author] — raw/slug"
-        let bib_section = page.compiled_truth
+        let bib_section = page
+            .compiled_truth
             .find("\n\n## 参考文献")
             .map(|pos| &page.compiled_truth[pos..]);
 
@@ -3859,19 +4435,25 @@ impl Engine {
         // wikilinks and bibliography entries due to editor/LLM differences).
         let slug_key = |s: &str| -> String {
             MarkdownParser::normalize_slug(s)
-                .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
-                .replace('\u{2018}', "'").replace('\u{2019}', "'")
+                .replace('\u{201C}', "\"")
+                .replace('\u{201D}', "\"")
+                .replace('\u{2018}', "'")
+                .replace('\u{2019}', "'")
         };
 
         // ── Check 2: Duplicate bibliography entries ────────────────────────────────
-        let mut seen_bib_slugs: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+        let mut seen_bib_slugs: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
         for (num, _title, bib_slug) in &bib_entries {
             let norm_key = slug_key(bib_slug);
             if let Some((first_num, first_slug)) = seen_bib_slugs.get(&norm_key) {
                 findings.push(AuditFinding {
                     severity: "WARN",
                     category: "bib_duplicate",
-                    message: format!("重复参考文献: [{}] 与 [{}] 指向同一文章 {}", num, first_num, first_slug),
+                    message: format!(
+                        "重复参考文献: [{}] 与 [{}] 指向同一文章 {}",
+                        num, first_num, first_slug
+                    ),
                     suggestion: Some(format!("删除 [{}]，保留 [{}]", num, first_num)),
                     auto_fixable: true,
                 });
@@ -3886,8 +4468,10 @@ impl Engine {
         let ct_nfc = MarkdownParser::normalize_slug(&page.compiled_truth);
         // ct with ASCII-normalized quotes for matching curly-quote bib slugs
         let ct_ascii_quotes = ct_nfc
-            .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
-            .replace('\u{2018}', "'").replace('\u{2019}', "'");
+            .replace('\u{201C}', "\"")
+            .replace('\u{201D}', "\"")
+            .replace('\u{2018}', "'")
+            .replace('\u{2019}', "'");
         for (_num, _title, bib_slug) in &bib_entries {
             let norm_bib = slug_key(bib_slug);
             // Check: does compiled_truth contain [[bib_slug (as a wikilink prefix)?
@@ -3910,22 +4494,32 @@ impl Engine {
         }
 
         // ── Check 4: In-text citations not in bibliography ─────────────────────────
-        let bib_slug_set: std::collections::HashSet<String> = bib_entries.iter()
+        let bib_slug_set: std::collections::HashSet<String> = bib_entries
+            .iter()
             .map(|(_, _, s)| MarkdownParser::normalize_slug(s))
             .collect();
         for slug_ref in &cited_slugs {
             if slug_ref.starts_with("raw/") || {
-                let pt: Option<String> = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
-                    .bind(slug_ref).fetch_optional(&self.inner.db).await.unwrap_or(None);
+                let pt: Option<String> =
+                    sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
+                        .bind(slug_ref)
+                        .fetch_optional(&self.inner.db)
+                        .await
+                        .unwrap_or(None);
                 pt.as_deref() == Some("note")
             } {
                 let in_bib = bib_slug_set.contains(slug_ref)
-                    || bib_slug_set.iter().any(|b| b.ends_with(slug_ref.as_str()) || slug_ref.ends_with(b.as_str()));
+                    || bib_slug_set
+                        .iter()
+                        .any(|b| b.ends_with(slug_ref.as_str()) || slug_ref.ends_with(b.as_str()));
                 if !in_bib && !bib_entries.is_empty() {
                     findings.push(AuditFinding {
                         severity: "INFO",
                         category: "bib_missing",
-                        message: format!("未收录引用: [[{}]] 出现在正文但参考文献列表无此条目", slug_ref),
+                        message: format!(
+                            "未收录引用: [[{}]] 出现在正文但参考文献列表无此条目",
+                            slug_ref
+                        ),
                         suggestion: Some("运行 `rbrain cite --append` 更新参考文献".to_string()),
                         auto_fixable: false,
                     });
@@ -3935,7 +4529,8 @@ impl Engine {
 
         // ── --fix: Remove duplicate and orphan bibliography entries ───────────────
         if fix && !bib_entries.is_empty() {
-            let orphan_slugs: std::collections::HashSet<String> = bib_entries.iter()
+            let orphan_slugs: std::collections::HashSet<String> = bib_entries
+                .iter()
                 .filter(|(_, _, bib_slug)| {
                     let norm = slug_key(bib_slug);
                     let wl = format!("[[{}", bib_slug);
@@ -3949,11 +4544,13 @@ impl Engine {
                 .collect();
 
             let mut kept: Vec<(usize, String, String)> = Vec::new();
-            let mut seen_for_fix: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_for_fix: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (num, title, bib_slug) in &bib_entries {
                 let norm = slug_key(bib_slug);
                 // Mark as removable if it's a duplicate (seen_for_fix already has this norm) or an orphan
-                if seen_for_fix.contains(&norm) || orphan_slugs.contains(bib_slug.as_str())
+                if seen_for_fix.contains(&norm)
+                    || orphan_slugs.contains(bib_slug.as_str())
                     || orphan_slugs.iter().any(|o| slug_key(o) == norm)
                 {
                     fixed.push(format!("删除: [{}] {} — {}", num, title, bib_slug));
@@ -3979,7 +4576,11 @@ impl Engine {
             }
         }
 
-        Ok(AuditReport { slug: normalized, findings, fixed })
+        Ok(AuditReport {
+            slug: normalized,
+            findings,
+            fixed,
+        })
     }
 
     /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
@@ -3988,7 +4589,8 @@ impl Engine {
         let normalized = MarkdownParser::normalize_slug(slug);
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut sources: Vec<CiteEntry> = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<String>, u8)> = std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<(String, Vec<String>, u8)> =
+            std::collections::VecDeque::new();
 
         visited.insert(normalized.clone());
         queue.push_back((normalized.clone(), vec![normalized.clone()], 0));
@@ -4004,13 +4606,12 @@ impl Engine {
 
                 let is_source = target.starts_with("raw/") || {
                     // also include notes/ pages as primary sources
-                    let pt: Option<String> = sqlx::query_scalar(
-                        "SELECT page_type FROM pages WHERE slug = ?1"
-                    )
-                    .bind(target)
-                    .fetch_optional(&self.inner.db)
-                    .await
-                    .unwrap_or(None);
+                    let pt: Option<String> =
+                        sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
+                            .bind(target)
+                            .fetch_optional(&self.inner.db)
+                            .await
+                            .unwrap_or(None);
                     pt.as_deref() == Some("note")
                 };
 
@@ -4018,14 +4619,13 @@ impl Engine {
                 new_path.push(target.clone());
 
                 if is_source {
-                    let stored_title: Option<String> = sqlx::query_scalar(
-                        "SELECT NULLIF(title, '') FROM pages WHERE slug = ?1"
-                    )
-                    .bind(target)
-                    .fetch_optional(&self.inner.db)
-                    .await
-                    .unwrap_or(None)
-                    .flatten();
+                    let stored_title: Option<String> =
+                        sqlx::query_scalar("SELECT NULLIF(title, '') FROM pages WHERE slug = ?1")
+                            .bind(target)
+                            .fetch_optional(&self.inner.db)
+                            .await
+                            .unwrap_or(None)
+                            .flatten();
                     // If no stored title, derive from slug: last path segment, split on '_' for author
                     let title = stored_title.unwrap_or_else(|| {
                         let stem = target.rsplit('/').next().unwrap_or(target.as_str());
@@ -4039,7 +4639,7 @@ impl Engine {
                     });
 
                     let page_type = sqlx::query_scalar::<_, String>(
-                        "SELECT page_type FROM pages WHERE slug = ?1"
+                        "SELECT page_type FROM pages WHERE slug = ?1",
                     )
                     .bind(target)
                     .fetch_optional(&self.inner.db)
@@ -4076,19 +4676,25 @@ impl Engine {
     pub async fn merge_similar_concepts(&self, threshold: f32) -> Result<Vec<MergeRecord>> {
         let embedder = match &self.inner.embedder {
             Some(e) => e.clone(),
-            None => return Err(BrainError::ApiUnreachable {
-                provider: "embedder".to_string(),
-                message: "Embedder required for concept merging".to_string(),
-            }),
+            None => {
+                return Err(BrainError::ApiUnreachable {
+                    provider: "embedder".to_string(),
+                    message: "Embedder required for concept merging".to_string(),
+                });
+            }
         };
 
-        let concepts = self.list_pages(Some("concept"), None, None, None, None).await?;
+        let concepts = self
+            .list_pages(Some("concept"), None, None, None, None)
+            .await?;
         if concepts.len() < 2 {
             return Ok(vec![]);
         }
 
         let titles: Vec<String> = concepts.iter().map(|c| c.title.clone()).collect();
-        let embeddings = embedder.embed_batch(&titles).await
+        let embeddings = embedder
+            .embed_batch(&titles)
+            .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let n = concepts.len();
@@ -4096,13 +4702,17 @@ impl Engine {
         // Union-Find helpers (index-based)
         let mut parent: Vec<usize> = (0..n).collect();
         fn find(parent: &mut Vec<usize>, x: usize) -> usize {
-            if parent[x] != x { parent[x] = find(parent, parent[x]); }
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
             parent[x]
         }
         fn union(parent: &mut Vec<usize>, x: usize, y: usize) {
             let px = find(parent, x);
             let py = find(parent, y);
-            if px != py { parent[px] = py; }
+            if px != py {
+                parent[px] = py;
+            }
         }
 
         // Cosine similarity between two f32 vecs
@@ -4110,7 +4720,11 @@ impl Engine {
             let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
             let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
             let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+            if na == 0.0 || nb == 0.0 {
+                0.0
+            } else {
+                dot / (na * nb)
+            }
         }
 
         // Find pairs above threshold and union them
@@ -4130,7 +4744,8 @@ impl Engine {
         }
 
         // Group concepts by cluster root
-        let mut clusters: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
         for i in 0..n {
             let root = find(&mut parent, i);
             clusters.entry(root).or_default().push(i);
@@ -4139,56 +4754,65 @@ impl Engine {
         let mut records: Vec<MergeRecord> = Vec::new();
 
         for (_root, members) in &clusters {
-            if members.len() < 2 { continue; }
+            if members.len() < 2 {
+                continue;
+            }
 
             // Get inbound link counts for each member
             let mut counts: Vec<(usize, i64)> = Vec::new();
             for &idx in members {
                 let slug = &concepts[idx].slug;
-                let cnt: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM links WHERE target_slug = ?1"
-                )
-                .bind(slug)
-                .fetch_one(&self.inner.db)
-                .await
-                .unwrap_or(0);
+                let cnt: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE target_slug = ?1")
+                        .bind(slug)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0);
                 counts.push((idx, cnt));
             }
             // Keep the one with the most inbound links (tie: keep longest title as tiebreaker)
-            counts.sort_by(|a, b| b.1.cmp(&a.1)
-                .then(concepts[b.0].title.len().cmp(&concepts[a.0].title.len())));
+            counts.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then(concepts[b.0].title.len().cmp(&concepts[a.0].title.len()))
+            });
             let (keeper_idx, _) = counts[0];
             let keeper_slug = concepts[keeper_idx].slug.clone();
 
             for &(dropped_idx, _) in &counts[1..] {
                 let dropped_slug = concepts[dropped_idx].slug.clone();
                 // Find the similarity for this pair (use max across all similar_pairs)
-                let sim = similar_pairs.iter()
+                let sim = similar_pairs
+                    .iter()
                     .filter(|(i, j, _)| {
-                        (*i == keeper_idx && *j == dropped_idx) ||
-                        (*i == dropped_idx && *j == keeper_idx)
+                        (*i == keeper_idx && *j == dropped_idx)
+                            || (*i == dropped_idx && *j == keeper_idx)
                     })
                     .map(|(_, _, s)| *s)
                     .fold(0f32, f32::max);
 
-                eprintln!("  [merge] '{}' → '{}' (sim={:.3})", dropped_slug, keeper_slug, sim);
+                eprintln!(
+                    "  [merge] '{}' → '{}' (sim={:.3})",
+                    dropped_slug, keeper_slug, sim
+                );
 
                 // Redirect all inbound links from dropped to keeper
                 // Use OR IGNORE to skip rows that would violate the UNIQUE constraint
-                sqlx::query(
-                    "UPDATE OR IGNORE links SET target_slug = ?1 WHERE target_slug = ?2"
-                )
-                .bind(&keeper_slug)
-                .bind(&dropped_slug)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                sqlx::query("UPDATE OR IGNORE links SET target_slug = ?1 WHERE target_slug = ?2")
+                    .bind(&keeper_slug)
+                    .bind(&dropped_slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
                 // Delete any remaining links still pointing to dropped (conflicting duplicates)
                 sqlx::query("DELETE FROM links WHERE target_slug = ?1")
-                .bind(&dropped_slug)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .bind(&dropped_slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
                 // Delete the dropped concept page
                 self.delete_page(&dropped_slug).await?;
@@ -4253,9 +4877,21 @@ impl AuditReport {
                 out.push_str(&format!("  - {}\n", f));
             }
         }
-        let errors: Vec<_> = self.findings.iter().filter(|f| f.severity == "ERROR").collect();
-        let warns: Vec<_> = self.findings.iter().filter(|f| f.severity == "WARN").collect();
-        let infos: Vec<_> = self.findings.iter().filter(|f| f.severity == "INFO").collect();
+        let errors: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == "ERROR")
+            .collect();
+        let warns: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == "WARN")
+            .collect();
+        let infos: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == "INFO")
+            .collect();
         for group in [errors, warns, infos] {
             for f in group {
                 out.push_str(&format!("\n[{}] {}\n", f.severity, f.message));
@@ -4273,7 +4909,11 @@ fn update_frontmatter_tags(content: &str, tags: &[String]) -> String {
     let tags_yaml = if tags.is_empty() {
         "tags: []".to_string()
     } else {
-        let items = tags.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n");
+        let items = tags
+            .iter()
+            .map(|t| format!("  - {}", t))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!("tags:\n{}", items)
     };
 
@@ -4284,12 +4924,6 @@ fn update_frontmatter_tags(content: &str, tags: &[String]) -> String {
     } else {
         content.to_string()
     }
-}
-
-fn compute_query_hash(query: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(query.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 pub struct GraphEdge {
@@ -4476,11 +5110,17 @@ mod event_filter_tests {
             Some("document metadata")
         );
         assert_eq!(
-            extracted_event_rejection_reason(&event("2023", "国家社会科学基金项目立项，为本研究提供资助")),
+            extracted_event_rejection_reason(&event(
+                "2023",
+                "国家社会科学基金项目立项，为本研究提供资助"
+            )),
             Some("document metadata")
         );
         assert_eq!(
-            extracted_event_rejection_reason(&event("2024-11", "《高等教育研究》第45卷第11期发表郝文武、贺璐璐的论文")),
+            extracted_event_rejection_reason(&event(
+                "2024-11",
+                "《高等教育研究》第45卷第11期发表郝文武、贺璐璐的论文"
+            )),
             Some("document metadata")
         );
         assert_eq!(
@@ -4488,14 +5128,25 @@ mod event_filter_tests {
             None
         );
         assert_eq!(
-            extracted_event_rejection_reason(&event("2016-05-17", "习近平发表重要讲话，提出相关命题")),
+            extracted_event_rejection_reason(&event(
+                "2016-05-17",
+                "习近平发表重要讲话，提出相关命题"
+            )),
             None
         );
     }
 
     #[test]
     fn derived_research_pages_are_not_generation_sources() {
-        for page_type in ["draft", "synthesis", "wiki", "memo", "concept", "figure", "evidence"] {
+        for page_type in [
+            "draft",
+            "synthesis",
+            "wiki",
+            "memo",
+            "concept",
+            "figure",
+            "evidence",
+        ] {
             assert!(is_derived_research_context(page_type));
         }
         assert!(!is_derived_research_context("note"));

@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 use rbrain_core::error::{BrainError, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -31,13 +33,13 @@ pub struct Job {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
-#[repr(i32)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum JobStatus {
-    Pending = 1,
-    Running = 2,
-    Done = 3,
-    Failed = 4,
-    Cancelled = 5,
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
 }
 
 impl std::fmt::Display for JobStatus {
@@ -49,6 +51,79 @@ impl std::fmt::Display for JobStatus {
             JobStatus::Failed => write!(f, "failed"),
             JobStatus::Cancelled => write!(f, "cancelled"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
+
+    struct PanicHandler;
+
+    #[async_trait]
+    impl JobHandler for PanicHandler {
+        fn name(&self) -> &str {
+            "panic_job"
+        }
+
+        async fn handle(
+            &self,
+            _job: &Job,
+            _params: serde_json::Value,
+        ) -> Result<Option<serde_json::Value>> {
+            panic!("handler exploded");
+        }
+    }
+
+    async fn test_queue() -> Arc<JobQueue> {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("../../migrations")
+            .run(&db)
+            .await
+            .expect("run migrations");
+        Arc::new(JobQueue::new(db))
+    }
+
+    #[tokio::test]
+    async fn panicked_handler_retries_job_and_stops_heartbeat() {
+        let queue = test_queue().await;
+        let job_id = queue
+            .submit_job("panic_job", &json!({}), None, None, None, None)
+            .await
+            .expect("submit job");
+        let job = queue
+            .claim_job("default")
+            .await
+            .expect("claim job")
+            .expect("claimed job");
+
+        let mut handlers: HashMap<String, Arc<dyn JobHandler>> = HashMap::new();
+        handlers.insert("panic_job".to_string(), Arc::new(PanicHandler));
+
+        Worker::process_job_inner(queue.clone(), handlers, 1, job).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
+
+        let job = queue.get_job(job_id).await.expect("get job");
+        assert!(matches!(job.status, JobStatus::Pending));
+        assert!(
+            job.heartbeat_at.is_none(),
+            "heartbeat task should stop after panic"
+        );
+        assert!(
+            job.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("handler exploded")),
+            "panic message should be stored as last_error"
+        );
     }
 }
 
@@ -74,6 +149,32 @@ pub struct JobStats {
     pub done: i64,
     pub failed: i64,
     pub cancelled: i64,
+}
+
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self { handle }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -160,9 +261,13 @@ impl JobQueue {
         Ok(job)
     }
 
-    pub async fn complete_job(&self, job_id: i64, result: Option<&serde_json::Value>) -> Result<()> {
+    pub async fn complete_job(
+        &self,
+        job_id: i64,
+        result: Option<&serde_json::Value>,
+    ) -> Result<()> {
         let result_str = result.map(|r| r.to_string());
-        
+
         sqlx::query(
             "UPDATE jobs SET status = 'done', finished_at = datetime('now'), result = ?1 WHERE id = ?2"
         )
@@ -212,23 +317,32 @@ impl JobQueue {
     }
 
     pub async fn cancel_job(&self, job_id: i64) -> Result<()> {
-        let mut tx = self.db.begin().await
+        let mut tx = self
+            .db
+            .begin()
+            .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         self.cancel_job_recursive(&mut tx, job_id).await?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(())
     }
 
-    async fn cancel_job_recursive(&self, tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, job_id: i64) -> Result<()> {
-        let child_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs WHERE parent_job_id = ?1")
-            .bind(job_id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    async fn cancel_job_recursive(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        job_id: i64,
+    ) -> Result<()> {
+        let child_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM jobs WHERE parent_job_id = ?1")
+                .bind(job_id)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         for child_id in child_ids {
             Box::pin(self.cancel_job_recursive(tx, child_id)).await?;
@@ -307,7 +421,9 @@ impl JobQueue {
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         for job_id in &stalled_jobs {
-            let _ = self.retry_or_fail_job(*job_id, "Worker heartbeat timeout - job may have stalled").await;
+            let _ = self
+                .retry_or_fail_job(*job_id, "Worker heartbeat timeout - job may have stalled")
+                .await;
         }
 
         Ok(stalled_jobs)
@@ -334,10 +450,11 @@ impl JobQueue {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let cancelled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status = 'cancelled'")
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let cancelled: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status = 'cancelled'")
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(JobStats {
             pending,
@@ -373,7 +490,11 @@ impl std::fmt::Debug for Worker {
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     fn name(&self) -> &str;
-    async fn handle(&self, job: &Job, params: serde_json::Value) -> Result<Option<serde_json::Value>>;
+    async fn handle(
+        &self,
+        job: &Job,
+        params: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>>;
 }
 
 impl Worker {
@@ -392,12 +513,13 @@ impl Worker {
         self.handlers.insert(handler.name().to_string(), handler);
     }
 
-    pub async fn run(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-        let shutdown_rx = shutdown;
+    pub async fn run(&self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         let mut last_recovery = std::time::Instant::now();
         let recovery_interval = std::time::Duration::from_secs(30);
+        let max_concurrency = self.concurrency.max(1);
+        let mut running = tokio::task::JoinSet::new();
 
-        info!("Worker started with concurrency {}", self.concurrency);
+        info!("Worker started with concurrency {}", max_concurrency);
 
         loop {
             if *shutdown_rx.borrow() {
@@ -418,71 +540,126 @@ impl Worker {
                 last_recovery = std::time::Instant::now();
             }
 
-            match self.queue.claim_job("default").await {
-                Ok(Some(job)) => {
-                    info!("Claimed job {} ({})", job.id, job.name);
-                    self.process_job(&job).await;
+            while running.len() < max_concurrency {
+                match self.queue.claim_job("default").await {
+                    Ok(Some(job)) => {
+                        info!("Claimed job {} ({})", job.id, job.name);
+                        let queue = self.queue.clone();
+                        let handlers = self.handlers.clone();
+                        let heartbeat_interval = self.heartbeat_interval_secs;
+                        running.spawn(async move {
+                            Self::process_job_inner(queue, handlers, heartbeat_interval, job).await;
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Failed to claim job: {}", e);
+                        break;
+                    }
                 }
-                Ok(None) => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(self.poll_interval_ms)).await;
+            }
+
+            if running.len() >= max_concurrency {
+                if let Some(result) = running.join_next().await {
+                    if let Err(e) = result {
+                        error!("Worker task panicked: {}", e);
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to claim job: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(self.poll_interval_ms)).await;
+                continue;
+            }
+
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        info!("Worker shutting down");
+                        break;
+                    }
                 }
+                result = running.join_next(), if !running.is_empty() => {
+                    if let Some(Err(e)) = result {
+                        error!("Worker task panicked: {}", e);
+                    }
+                }
+                () = tokio::time::sleep(tokio::time::Duration::from_millis(self.poll_interval_ms)) => {}
+            }
+        }
+
+        while let Some(result) = running.join_next().await {
+            if let Err(e) = result {
+                error!("Worker task panicked during shutdown: {}", e);
             }
         }
 
         Ok(())
     }
 
-    async fn process_job(&self, job: &Job) {
+    async fn process_job_inner(
+        queue: Arc<JobQueue>,
+        handlers: std::collections::HashMap<String, Arc<dyn JobHandler>>,
+        heartbeat_interval: u64,
+        job: Job,
+    ) {
         let params: serde_json::Value = match serde_json::from_str(&job.params) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.queue.fail_job(job.id, &format!("Failed to parse params: {}", e)).await;
+                let _ = queue
+                    .fail_job(job.id, &format!("Failed to parse params: {}", e))
+                    .await;
                 return;
             }
         };
 
-        let handler = self.handlers.get(&job.name);
-        if handler.is_none() {
-            let _ = self.queue.fail_job(job.id, &format!("No handler registered for job type: {}", job.name)).await;
+        let Some(handler) = handlers.get(&job.name).cloned() else {
+            let _ = queue
+                .fail_job(
+                    job.id,
+                    &format!("No handler registered for job type: {}", job.name),
+                )
+                .await;
             return;
-        }
+        };
 
-        let handler = handler.unwrap();
         let job_id = job.id;
-        let queue = self.queue.clone();
-        let handler = handler.clone();
-        let heartbeat_interval = self.heartbeat_interval_secs;
+        let heartbeat_queue = queue.clone();
 
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(heartbeat_interval));
+        let _heartbeat_guard = HeartbeatGuard::new(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(heartbeat_interval));
             loop {
                 interval.tick().await;
-                if let Err(e) = queue.update_heartbeat(job_id).await {
+                if let Err(e) = heartbeat_queue.update_heartbeat(job_id).await {
                     error!("Failed to update heartbeat for job {}: {}", job_id, e);
                 }
             }
-        });
+        }));
 
-        match handler.handle(job, params).await {
-            Ok(result) => {
-                heartbeat_handle.abort();
-                if let Err(e) = self.queue.complete_job(job.id, result.as_ref()).await {
+        let handler_result = AssertUnwindSafe(handler.handle(&job, params))
+            .catch_unwind()
+            .await;
+
+        match handler_result {
+            Ok(Ok(result)) => {
+                if let Err(e) = queue.complete_job(job.id, result.as_ref()).await {
                     error!("Failed to complete job {}: {}", job.id, e);
                 } else {
                     info!("Completed job {}", job.id);
                 }
             }
-            Err(e) => {
-                heartbeat_handle.abort();
+            Ok(Err(e)) => {
                 let error_msg = e.to_string();
-                if let Err(e) = self.queue.retry_or_fail_job(job.id, &error_msg).await {
+                if let Err(e) = queue.retry_or_fail_job(job.id, &error_msg).await {
                     error!("Failed to update job {} status: {}", job.id, e);
                 } else {
                     warn!("Job {} failed: {}", job.id, error_msg);
+                }
+            }
+            Err(payload) => {
+                let error_msg =
+                    format!("job handler panicked: {}", panic_message(payload.as_ref()));
+                if let Err(e) = queue.retry_or_fail_job(job.id, &error_msg).await {
+                    error!("Failed to update panicked job {} status: {}", job.id, e);
+                } else {
+                    warn!("Job {} panicked: {}", job.id, error_msg);
                 }
             }
         }

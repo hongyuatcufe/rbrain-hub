@@ -6711,6 +6711,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "governor",
  "rbrain-core",
  "rbrain-db",
