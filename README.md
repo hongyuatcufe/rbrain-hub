@@ -72,7 +72,8 @@ model = "text-embedding-v4"
 [deepseek]
 api_key = "sk-..."
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
+model     = "deepseek-v4-flash"   # fast model: extraction, query expansion, etc.
+model_pro = "deepseek-v4-pro"    # powerful model: synthesis, compose
 
 embedding_dim = 1024
 EOF
@@ -346,7 +347,7 @@ rbrain-hub/
 
 **Embedding**: Qwen `text-embedding-v4` — single API call returns 1024-dim dense vector + sparse vector via `output_type="dense&sparse"`
 
-**LLM**: DeepSeek `deepseek-chat` — extraction, synthesis, think, generate, compose
+**LLM**: DeepSeek — `deepseek-v4-flash` for extraction/query expansion, `deepseek-v4-pro` for synthesis and compose
 
 **Storage**:
 - SQLite (`brain.db`) — pages, chunks, links, dream_metadata, tags, takes, timeline

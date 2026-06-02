@@ -3225,7 +3225,15 @@ impl Engine {
                         PromptSpec::Inline(_) => "<inline>",
                     }
                 );
-                let response = match deepseek.chat(&system_prompt, &effective_user_msg).await {
+                let is_synthesis = matches!(
+                    &step.output_mode,
+                    OutputMode::SaveAs { page_type, .. } if page_type == "synthesis"
+                );
+                let response = match if is_synthesis {
+                    deepseek.chat_pro(&system_prompt, &effective_user_msg).await
+                } else {
+                    deepseek.chat(&system_prompt, &effective_user_msg).await
+                } {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("    WARN: LLM call failed for {}: {}", page.slug, e);
@@ -3531,7 +3539,7 @@ impl Engine {
             }
         );
 
-        let response = match deepseek.chat(system_prompt, &user_msg).await {
+        let response = match deepseek.chat_pro(system_prompt, &user_msg).await {
             Ok(r) => r,
             Err(e) => {
                 return Err(BrainError::Io(std::io::Error::new(
@@ -4237,7 +4245,7 @@ impl Engine {
                         Some(hint) => format!("{base_user}\n\n---\nREVISION REQUIRED (attempt {}/{MAX_RETRIES}): {hint}", attempt + 1),
                         None => base_user.clone(),
                     };
-                    match client.chat(&system, &user).await {
+                    match client.chat_pro(&system, &user).await {
                         Ok(resp) => MarkdownParser::normalize_llm_output(&resp),
                         Err(e) => {
                             eprintln!(

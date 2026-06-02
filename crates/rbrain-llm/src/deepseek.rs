@@ -5,7 +5,8 @@ use std::env;
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
-const DEFAULT_MODEL: &str = "deepseek-chat";
+const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_MODEL_PRO: &str = "deepseek-v4-pro";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Intent {
@@ -74,6 +75,7 @@ pub struct DeepSeekClient {
     api_key: String,
     base_url: String,
     model: String,
+    model_pro: String,
 }
 
 impl DeepSeekClient {
@@ -100,6 +102,7 @@ impl DeepSeekClient {
             api_key,
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
+            model_pro: cfg.model_pro.clone(),
         })
     }
 
@@ -124,6 +127,7 @@ impl DeepSeekClient {
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            model_pro: DEFAULT_MODEL_PRO.to_string(),
         })
     }
 
@@ -137,10 +141,19 @@ impl DeepSeekClient {
         self
     }
 
-    /// General chat completion: system prompt + user message → assistant response.
+    /// Chat using the fast model (simple tasks: extraction, query expansion, etc.)
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        self.chat_with_model(system, user, &self.model.clone()).await
+    }
+
+    /// Chat using the pro model (complex generation: synthesis, compose, etc.)
+    pub async fn chat_pro(&self, system: &str, user: &str) -> Result<String> {
+        self.chat_with_model(system, user, &self.model_pro.clone()).await
+    }
+
+    async fn chat_with_model(&self, system: &str, user: &str, model: &str) -> Result<String> {
         let request = ChatCompletionRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             messages: vec![
                 Message { role: "system".to_string(), content: system.to_string() },
                 Message { role: "user".to_string(), content: user.to_string() },

@@ -65,7 +65,8 @@ model = "text-embedding-v4"
 [deepseek]
 api_key = "sk-..."
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
+model = "deepseek-v4-flash"
+model_pro = "deepseek-v4-pro"
 
 embedding_dim = 1024
 ```

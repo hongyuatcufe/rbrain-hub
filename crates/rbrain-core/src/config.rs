@@ -12,7 +12,11 @@ pub struct QwenConfig {
 pub struct DeepSeekConfig {
     pub api_key: String,
     pub base_url: String,
+    /// Fast model for lightweight tasks (extraction, query expansion, etc.)
     pub model: String,
+    /// Powerful model for complex generation tasks (synthesis, compose, etc.)
+    #[serde(default = "DeepSeekConfig::default_model_pro")]
+    pub model_pro: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,12 +66,19 @@ impl Default for QwenConfig {
     }
 }
 
+impl DeepSeekConfig {
+    fn default_model_pro() -> String {
+        "deepseek-v4-pro".to_string()
+    }
+}
+
 impl Default for DeepSeekConfig {
     fn default() -> Self {
         DeepSeekConfig {
             api_key: String::new(),
             base_url: "https://api.deepseek.com/v1".to_string(),
-            model: "deepseek-chat".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            model_pro: "deepseek-v4-pro".to_string(),
         }
     }
 }
