@@ -4143,94 +4143,121 @@ impl Engine {
                 concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
             };
 
-            let synthesized_content = if let Some(client) = deepseek {
-                let system = self.inner.prompts.load("synthesize_academic");
+            // Build source context once; reused across retry attempts.
+            let mut context_items = Vec::new();
+            for p in &source_pages {
+                let db_chunks: Vec<(i64, String)> = sqlx::query(
+                    "SELECT id, text FROM chunks WHERE page_slug = ?1 AND is_compiled_truth = 1 ORDER BY chunk_idx"
+                )
+                .bind(&p.slug)
+                .fetch_all(&self.inner.db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    use sqlx::Row;
+                    (r.get::<i64, _>("id"), r.get::<String, _>("text"))
+                })
+                .collect();
 
-                let mut context_items = Vec::new();
-                for p in &source_pages {
-                    let db_chunks: Vec<(i64, String)> = sqlx::query(
-                        "SELECT id, text FROM chunks WHERE page_slug = ?1 AND is_compiled_truth = 1 ORDER BY chunk_idx"
-                    )
-                    .bind(&p.slug)
-                    .fetch_all(&self.inner.db)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| {
-                        use sqlx::Row;
-                        (r.get::<i64, _>("id"), r.get::<String, _>("text"))
-                    })
-                    .collect();
-
-                    if db_chunks.is_empty() {
-                        // Fallback: page not yet chunked, use text snippet
-                        let mut idx = 800;
-                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
-                            idx -= 1;
-                        }
-                        let snippet =
-                            p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
-                        context_items
-                            .push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
-                    } else {
-                        let slug = &p.slug;
-                        let chunk_blocks: Vec<String> = db_chunks
-                            .iter()
-                            .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
-                            .collect();
-                        context_items.push(format!(
-                            "Source: {} | {}\n{}",
-                            p.slug,
-                            p.title,
-                            chunk_blocks.join("\n")
-                        ));
+                if db_chunks.is_empty() {
+                    let mut idx = 800;
+                    while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
+                        idx -= 1;
                     }
-                }
-
-                let user = format!(
-                    "Concept: {} (slug: {})\nDescription: {}\n\nSource Articles:\n\n{}",
-                    concept.title,
-                    concept.slug,
-                    concept_desc,
-                    context_items.join("\n\n---\n\n")
-                );
-
-                match client.chat(&system, &user).await {
-                    Ok(resp) => MarkdownParser::normalize_llm_output(&resp),
-                    Err(e) => {
-                        eprintln!(
-                            "    WARN: LLM call failed for {}: {}. Using mock.",
-                            concept.slug, e
-                        );
-                        self.generate_mock_concept_synthesis(concept, &source_pages)
-                    }
-                }
-            } else {
-                self.generate_mock_concept_synthesis(concept, &source_pages)
-            };
-
-            let mut synth_page = Page::new(
-                synthesis_slug.clone(),
-                "synthesis".to_string(),
-                synthesized_content,
-            );
-            synth_page.title = format!("综合分析：{}", concept.title);
-            synth_page.tags = concept.tags.clone();
-            synth_page.language = Some(rbrain_core::page::Language::detect(
-                &synth_page.compiled_truth,
-            ));
-
-            if deepseek.is_some() {
-                if let Err(reason) =
-                    validate_synthesis_quality(&synth_page.compiled_truth, source_pages.len())
-                {
-                    eprintln!(
-                        "    WARN: rejecting low-quality synthesis {}: {}",
-                        synthesis_slug, reason
-                    );
-                    continue;
+                    let snippet =
+                        p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
+                    context_items
+                        .push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
+                } else {
+                    let slug = &p.slug;
+                    let chunk_blocks: Vec<String> = db_chunks
+                        .iter()
+                        .map(|(id, text)| format!("[chunk:{} | {}] {}", id, slug, text))
+                        .collect();
+                    context_items.push(format!(
+                        "Source: {} | {}\n{}",
+                        p.slug,
+                        p.title,
+                        chunk_blocks.join("\n")
+                    ));
                 }
             }
+
+            let base_user = format!(
+                "Concept: {} (slug: {})\nDescription: {}\n\nSource Articles:\n\n{}",
+                concept.title,
+                concept.slug,
+                concept_desc,
+                context_items.join("\n\n---\n\n")
+            );
+
+            const MAX_RETRIES: usize = 2;
+            let mut revision_hint: Option<String> = None;
+            let mut synth_page_opt: Option<Page> = None;
+
+            'retry: for attempt in 0..=MAX_RETRIES {
+                let synthesized_content = if let Some(client) = deepseek {
+                    let system = self.inner.prompts.load("synthesize_academic");
+                    let user = match &revision_hint {
+                        Some(hint) => format!("{base_user}\n\n---\nREVISION REQUIRED (attempt {}/{MAX_RETRIES}): {hint}", attempt + 1),
+                        None => base_user.clone(),
+                    };
+                    match client.chat(&system, &user).await {
+                        Ok(resp) => MarkdownParser::normalize_llm_output(&resp),
+                        Err(e) => {
+                            eprintln!(
+                                "    WARN: LLM call failed for {}: {}. Using mock.",
+                                concept.slug, e
+                            );
+                            self.generate_mock_concept_synthesis(concept, &source_pages)
+                        }
+                    }
+                } else {
+                    self.generate_mock_concept_synthesis(concept, &source_pages)
+                };
+
+                let mut page = Page::new(
+                    synthesis_slug.clone(),
+                    "synthesis".to_string(),
+                    synthesized_content,
+                );
+                page.title = format!("综合分析：{}", concept.title);
+                page.tags = concept.tags.clone();
+                page.language = Some(rbrain_core::page::Language::detect(
+                    &page.compiled_truth,
+                ));
+
+                if deepseek.is_some() {
+                    match validate_synthesis_quality(&page.compiled_truth, source_pages.len()) {
+                        Ok(()) => {
+                            synth_page_opt = Some(page);
+                            break 'retry;
+                        }
+                        Err(reason) => {
+                            if attempt < MAX_RETRIES {
+                                eprintln!(
+                                    "    WARN: attempt {}/{} rejected ({}), retrying…",
+                                    attempt + 1, MAX_RETRIES + 1, reason
+                                );
+                                revision_hint = Some(reason);
+                            } else {
+                                eprintln!(
+                                    "    WARN: rejecting low-quality synthesis {} after {} attempt(s): {}",
+                                    synthesis_slug, MAX_RETRIES + 1, reason
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    synth_page_opt = Some(page);
+                    break 'retry;
+                }
+            }
+
+            let Some(synth_page) = synth_page_opt else {
+                continue;
+            };
 
             self.put_page(synth_page.clone()).await?;
             println!("    Saved: {}", synthesis_slug);
@@ -5170,7 +5197,8 @@ fn validate_synthesis_quality(
 
     let sections = markdown_sections(content);
     let section_count = sections.len();
-    let max_sections = 12;
+    // Allow more sections when there are many source articles.
+    let max_sections = if source_count > 8 { 20 } else { 12 };
     if section_count > max_sections {
         return Err(format!(
             "{section_count} second-level section(s), maximum is {max_sections} for {source_count} source(s)"

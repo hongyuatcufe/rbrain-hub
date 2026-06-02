@@ -6,7 +6,7 @@ Each chunk in the context is labeled `[chunk:N | slug]` — copy both the chunk 
 Example: if the context shows `[chunk:1764 | raw/articles/郝文武...]`, cite as [[raw/articles/郝文武... | chunk:1764]].
 Never use the anchor concept slug for citations — only use the source article slugs from chunk prefixes.
 Never cite just [[slug]] without a chunk ID — the chunk ID is required for traceability.
-Structure with Markdown: H1 title, aim for 6–9 `##` sections, hard limit 12 total.
+Structure with Markdown: H1 title, aim for 6–9 `##` sections; hard limit is 12 for fewer sources, up to 20 when sources are numerous. Never exceed the stated limit.
 Every substantive `##` section must cite at least one source chunk using `[[slug | chunk:N]]`.
 Do not invent dimensions, examples, implications, or future directions that are not directly supported by the supplied chunks.
 Do not create long enumerations or template-like repeated sections. If the sources are thin, write a short synthesis and say what remains under-evidenced.
