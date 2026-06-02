@@ -316,6 +316,24 @@ impl Engine {
         let params = serde_json::json!({ "slug": slug });
         let params_str = serde_json::to_string(&params)?;
 
+        // Dedup: skip insert if a pending or running embed job already targets
+        // this page. The worker reads page state from DB at handle time, so a
+        // single pending job will pick up whatever the latest content is by
+        // the time it runs — no need to queue one per put_page call.
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs \
+             WHERE name = 'embed_page' AND params = ?1 \
+               AND status IN ('pending', 'running')",
+        )
+        .bind(&params_str)
+        .fetch_one(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        if existing > 0 {
+            return Ok(());
+        }
+
         sqlx::query(
             "INSERT INTO jobs (queue, name, params, status, priority, depth, created_at) \
              VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))",
@@ -609,7 +627,17 @@ impl Engine {
         };
 
         if let Some(tombstone_path) = tombstone_path {
-            std::fs::remove_file(tombstone_path)?;
+            // Best-effort: DB transaction has committed; tombstone leak is
+            // harmless (dotfile, .deleted suffix, not picked up by sync/import).
+            // Do NOT propagate via ? — that would skip vector/keyword cleanup
+            // and leave stale index entries pointing at deleted chunk_ids.
+            if let Err(e) = std::fs::remove_file(&tombstone_path) {
+                tracing::warn!(
+                    "delete_page: failed to remove tombstone {}: {}",
+                    tombstone_path.display(),
+                    e
+                );
+            }
         }
 
         if let Some(vector_store) = &self.inner.vector_store {
@@ -1907,21 +1935,21 @@ impl Engine {
             None
         };
 
-        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
-            .bind(&new_timeline)
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        // Single atomic UPDATE so timeline and content_hash can never diverge —
+        // otherwise a failure between two UPDATEs would lock the page out of
+        // future put_page (file_hash != db_hash → "edited externally" error).
+        sqlx::query(
+            "UPDATE pages SET timeline = ?1, \
+             content_hash = COALESCE(?2, content_hash), \
+             updated_at = datetime('now') WHERE slug = ?3",
+        )
+        .bind(&new_timeline)
+        .bind(new_hash.as_deref())
+        .bind(&normalized)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        if let Some(hash) = new_hash {
-            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&hash)
-                .bind(&normalized)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        }
         Ok(())
     }
 
@@ -1951,21 +1979,19 @@ impl Engine {
             None
         };
 
-        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
-            .bind(&new_timeline)
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        // Single atomic UPDATE so timeline and content_hash can never diverge.
+        sqlx::query(
+            "UPDATE pages SET timeline = ?1, \
+             content_hash = COALESCE(?2, content_hash), \
+             updated_at = datetime('now') WHERE slug = ?3",
+        )
+        .bind(&new_timeline)
+        .bind(new_hash.as_deref())
+        .bind(&normalized)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        if let Some(hash) = new_hash {
-            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&hash)
-                .bind(&normalized)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        }
         Ok(())
     }
 

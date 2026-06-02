@@ -152,18 +152,33 @@ pub struct JobStats {
 }
 
 struct HeartbeatGuard {
-    handle: tokio::task::JoinHandle<()>,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HeartbeatGuard {
     fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self { handle }
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the heartbeat task and wait for it to terminate before returning.
+    /// Use this BEFORE writing terminal job status (complete/retry/fail) so
+    /// the heartbeat task can't sneak in an UPDATE that overrides the final
+    /// heartbeat_at column.
+    async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
 impl Drop for HeartbeatGuard {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -622,7 +637,7 @@ impl Worker {
         let job_id = job.id;
         let heartbeat_queue = queue.clone();
 
-        let _heartbeat_guard = HeartbeatGuard::new(tokio::spawn(async move {
+        let heartbeat_guard = HeartbeatGuard::new(tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(heartbeat_interval));
             loop {
@@ -636,6 +651,11 @@ impl Worker {
         let handler_result = AssertUnwindSafe(handler.handle(&job, params))
             .catch_unwind()
             .await;
+
+        // Synchronously stop the heartbeat BEFORE writing terminal status so
+        // an in-flight tick can't overwrite the heartbeat_at column that
+        // complete_job / retry_or_fail_job is about to clear.
+        heartbeat_guard.shutdown().await;
 
         match handler_result {
             Ok(Ok(result)) => {
