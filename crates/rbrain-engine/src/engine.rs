@@ -5170,7 +5170,7 @@ fn validate_synthesis_quality(
 
     let sections = markdown_sections(content);
     let section_count = sections.len();
-    let max_sections = 9;
+    let max_sections = 12;
     if section_count > max_sections {
         return Err(format!(
             "{section_count} second-level section(s), maximum is {max_sections} for {source_count} source(s)"
