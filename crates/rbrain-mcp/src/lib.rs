@@ -1,12 +1,21 @@
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
+use rbrain_engine::evidence::{
+    SuggestedAction, ValidatorResult, analysis_plan_exists, artifact_hash_present,
+    dataset_registered, finding_has_dataset_lineage, finding_has_supporting_artifact,
+    run_citation_check,
+};
 use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
+use rbrain_engine::research::{
+    ProtocolState, ResearchRun, ResearchRunStore, RunStatus, TaskType, protocol::derive_state,
+};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     schemars::{self, JsonSchema},
     tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Clone)]
 pub struct RBrainMcpServer {
@@ -330,6 +339,304 @@ impl MutationResult {
             message: msg.into(),
         }
     }
+}
+
+// ── Research-run argument & result types (M1) ──────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateResearchRunArgs {
+    /// Human-readable title rendered into the research_run page.
+    pub title: String,
+    /// Page slug for the run (e.g. "research/runs/2026-06-07-cohort"). If
+    /// omitted, derived from title.
+    pub slug: Option<String>,
+    /// `literature_review` | `data_analysis` | `mixed_methods` | `theory_building`.
+    pub task_type: String,
+    /// Optional caller-provided uuid. Generated if omitted.
+    pub run_id: Option<String>,
+    /// Optional initial research question to embed in the page body.
+    pub research_question: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ResearchRunResult {
+    pub ok: bool,
+    pub run_id: String,
+    pub slug: String,
+    pub task_type: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetProtocolArgs {
+    pub run_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RegisterInputArgs {
+    /// `dataset` | `artifact`
+    pub kind: String,
+    /// Page slug for this input.
+    pub slug: String,
+    /// Human title.
+    pub title: String,
+    /// File path (relative to ZeroClaw workspace).
+    pub path: String,
+    /// Absolute path captured at registration time.
+    pub abs_path_snapshot: Option<String>,
+    /// sha256 of the file contents.
+    pub hash: String,
+    /// Size in bytes.
+    pub size_bytes: Option<i64>,
+    /// For dataset: csv|xlsx|json|parquet|sql|other.
+    /// For artifact: script|log|result_table|chart|model_output|report|notebook.
+    pub kind_subtype: Option<String>,
+    /// Mime type, optional.
+    pub mime_type: Option<String>,
+    /// research_run slug this input belongs to.
+    pub run_slug: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RecordArgs {
+    /// `finding` | `limitation` | `analysis_plan`
+    pub kind: String,
+    pub slug: String,
+    pub title: String,
+    /// Markdown body.
+    pub content: String,
+    /// research_run slug.
+    pub run_slug: String,
+    /// For finding: draft|claim|validated. Defaults to draft.
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ValidateRunArgs {
+    pub run_id: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ValidateRunResult {
+    pub ok: bool,
+    pub run_id: String,
+    pub overall: String,
+    pub validators: Vec<ValidatorJson>,
+    pub protocol: Option<ProtocolJson>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ValidatorJson {
+    pub validator: String,
+    pub status: String,
+    pub message: String,
+    pub affected_slugs: Vec<String>,
+    pub suggested_actions: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ProtocolJson {
+    pub run_id: String,
+    pub task_type: String,
+    pub current_step: String,
+    pub completed_steps: Vec<String>,
+    pub next_actions: Vec<serde_json::Value>,
+    pub blocking_validators: Vec<ValidatorJson>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CitationCheckArgs {
+    pub slug: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct CitationCheckResultJson {
+    pub ok: bool,
+    pub slug: String,
+    pub validator: ValidatorJson,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct EvidenceCheckArgs {
+    pub finding_slug: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct EvidenceCheckResultJson {
+    pub ok: bool,
+    pub finding_slug: String,
+    pub validator: ValidatorJson,
+}
+
+fn validator_to_json(v: &ValidatorResult) -> ValidatorJson {
+    ValidatorJson {
+        validator: v.validator.clone(),
+        status: match v.status {
+            rbrain_engine::evidence::ValidatorStatus::Pass => "pass".into(),
+            rbrain_engine::evidence::ValidatorStatus::Warn => "warn".into(),
+            rbrain_engine::evidence::ValidatorStatus::Fail => "fail".into(),
+        },
+        message: v.message.clone(),
+        affected_slugs: v.affected_slugs.clone(),
+        suggested_actions: v
+            .suggested_actions
+            .iter()
+            .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+            .collect(),
+    }
+}
+
+fn protocol_to_json(p: &ProtocolState) -> ProtocolJson {
+    ProtocolJson {
+        run_id: p.run_id.clone(),
+        task_type: p.task_type.to_string(),
+        current_step: p.current_step.clone(),
+        completed_steps: p.completed_steps.clone(),
+        next_actions: p
+            .next_actions
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "action": serde_json::to_value(&a.action).unwrap_or(serde_json::Value::Null),
+                    "reason": a.reason,
+                })
+            })
+            .collect(),
+        blocking_validators: p
+            .blocking_validators
+            .iter()
+            .map(validator_to_json)
+            .collect(),
+    }
+}
+
+fn build_run_page_body(title: &str, _task_type: &str, question: Option<&str>) -> String {
+    let mut body = format!("# {title}\n\n");
+    if let Some(q) = question {
+        body.push_str("## Research question\n\n");
+        body.push_str(q);
+        body.push_str("\n");
+    }
+    body
+}
+
+fn page_with_frontmatter(
+    slug: String,
+    page_type: &str,
+    title: &str,
+    frontmatter: serde_json::Map<String, serde_json::Value>,
+    body: String,
+) -> Page {
+    let mut page = Page::new(slug, page_type.to_string(), body);
+    page.frontmatter = serde_json::Value::Object(frontmatter);
+    page.title = title.to_string();
+    page
+}
+
+/// Deserialize the snapshot persisted by `validate_research_run`. Reserved for
+/// future audit / history tooling. **Not** used by protocol state derivation —
+/// see `validators_for_protocol` for why.
+#[allow(dead_code)]
+fn stored_validator_summary(run: &ResearchRun) -> Option<Vec<ValidatorResult>> {
+    run.last_validation_summary
+        .as_deref()
+        .and_then(|summary| serde_json::from_str(summary).ok())
+}
+
+fn push_validator_result<E: std::fmt::Display>(
+    validators: &mut Vec<ValidatorResult>,
+    result: std::result::Result<ValidatorResult, E>,
+) {
+    match result {
+        Ok(v) => validators.push(v),
+        Err(e) => tracing::warn!("validator failed: {e}"),
+    }
+}
+
+async fn run_research_validators(
+    pool: &sqlx::SqlitePool,
+    run: &ResearchRun,
+) -> Vec<ValidatorResult> {
+    let mut validators = Vec::new();
+    match run.task_type {
+        TaskType::DataAnalysis => {
+            push_validator_result(&mut validators, dataset_registered(pool, &run.slug).await);
+            push_validator_result(&mut validators, analysis_plan_exists(pool, &run.slug).await);
+            push_validator_result(
+                &mut validators,
+                artifact_hash_present(pool, &run.slug).await,
+            );
+            push_validator_result(
+                &mut validators,
+                finding_has_dataset_lineage(pool, &run.slug).await,
+            );
+            push_validator_result(
+                &mut validators,
+                finding_has_supporting_artifact(pool, &run.slug).await,
+            );
+        }
+        TaskType::MixedMethods | TaskType::TheoryBuilding => {
+            push_validator_result(&mut validators, analysis_plan_exists(pool, &run.slug).await);
+            push_validator_result(
+                &mut validators,
+                artifact_hash_present(pool, &run.slug).await,
+            );
+            push_validator_result(
+                &mut validators,
+                finding_has_supporting_artifact(pool, &run.slug).await,
+            );
+        }
+        TaskType::LiteratureReview => {}
+    }
+    validators
+}
+
+/// Protocol state is derived **live** from the current registered state — never
+/// from `research_runs.last_validation_summary`. The stored summary is kept
+/// only for audit / history (read it via `stored_validator_summary` when you
+/// genuinely want the snapshot at the moment of the last `validate` call).
+///
+/// Rationale: between a `validate_research_run` call and a subsequent
+/// `get_research_protocol` call, ZeroClaw may have called `register_input` /
+/// `record` / `add_link`. Returning the cached summary would make the protocol
+/// recommend actions ZeroClaw has already completed. Validators are cheap SQL
+/// counts (no LLM), so recomputing is correct and inexpensive.
+async fn validators_for_protocol(
+    pool: &sqlx::SqlitePool,
+    run: &ResearchRun,
+) -> Vec<ValidatorResult> {
+    run_research_validators(pool, run).await
+}
+
+async fn ensure_research_run_slug(
+    engine: &Engine,
+    run_slug: &str,
+) -> std::result::Result<(), String> {
+    let store = ResearchRunStore::new(engine.get_db());
+    match store.find_by_slug(run_slug).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!("research_run not found for slug: {run_slug}")),
+        Err(e) => Err(format!("research_run lookup failed: {e}")),
+    }
+}
+
+fn derive_run_slug(title: &str, given: Option<&str>) -> String {
+    if let Some(s) = given {
+        return s.to_string();
+    }
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    format!("research/runs/{}", trimmed)
 }
 
 // ── MCP Tools ───────────────────────────────────────────────────────────────
@@ -867,6 +1174,415 @@ impl RBrainMcpServer {
                 message: format!("Error: {}", e),
             }),
         }
+    }
+
+    // ── M1 research-run tools ──────────────────────────────────────────────
+
+    #[tool(
+        name = "brain_create_research_run",
+        description = "Create a research run. Inserts a research_runs row (source of truth) and \
+            a Markdown page (rendering layer). task_type ∈ literature_review|data_analysis|mixed_methods|theory_building."
+    )]
+    async fn create_research_run(
+        &self,
+        Parameters(args): Parameters<CreateResearchRunArgs>,
+    ) -> Json<ResearchRunResult> {
+        let task_type = match TaskType::from_str(&args.task_type) {
+            Ok(t) => t,
+            Err(e) => {
+                return Json(ResearchRunResult {
+                    ok: false,
+                    run_id: String::new(),
+                    slug: String::new(),
+                    task_type: args.task_type,
+                    status: String::new(),
+                    message: format!("invalid task_type: {e}"),
+                });
+            }
+        };
+        let slug = derive_run_slug(&args.title, args.slug.as_deref());
+        // 1. Persist the page first so research_runs.slug FK is satisfied.
+        let body = build_run_page_body(
+            &args.title,
+            task_type.as_str(),
+            args.research_question.as_deref(),
+        );
+        let mut fm = serde_json::Map::new();
+        fm.insert("type".into(), serde_json::json!("research_run"));
+        fm.insert("title".into(), serde_json::json!(args.title));
+        fm.insert("task_type".into(), serde_json::json!(task_type.as_str()));
+        fm.insert("created_by".into(), serde_json::json!("zeroclaw"));
+        if let Some(q) = &args.research_question {
+            fm.insert("research_question".into(), serde_json::json!(q));
+        }
+        let page = page_with_frontmatter(slug.clone(), "research_run", &args.title, fm, body);
+        if let Err(e) = self.engine.put_page(page).await {
+            return Json(ResearchRunResult {
+                ok: false,
+                run_id: String::new(),
+                slug,
+                task_type: task_type.to_string(),
+                status: String::new(),
+                message: format!("put_page failed: {e}"),
+            });
+        }
+        // 2. Insert research_runs row.
+        let store = ResearchRunStore::new(self.engine.get_db());
+        match store
+            .create(args.run_id.as_deref(), &slug, task_type, "zeroclaw")
+            .await
+        {
+            Ok(run) => Json(ResearchRunResult {
+                ok: true,
+                run_id: run.id,
+                slug: run.slug,
+                task_type: run.task_type.to_string(),
+                status: run.status.to_string(),
+                message: "research_run created".into(),
+            }),
+            Err(e) => Json(ResearchRunResult {
+                ok: false,
+                run_id: String::new(),
+                slug,
+                task_type: task_type.to_string(),
+                status: String::new(),
+                message: format!("store.create failed: {e}"),
+            }),
+        }
+    }
+
+    #[tool(
+        name = "brain_get_research_protocol",
+        description = "Returns the protocol state machine for a research run: current step, completed steps, \
+            next actions, and blocking validators. State is derived live from the latest validator pass — \
+            ZeroClaw can resume cleanly after session interruption using just the run_id."
+    )]
+    async fn get_research_protocol(
+        &self,
+        Parameters(args): Parameters<GetProtocolArgs>,
+    ) -> Json<ProtocolJson> {
+        let store = ResearchRunStore::new(self.engine.get_db());
+        let run = match store.get(&args.run_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("get_research_protocol: {e}");
+                return Json(ProtocolJson {
+                    run_id: args.run_id,
+                    task_type: "unknown".into(),
+                    current_step: "error".into(),
+                    completed_steps: vec![],
+                    next_actions: vec![],
+                    blocking_validators: vec![],
+                });
+            }
+        };
+        let pool = self.engine.get_db();
+        let vs = validators_for_protocol(pool, &run).await;
+        Json(protocol_to_json(&derive_state(&run, &vs)))
+    }
+
+    #[tool(
+        name = "brain_register_input",
+        description = "Register an input (kind=dataset|artifact) to a research run. Stores hash + path snapshot \
+            in page frontmatter, links it to the run via uses_dataset/produces. ZeroClaw calls this \
+            immediately after producing or consuming a file."
+    )]
+    async fn register_input(
+        &self,
+        Parameters(args): Parameters<RegisterInputArgs>,
+    ) -> Json<MutationResult> {
+        if let Err(e) = ensure_research_run_slug(&self.engine, &args.run_slug).await {
+            return Json(MutationResult::err(e));
+        }
+
+        let (page_type, edge_type) = match args.kind.as_str() {
+            "dataset" => ("dataset", "uses_dataset"),
+            "artifact" => ("artifact", "produces"),
+            other => {
+                return Json(MutationResult::err(format!(
+                    "kind must be dataset|artifact, got {other}"
+                )));
+            }
+        };
+
+        let format_field = if args.kind == "dataset" {
+            "format"
+        } else {
+            "artifact_kind"
+        };
+        let mut fm = serde_json::Map::new();
+        fm.insert("type".into(), serde_json::json!(page_type));
+        fm.insert("title".into(), serde_json::json!(args.title));
+        fm.insert("path".into(), serde_json::json!(args.path));
+        if let Some(abs) = &args.abs_path_snapshot {
+            fm.insert("abs_path_snapshot".into(), serde_json::json!(abs));
+        }
+        fm.insert("hash".into(), serde_json::json!(args.hash));
+        if let Some(sz) = args.size_bytes {
+            fm.insert("size_bytes".into(), serde_json::json!(sz));
+        }
+        if let Some(k) = &args.kind_subtype {
+            fm.insert(format_field.into(), serde_json::json!(k));
+        }
+        if let Some(m) = &args.mime_type {
+            fm.insert("mime_type".into(), serde_json::json!(m));
+        }
+        fm.insert("research_run".into(), serde_json::json!(args.run_slug));
+
+        let body = format!("# {}\n\nRegistered via brain_register_input.\n", args.title);
+        let page = page_with_frontmatter(args.slug.clone(), page_type, &args.title, fm, body);
+        if let Err(e) = self.engine.put_page(page).await {
+            return Json(MutationResult::err(format!("put_page failed: {e}")));
+        }
+        // Link run → input
+        if let Err(e) = self
+            .engine
+            .add_link(&args.run_slug, &args.slug, edge_type, None, None)
+            .await
+        {
+            return Json(MutationResult::err(format!(
+                "add_link {edge_type} failed: {e}"
+            )));
+        }
+        Json(MutationResult::ok(format!(
+            "{} registered and linked via {edge_type}",
+            args.kind
+        )))
+    }
+
+    #[tool(
+        name = "brain_record",
+        description = "Record a discrete research fact (kind=finding|limitation|analysis_plan) and link it to a run. \
+            For finding, set status=draft|claim|validated to control validator severity (draft → warn only)."
+    )]
+    async fn record(&self, Parameters(args): Parameters<RecordArgs>) -> Json<MutationResult> {
+        if let Err(e) = ensure_research_run_slug(&self.engine, &args.run_slug).await {
+            return Json(MutationResult::err(e));
+        }
+
+        let (page_type, edge_type) = match args.kind.as_str() {
+            "finding" => ("finding", "produces"),
+            "limitation" => ("limitation", "limits"),
+            "analysis_plan" => ("analysis_plan", "tests_hypothesis"),
+            other => {
+                return Json(MutationResult::err(format!(
+                    "kind must be finding|limitation|analysis_plan, got {other}"
+                )));
+            }
+        };
+        let status = args.status.unwrap_or_else(|| "draft".to_string());
+        if args.kind == "finding" && !matches!(status.as_str(), "draft" | "claim" | "validated") {
+            return Json(MutationResult::err(format!(
+                "finding status must be draft|claim|validated, got {status}"
+            )));
+        }
+        let mut fm = serde_json::Map::new();
+        fm.insert("type".into(), serde_json::json!(page_type));
+        fm.insert("title".into(), serde_json::json!(args.title));
+        fm.insert("research_run".into(), serde_json::json!(args.run_slug));
+        if args.kind == "finding" {
+            fm.insert("status".into(), serde_json::json!(status));
+        }
+        let body = format!("# {}\n\n{}\n", args.title, args.content);
+        let page = page_with_frontmatter(args.slug.clone(), page_type, &args.title, fm, body);
+        if let Err(e) = self.engine.put_page(page).await {
+            return Json(MutationResult::err(format!("put_page failed: {e}")));
+        }
+        if let Err(e) = self
+            .engine
+            .add_link(&args.run_slug, &args.slug, edge_type, None, None)
+            .await
+        {
+            return Json(MutationResult::err(format!("add_link failed: {e}")));
+        }
+        Json(MutationResult::ok(format!(
+            "{} recorded and linked via {edge_type}",
+            args.kind
+        )))
+    }
+
+    #[tool(
+        name = "brain_validate_research_run",
+        description = "Run validators against a research run; the set depends on task_type. \
+            data_analysis: dataset_registered, analysis_plan_exists, artifact_hash_present, \
+            finding_has_dataset_lineage, finding_has_supporting_artifact. \
+            mixed_methods | theory_building: analysis_plan_exists, artifact_hash_present, \
+            finding_has_supporting_artifact. \
+            literature_review: validators land in M3 — overall returns 'warn' until then. \
+            Returns structured results with controlled suggested_actions enum and the derived \
+            protocol state so ZeroClaw knows the next step."
+    )]
+    async fn validate_research_run(
+        &self,
+        Parameters(args): Parameters<ValidateRunArgs>,
+    ) -> Json<ValidateRunResult> {
+        let store = ResearchRunStore::new(self.engine.get_db());
+        let run = match store.get(&args.run_id).await {
+            Ok(r) => r,
+            Err(_e) => {
+                return Json(ValidateRunResult {
+                    ok: false,
+                    run_id: args.run_id,
+                    overall: "error".into(),
+                    validators: vec![],
+                    protocol: None,
+                });
+            }
+        };
+        let pool = self.engine.get_db();
+        let vs = run_research_validators(pool, &run).await;
+
+        // Empty validator list is **not** "pass" — it means no validators are
+        // wired yet for this task_type (currently: literature_review, M3 work).
+        // Returning `warn` prevents ZeroClaw from falsely concluding the run
+        // has been validated.
+        let overall = if vs.is_empty() {
+            "warn"
+        } else if vs
+            .iter()
+            .any(|v| v.status == rbrain_engine::evidence::ValidatorStatus::Fail)
+        {
+            "fail"
+        } else if vs
+            .iter()
+            .any(|v| v.status == rbrain_engine::evidence::ValidatorStatus::Warn)
+        {
+            "warn"
+        } else {
+            "pass"
+        }
+        .to_string();
+
+        // Persist summary for protocol derivation across sessions.
+        let mut latest_run = run.clone();
+        if let Ok(json) = serde_json::to_string(&vs) {
+            if let Ok(updated) = store
+                .record_validation(&run.id, &run.fingerprint, &json)
+                .await
+            {
+                latest_run = updated;
+            }
+            // Advance status: planned -> running on first validation; -> validating on all-pass.
+            let next = match (latest_run.status, overall.as_str()) {
+                (RunStatus::Planned, _) => Some(RunStatus::Running),
+                (RunStatus::Running, "pass") => Some(RunStatus::Validating),
+                _ => None,
+            };
+            if let Some(n) = next {
+                if let Ok(updated) = store.set_status(&latest_run.id, n).await {
+                    latest_run = updated;
+                }
+            }
+        }
+
+        let protocol = protocol_to_json(&derive_state(&latest_run, &vs));
+
+        Json(ValidateRunResult {
+            ok: true,
+            run_id: latest_run.id,
+            overall,
+            validators: vs.iter().map(validator_to_json).collect(),
+            protocol: Some(protocol),
+        })
+    }
+
+    #[tool(
+        name = "brain_citation_check",
+        description = "Verify all wiki citations in a page resolve to source pages, not derived ones (draft/synthesis/wiki). \
+            Wraps the existing `rbrain audit` logic into the ValidatorResult vocabulary with suggested_actions."
+    )]
+    async fn citation_check(
+        &self,
+        Parameters(args): Parameters<CitationCheckArgs>,
+    ) -> Json<CitationCheckResultJson> {
+        match run_citation_check(&self.engine, &args.slug).await {
+            Ok(report) => Json(CitationCheckResultJson {
+                ok: true,
+                slug: report.slug,
+                validator: validator_to_json(&report.validator),
+            }),
+            Err(e) => Json(CitationCheckResultJson {
+                ok: false,
+                slug: args.slug.clone(),
+                validator: ValidatorJson {
+                    validator: "brain_citation_check".into(),
+                    status: "fail".into(),
+                    message: format!("audit failed: {e}"),
+                    affected_slugs: vec![args.slug],
+                    suggested_actions: vec![],
+                },
+            }),
+        }
+    }
+
+    #[tool(
+        name = "brain_evidence_check",
+        description = "Walk the provenance graph from a finding (supports / derived_from / uses_dataset) and \
+            confirm it terminates in at least one registered artifact + dataset. M1 implementation: counts \
+            outgoing supports edges and traversal depth."
+    )]
+    async fn evidence_check(
+        &self,
+        Parameters(args): Parameters<EvidenceCheckArgs>,
+    ) -> Json<EvidenceCheckResultJson> {
+        let pool = self.engine.get_db();
+        // Outgoing supports edges to registered artifacts.
+        let supports_count: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM links l
+             JOIN pages p ON p.slug = l.target_slug
+             WHERE l.source_slug = ?
+               AND l.edge_type = 'supports'
+               AND p.page_type = 'artifact'",
+        )
+        .bind(&args.finding_slug)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        // Reachable dataset via 2-hop:
+        // finding --supports--> artifact --derived_from/uses_dataset--> dataset.
+        let dataset_count: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM links l1
+             JOIN pages artifact ON artifact.slug = l1.target_slug
+             JOIN links l2 ON l2.source_slug = artifact.slug
+             JOIN pages dataset ON dataset.slug = l2.target_slug
+             WHERE l1.source_slug = ?
+               AND l1.edge_type = 'supports'
+               AND l2.edge_type IN ('derived_from','uses_dataset')
+               AND artifact.page_type = 'artifact'
+               AND dataset.page_type = 'dataset'",
+        )
+        .bind(&args.finding_slug)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        let validator = if supports_count == 0 {
+            ValidatorResult::fail(
+                "brain_evidence_check",
+                "finding has no `supports` outlink to an artifact",
+            )
+            .with_affected([args.finding_slug.clone()])
+            .with_actions([SuggestedAction::LinkEvidence {
+                from: args.finding_slug.clone(),
+                to: String::new(),
+                link_type: "supports".into(),
+            }])
+        } else if dataset_count == 0 {
+            ValidatorResult::warn(
+                "brain_evidence_check",
+                "finding supports an artifact but no dataset lineage reached within 2 hops",
+            )
+            .with_affected([args.finding_slug.clone()])
+        } else {
+            ValidatorResult::pass("brain_evidence_check")
+        };
+
+        Json(EvidenceCheckResultJson {
+            ok: true,
+            finding_slug: args.finding_slug,
+            validator: validator_to_json(&validator),
+        })
     }
 }
 

@@ -1308,6 +1308,87 @@ impl Engine {
         Ok(rrf(ranked_lists, 60.0))
     }
 
+    /// Hybrid search with per-result attribution for `query --explain` (M0).
+    /// Returns one [`ExplainedHit`] per chunk_id in the RRF top-k, including
+    /// dense/BM25 rank+score and the sparse degradation flag.
+    pub async fn explained_search(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+    ) -> Result<Vec<ExplainedHit>> {
+        let (dense_results, sparse_results, keyword_results) = tokio::join!(
+            self.vector_search(query, k),
+            self.sparse_search(query, k),
+            self.keyword_search(query, lang, k),
+        );
+        let dense = dense_results.unwrap_or_default();
+        let sparse = sparse_results.unwrap_or_default();
+        let keyword = keyword_results.unwrap_or_default();
+
+        // Build per-id attribution maps.
+        use std::collections::HashMap;
+        let mut dense_map: HashMap<i64, (usize, f32)> = HashMap::new();
+        for (i, (id, score)) in dense.iter().enumerate() {
+            dense_map.insert(*id, (i + 1, *score));
+        }
+        let mut keyword_map: HashMap<i64, (usize, f32)> = HashMap::new();
+        for (i, (id, score)) in keyword.iter().enumerate() {
+            keyword_map.insert(*id, (i + 1, *score));
+        }
+        let mut sparse_map: HashMap<i64, (usize, f32)> = HashMap::new();
+        for (i, (id, score)) in sparse.iter().enumerate() {
+            sparse_map.insert(*id, (i + 1, *score));
+        }
+
+        // RRF (same constant as hybrid_search).
+        let mut ranked_lists: Vec<Vec<(i64, usize)>> = Vec::new();
+        if !dense.is_empty() {
+            ranked_lists.push(
+                dense
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (*id, i + 1))
+                    .collect(),
+            );
+        }
+        if !sparse.is_empty() {
+            ranked_lists.push(
+                sparse
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (*id, i + 1))
+                    .collect(),
+            );
+        }
+        if !keyword.is_empty() {
+            ranked_lists.push(
+                keyword
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (*id, i + 1))
+                    .collect(),
+            );
+        }
+        let fused = rrf(ranked_lists, 60.0);
+        let sparse_enabled = self.is_sparse_enabled();
+        Ok(fused
+            .into_iter()
+            .take(k)
+            .map(|(id, rrf_score)| ExplainedHit {
+                chunk_id: id,
+                rrf_score,
+                dense_rank: dense_map.get(&id).map(|(r, _)| *r),
+                dense_score: dense_map.get(&id).map(|(_, s)| *s),
+                bm25_rank: keyword_map.get(&id).map(|(r, _)| *r),
+                bm25_score: keyword_map.get(&id).map(|(_, s)| *s),
+                sparse_rank: sparse_map.get(&id).map(|(r, _)| *r),
+                sparse_score: sparse_map.get(&id).map(|(_, s)| *s),
+                sparse_enabled,
+            })
+            .collect())
+    }
+
     /// Sparse vector search — returns empty when backend doesn't support it yet.
     async fn sparse_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
         let embedder = match &self.inner.embedder {
@@ -2318,7 +2399,26 @@ impl Engine {
             }
         }
 
+        // M0: sparse retrieval is currently degraded — LanceDB Rust SDK does
+        // not yet expose sparse ANN. hybrid_search falls back to dense + BM25.
+        // Report as a WARN-style issue so doctor surfaces it.
+        if !self.is_sparse_enabled() {
+            issues.push(
+                "SPARSE_DEGRADED: sparse ANN unavailable in LanceDB Rust SDK 0.17; \
+                 retrieval is dense + BM25 only. Chinese terms, proper nouns, and \
+                 exact phrases lose a retrieval signal."
+                    .to_string(),
+            );
+        }
+
         Ok(issues)
+    }
+
+    /// Whether the sparse retrieval path is operational.
+    /// Currently always false — kept as a method so future SDK upgrades flip a
+    /// single source of truth (doctor + `query --explain` both read this).
+    pub fn is_sparse_enabled(&self) -> bool {
+        false
     }
 
     /// Get statistics about the knowledge base
@@ -3392,7 +3492,8 @@ impl Engine {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    let base_slug = format!("{}{}", cfg.slug_prefix, slugify(name));
+                                        let base_slug =
+                                            format!("{}{}", cfg.slug_prefix, slugify(name));
                                     // Deduplicate within this run using a counter suffix
                                     let out_slug = if used_slugs.contains(&base_slug) {
                                         let mut i = 2usize;
@@ -3437,7 +3538,8 @@ impl Engine {
                                         .unwrap_or(0) > 0;
 
                                         if !already_linked {
-                                            if let Ok(mut existing) = self.get_page(&out_slug).await
+                                                if let Ok(mut existing) =
+                                                    self.get_page(&out_slug).await
                                             {
                                                 // Use a heading separator instead of `---` to avoid
                                                 // corrupting split_body(), which uses rfind("\n---\n")
@@ -4207,10 +4309,8 @@ impl Engine {
                     while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
                         idx -= 1;
                     }
-                    let snippet =
-                        p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
-                    context_items
-                        .push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
+                    let snippet = p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
+                    context_items.push(format!("Source: {} | {}\n{}", p.slug, p.title, snippet));
                 } else {
                     let slug = &p.slug;
                     let chunk_blocks: Vec<String> = db_chunks
@@ -4242,7 +4342,10 @@ impl Engine {
                 let synthesized_content = if let Some(client) = deepseek {
                     let system = self.inner.prompts.load("synthesize_academic");
                     let user = match &revision_hint {
-                        Some(hint) => format!("{base_user}\n\n---\nREVISION REQUIRED (attempt {}/{MAX_RETRIES}): {hint}", attempt + 1),
+                        Some(hint) => format!(
+                            "{base_user}\n\n---\nREVISION REQUIRED (attempt {}/{MAX_RETRIES}): {hint}",
+                            attempt + 1
+                        ),
                         None => base_user.clone(),
                     };
                     match client.chat_pro(&system, &user).await {
@@ -4266,9 +4369,7 @@ impl Engine {
                 );
                 page.title = format!("综合分析：{}", concept.title);
                 page.tags = concept.tags.clone();
-                page.language = Some(rbrain_core::page::Language::detect(
-                    &page.compiled_truth,
-                ));
+                page.language = Some(rbrain_core::page::Language::detect(&page.compiled_truth));
 
                 if deepseek.is_some() {
                     match validate_synthesis_quality(&page.compiled_truth, source_pages.len()) {
@@ -4280,13 +4381,17 @@ impl Engine {
                             if attempt < MAX_RETRIES {
                                 eprintln!(
                                     "    WARN: attempt {}/{} rejected ({}), retrying…",
-                                    attempt + 1, MAX_RETRIES + 1, reason
+                                    attempt + 1,
+                                    MAX_RETRIES + 1,
+                                    reason
                                 );
                                 revision_hint = Some(reason);
                             } else {
                                 eprintln!(
                                     "    WARN: rejecting low-quality synthesis {} after {} attempt(s): {}",
-                                    synthesis_slug, MAX_RETRIES + 1, reason
+                                    synthesis_slug,
+                                    MAX_RETRIES + 1,
+                                    reason
                                 );
                             }
                         }
@@ -5070,6 +5175,24 @@ pub struct GraphEdge {
     pub edge_type: String,
     pub depth: usize,
     pub context: Option<String>,
+}
+
+/// Per-result attribution returned by [`Engine::explained_search`]. Used by
+/// `rbrain query --explain` (M0) so missed retrievals can be debugged without
+/// reading the source code.
+#[derive(Debug, Clone)]
+pub struct ExplainedHit {
+    pub chunk_id: i64,
+    pub rrf_score: f64,
+    pub dense_rank: Option<usize>,
+    pub dense_score: Option<f32>,
+    pub bm25_rank: Option<usize>,
+    pub bm25_score: Option<f32>,
+    pub sparse_rank: Option<usize>,
+    pub sparse_score: Option<f32>,
+    /// False while the LanceDB Rust SDK has no sparse ANN. Surface this in
+    /// every explain line so callers know the channel is degraded.
+    pub sparse_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
