@@ -146,6 +146,7 @@ async fn provenance_of_artifact_lists_incoming_and_outgoing_research_edges() {
     engine.add_link(artifact, script, "computed_by", None, None).await.unwrap();
     // Incoming to artifact:
     engine.add_link(finding, artifact, "supports", None, None).await.unwrap();
+    engine.add_link(finding, artifact, "contradicts", None, None).await.unwrap();
     engine.add_link(run, artifact, "produces", None, None).await.unwrap();
     // Non-research edge that must be filtered out:
     engine.add_link(artifact, dataset, "mentions", None, None).await.unwrap();
@@ -162,9 +163,10 @@ async fn provenance_of_artifact_lists_incoming_and_outgoing_research_edges() {
     assert!(out_types.contains(&"computed_by"), "out_types={:?}", out_types);
     assert!(!out_types.contains(&"mentions"), "out_types={:?}", out_types);
 
-    // Incoming: supports + produces.
+    // Incoming: supports + contradicts + produces.
     let in_types: Vec<&str> = incoming.iter().map(|e| e.edge_type.as_str()).collect();
     assert!(in_types.contains(&"supports"), "in_types={:?}", in_types);
+    assert!(in_types.contains(&"contradicts"), "in_types={:?}", in_types);
     assert!(in_types.contains(&"produces"), "in_types={:?}", in_types);
 }
 
@@ -173,5 +175,25 @@ async fn provenance_of_unknown_slug_errors() {
     let tb = TestBrain::new().await;
     let engine = open_mock_engine(&tb).await;
     let r = provenance_of(engine.get_db(), "research/missing").await;
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn evidence_check_unknown_slug_errors() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+    let r = run_evidence_check(engine.get_db(), "research/findings/missing").await;
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn evidence_check_non_finding_slug_errors() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let note = "research/notes/not-a-finding";
+    put_typed_page(&engine, note, "note", "Not a finding", Default::default()).await;
+
+    let r = run_evidence_check(engine.get_db(), note).await;
     assert!(r.is_err());
 }

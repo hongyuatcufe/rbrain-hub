@@ -504,6 +504,10 @@ async fn finding_has_dataset_lineage_rejects_uses_dataset_on_artifact_edge() {
         .await
         .expect("run→finding");
     engine
+        .add_link(run_slug, dataset_slug, "uses_dataset", None, None)
+        .await
+        .expect("run→dataset");
+    engine
         .add_link(finding_slug, artifact_slug, "supports", None, None)
         .await
         .expect("finding→artifact");
@@ -565,6 +569,10 @@ async fn finding_has_dataset_lineage_passes_with_derived_from() {
         .await
         .expect("run→finding");
     engine
+        .add_link(run_slug, dataset_slug, "uses_dataset", None, None)
+        .await
+        .expect("run→dataset");
+    engine
         .add_link(finding_slug, artifact_slug, "supports", None, None)
         .await
         .expect("finding→artifact");
@@ -577,6 +585,75 @@ async fn finding_has_dataset_lineage_passes_with_derived_from() {
         .await
         .expect("v");
     assert_eq!(v.status, ValidatorStatus::Pass);
+}
+
+#[tokio::test]
+async fn finding_has_dataset_lineage_rejects_dataset_not_registered_on_run() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+    let store = ResearchRunStore::new(engine.get_db());
+
+    let run_slug = "research/runs/wrong-dataset";
+    put_typed_page(
+        &engine,
+        run_slug,
+        "research_run",
+        "Wrong-dataset run",
+        Default::default(),
+    )
+    .await;
+    store
+        .create(None, run_slug, TaskType::DataAnalysis, "fixture")
+        .await
+        .expect("create");
+
+    let registered_dataset = "research/datasets/registered";
+    let mut reg_fm = serde_json::Map::new();
+    reg_fm.insert("hash".into(), serde_json::json!("sha256:registered"));
+    put_typed_page(&engine, registered_dataset, "dataset", "Registered", reg_fm).await;
+
+    let other_dataset = "research/datasets/other";
+    let mut other_fm = serde_json::Map::new();
+    other_fm.insert("hash".into(), serde_json::json!("sha256:other"));
+    put_typed_page(&engine, other_dataset, "dataset", "Other", other_fm).await;
+
+    let artifact_slug = "research/artifacts/wrong-dataset-result";
+    let mut art_fm = serde_json::Map::new();
+    art_fm.insert("hash".into(), serde_json::json!("sha256:result"));
+    art_fm.insert("artifact_kind".into(), serde_json::json!("result_table"));
+    put_typed_page(&engine, artifact_slug, "artifact", "Wrong dataset result", art_fm).await;
+
+    let finding_slug = "research/findings/wrong-dataset-finding";
+    let mut find_fm = serde_json::Map::new();
+    find_fm.insert("status".into(), serde_json::json!("claim"));
+    put_typed_page(&engine, finding_slug, "finding", "Wrong dataset finding", find_fm).await;
+
+    engine
+        .add_link(run_slug, registered_dataset, "uses_dataset", None, None)
+        .await
+        .expect("run→registered dataset");
+    engine
+        .add_link(run_slug, finding_slug, "produces", None, None)
+        .await
+        .expect("run→finding");
+    engine
+        .add_link(finding_slug, artifact_slug, "supports", None, None)
+        .await
+        .expect("finding→artifact");
+    engine
+        .add_link(artifact_slug, other_dataset, "derived_from", None, None)
+        .await
+        .expect("artifact→other dataset");
+
+    let v = finding_has_dataset_lineage(engine.get_db(), run_slug)
+        .await
+        .expect("v");
+    assert_eq!(
+        v.status,
+        ValidatorStatus::Fail,
+        "artifact lineage must use a dataset registered on the run: {}",
+        v.message
+    );
 }
 
 #[tokio::test]

@@ -1,8 +1,9 @@
 //! `brain_provenance_of(slug)` — reverse-walk the research graph to answer
 //! "what produced this result/artifact/finding?".
 //!
-//! Walks the edges `derived_from`, `computed_by`, `uses_dataset`, `supports`,
-//! `produces`, `cites` *in reverse* to enumerate the upstream chain.
+//! Enumerates incoming and outgoing research edges for the queried page. This is
+//! an adjacency report, not a recursive traversal; use `brain_evidence_check`
+//! for a finding's resolved evidence chain.
 //!
 //! Result is shaped so ZeroClaw can directly render a human-readable trail:
 //!
@@ -17,6 +18,8 @@
 use rbrain_core::error::{BrainError, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+
+use crate::research::edges::ALL as RESEARCH_EDGES;
 
 fn db_err<E: std::fmt::Display>(e: E) -> BrainError {
     BrainError::Io(std::io::Error::new(
@@ -44,20 +47,6 @@ pub struct ProvenanceReport {
     pub edges: Vec<ProvenanceEdge>,
 }
 
-const RESEARCH_EDGES: &[&str] = &[
-    "derived_from",
-    "computed_by",
-    "uses_dataset",
-    "uses_method",
-    "uses_variable",
-    "supports",
-    "produces",
-    "cites",
-    "tests_hypothesis",
-    "validates",
-    "limits",
-];
-
 /// Build an SQL `IN (?,?,...)` placeholder for the edge whitelist.
 fn placeholders(n: usize) -> String {
     std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
@@ -73,7 +62,8 @@ pub async fn provenance_of(pool: &SqlitePool, slug: &str) -> Result<ProvenanceRe
         .map_err(db_err)?
         .ok_or_else(|| BrainError::Conflict(format!("page not found: {slug}")))?;
 
-    let ph = placeholders(RESEARCH_EDGES.len());
+    let edge_names: Vec<&str> = RESEARCH_EDGES.iter().map(|e| e.as_str()).collect();
+    let ph = placeholders(edge_names.len());
 
     // Outgoing edges: slug --edge--> neighbour
     let out_sql = format!(
@@ -83,7 +73,7 @@ pub async fn provenance_of(pool: &SqlitePool, slug: &str) -> Result<ProvenanceRe
          ORDER BY l.edge_type, p.slug"
     );
     let mut q = sqlx::query(&out_sql).bind(slug);
-    for e in RESEARCH_EDGES {
+    for e in &edge_names {
         q = q.bind(*e);
     }
     let out_rows = q.fetch_all(pool).await.map_err(db_err)?;
@@ -96,7 +86,7 @@ pub async fn provenance_of(pool: &SqlitePool, slug: &str) -> Result<ProvenanceRe
          ORDER BY l.edge_type, p.slug"
     );
     let mut q = sqlx::query(&in_sql).bind(slug);
-    for e in RESEARCH_EDGES {
+    for e in &edge_names {
         q = q.bind(*e);
     }
     let in_rows = q.fetch_all(pool).await.map_err(db_err)?;
@@ -138,18 +128,26 @@ mod tests {
 
     #[test]
     fn edge_whitelist_covers_phase3_set() {
-        // Sanity-check: every Phase 3 research edge must appear in the
-        // whitelist so reverse-walk doesn't silently drop edge types.
+        // Sanity-check: every Phase 3 research edge must appear in the source
+        // vocabulary used by provenance_of, including contradiction edges.
         for e in [
             "derived_from",
             "computed_by",
             "uses_dataset",
+            "uses_method",
+            "uses_variable",
             "supports",
+            "contradicts",
             "produces",
             "cites",
+            "tests_hypothesis",
+            "validates",
+            "limits",
         ] {
             assert!(
-                RESEARCH_EDGES.contains(&e),
+                crate::research::edges::ALL
+                    .iter()
+                    .any(|edge| edge.as_str() == e),
                 "whitelist missing {e}",
             );
         }

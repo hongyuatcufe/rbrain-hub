@@ -28,6 +28,8 @@
 - **Dual embedding / 双向量嵌入** — single Qwen API call returns both dense (1024-dim) and sparse vectors via `output_type="dense&sparse"`
 - **LanceDB vector store** — MVCC concurrent-safe writes, IVF-PQ ANN index (auto-built at ≥256 rows), S3-compatible storage backend
 - **Knowledge graph / 知识图谱** — typed directed links anchored to specific passages (`evidence`, `related`, `supports`, `contrasts`, `develops`)
+- **Research memory + method review / 研究记忆与方法审阅** — `research_runs`, protocol state, dataset/artifact registration, citation/evidence/provenance validators for ZeroClaw-driven workflows
+- **Provenance graph / 研究溯源图** — 12 research edges (`uses_dataset`, `computed_by`, `derived_from`, `supports`, `contradicts`, etc.), `brain_evidence_check`, and one-hop `brain_provenance_of`
 - **Programmable pipeline profiles / 可编程流水线** — TOML-configured EXTRACT → SYNTHESIZE → COMPOSE stages; run with `dream --profile <name>`
 - **Dream Cycle / 自动知识提取流水线** — lint → embed → extract concepts/figures → synthesize concept clusters
 - **Literature review automation / 文献综述自动化** — `literature_review` profile runs extract → synthesize → compose, producing a structured academic review from raw articles
@@ -139,6 +141,8 @@ rbrain sync --embed                      # sync + re-embed changed pages
 
 Page types / 页面类型: `note` | `concept` | `figure` | `synthesis` | `wiki` | `question` | `evidence` | `draft` | `memo` | `period` | `book`
 
+Research page types / 研究页面类型: `research_run` | `research_question` | `dataset` | `codebook` | `analysis_plan` | `artifact` | `script` | `result` | `finding` | `limitation` | `research_memo` | `method_note`
+
 ### Search & Retrieval / 检索
 
 ```bash
@@ -159,7 +163,22 @@ rbrain orphans                           # pages with no incoming links
 rbrain extract --all                     # re-index [[wikilinks]] from content
 ```
 
-Link types / 链接类型: `evidence` | `related` | `supports` | `contrasts` | `develops`
+Generic link types / 通用链接类型: `evidence` | `related` | `supports` | `contrasts` | `develops` | `mentions` | `references`
+
+Research provenance edges / 研究溯源边: `uses_dataset` | `uses_variable` | `uses_method` | `computed_by` | `derived_from` | `supports` | `contradicts` | `tests_hypothesis` | `cites` | `limits` | `produces` | `validates`
+
+### ZeroClaw Research Workflow / ZeroClaw 研究工作流
+
+rbrain-hub is the research memory and quality layer for a lightweight academic agent stack. ZeroClaw executes shell/Python/R/SQL/browser/file tasks; rbrain-hub records the research state, retrieves evidence, preserves provenance, and validates citations/method completeness.
+
+M0-M2 shipped capabilities:
+
+- `query --explain` and sparse-degradation observability for retrieval diagnosis.
+- `research_runs` state table plus protocol recovery via `run_id`.
+- MCP tools: `brain_create_research_run`, `brain_get_research_protocol`, `brain_register_input`, `brain_record`, `brain_validate_research_run`, `brain_citation_check`, `brain_evidence_check`, `brain_provenance_of`.
+- `brain_evidence_check(finding_slug)` returns an `EvidenceChain { direct_support, datasets, scripts, literature_sources }`.
+- `brain_provenance_of(slug)` returns one-hop incoming/outgoing research-edge adjacency, filtering non-research edges such as `references`, `mentions`, and `related`.
+- Run-level data-analysis validation checks that artifact dataset lineage belongs to the current run's registered `uses_dataset` set.
 
 ### Dream Cycle / 自动化流水线
 

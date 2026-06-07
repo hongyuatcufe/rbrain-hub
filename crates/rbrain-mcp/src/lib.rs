@@ -1,9 +1,8 @@
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
-    SuggestedAction, ValidatorResult, analysis_plan_exists, artifact_hash_present,
-    dataset_registered, finding_has_dataset_lineage, finding_has_supporting_artifact,
-    run_citation_check,
+    ValidatorResult, analysis_plan_exists, artifact_hash_present, dataset_registered,
+    finding_has_dataset_lineage, finding_has_supporting_artifact, run_citation_check,
 };
 use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
 use rbrain_engine::research::{
@@ -930,7 +929,9 @@ impl RBrainMcpServer {
         description = "Create a typed directed link between two pages. \
             Use chunk_id (from brain_query results) to anchor the link to a specific passage as evidence — \
             the chunk text is automatically captured as context. \
-            link_type: evidence | related | person | period | supports | contrasts | develops | mentions | references"
+            Generic graph link_type: evidence | related | person | period | contrasts | develops | mentions | references. \
+            Research provenance link_type: uses_dataset | uses_variable | uses_method | computed_by | derived_from | \
+            supports | contradicts | tests_hypothesis | cites | limits | produces | validates."
     )]
     async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> Json<MutationResult> {
         let link_type = args.link_type.as_deref().unwrap_or("related");
@@ -1574,10 +1575,11 @@ impl RBrainMcpServer {
 
     #[tool(
         name = "brain_provenance_of",
-        description = "Reverse-walk the research graph from a slug to answer 'what produced this?'. \
-            Returns all incoming and outgoing research-context edges (derived_from, \
-            computed_by, uses_dataset, supports, produces, cites, tests_hypothesis, \
-            validates, limits). ZeroClaw renders these as a provenance trail."
+        description = "Enumerate one-hop incoming and outgoing research-context edges for a slug. \
+            This is an adjacency report, not a recursive chain traversal. For a finding's resolved \
+            evidence chain, call brain_evidence_check. Returned edges are limited to: derived_from, \
+            computed_by, uses_dataset, uses_method, uses_variable, supports, contradicts, produces, \
+            cites, tests_hypothesis, validates, limits."
     )]
     async fn provenance_of(
         &self,

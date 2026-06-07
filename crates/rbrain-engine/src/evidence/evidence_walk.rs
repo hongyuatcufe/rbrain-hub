@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
 use super::actions::SuggestedAction;
-use super::result::{ValidatorResult, ValidatorStatus};
+use super::result::ValidatorResult;
 
 fn db_err<E: std::fmt::Display>(e: E) -> BrainError {
     BrainError::Io(std::io::Error::new(
@@ -64,6 +64,18 @@ fn is_source_tier(page_type: &str) -> bool {
 }
 
 pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result<EvidenceReport> {
+    let page_type: String = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?")
+        .bind(finding_slug)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| BrainError::Conflict(format!("page not found: {finding_slug}")))?;
+    if page_type != "finding" {
+        return Err(BrainError::Conflict(format!(
+            "brain_evidence_check requires page_type=finding, got {page_type}: {finding_slug}"
+        )));
+    }
+
     // ── 1. supports edges (data-analysis finding shape) ────────────────────
     let supports_rows = sqlx::query(
         "SELECT p.slug, p.page_type FROM links l
@@ -219,6 +231,7 @@ fn classify_chain(chain: &EvidenceChain) -> ValidatorResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::result::ValidatorStatus;
 
     #[test]
     fn empty_chain_fails() {

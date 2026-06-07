@@ -6,7 +6,7 @@ This note records the code-review findings and roadmap for evolving rbrain-hub i
 >
 > **M0 + M1 shipped** in commit `0819ae6`: research_runs migration, evidence/research engine modules, 7 consolidated MCP tools, doctor sparse warn, `query --explain` v1, 9-test data_analysis fixture.
 >
-> **M2 shipped** in the follow-up commit: `ResearchEdge` vocabulary (11 edges), real graph-traversal `brain_evidence_check` returning `EvidenceChain`, new `brain_provenance_of(slug)` tool that reverse-walks research edges only (filters out `references`/`mentions`/etc.), `SuggestedAction::RecordAnalysisPlan`, 6-test m2_provenance fixture.
+> **M2 shipped** in the follow-up commit: `ResearchEdge` vocabulary (12 edges), real graph-traversal `brain_evidence_check` returning `EvidenceChain`, new `brain_provenance_of(slug)` tool that enumerates one-hop research-edge adjacency only (filters out `references`/`mentions`/etc.), `SuggestedAction::RecordAnalysisPlan`, 8-test m2_provenance fixture.
 
 ## Current assessment
 

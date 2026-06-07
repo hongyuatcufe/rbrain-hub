@@ -242,8 +242,8 @@ pub async fn finding_has_dataset_lineage(
 
         // Phase 3 graph contract: `uses_dataset` is run→dataset (dependency
         // declaration), `derived_from` is artifact→dataset (blood lineage).
-        // Only `derived_from` is the canonical artifact→dataset edge; accepting
-        // `uses_dataset` here would silently pass malformed graphs.
+        // The derived dataset must also be registered on this run; otherwise a
+        // finding can pass using an artifact from a different research context.
         let lineage_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM links l1
              JOIN pages artifact ON artifact.slug = l1.target_slug
@@ -253,9 +253,16 @@ pub async fn finding_has_dataset_lineage(
                AND l1.edge_type = 'supports'
                AND artifact.page_type = 'artifact'
                AND l2.edge_type = 'derived_from'
-               AND dataset.page_type = 'dataset'",
+               AND dataset.page_type = 'dataset'
+               AND EXISTS (
+                   SELECT 1 FROM links run_ds
+                   WHERE run_ds.source_slug = ?
+                     AND run_ds.target_slug = dataset.slug
+                     AND run_ds.edge_type = 'uses_dataset'
+               )",
         )
         .bind(&slug)
+        .bind(run_slug)
         .fetch_one(pool)
         .await
         .map_err(db_err)?;
