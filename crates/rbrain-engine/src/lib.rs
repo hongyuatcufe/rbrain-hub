@@ -18,4 +18,7 @@ pub use pipeline::{
     RetryParser, Runnable, SaveTypeConfig, Sequential, StageConfig,
 };
 pub use rbrain_search::TantivyIndex;
-pub use research::{NextAction, ProtocolState, ResearchRun, ResearchRunStore, RunStatus, TaskType};
+pub use research::{
+    NextAction, ProtocolState, ResearchEdge, ResearchRun, ResearchRunStore, RunStatus, TaskType,
+    is_research_edge,
+};

@@ -467,6 +467,24 @@ pub struct EvidenceCheckResultJson {
     pub ok: bool,
     pub finding_slug: String,
     pub validator: ValidatorJson,
+    /// EvidenceChain JSON (direct_support, datasets, scripts, literature_sources)
+    /// — present when ok=true, null on traversal error.
+    pub chain: serde_json::Value,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ProvenanceArgs {
+    pub slug: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ProvenanceResultJson {
+    pub ok: bool,
+    pub slug: String,
+    pub page_type: String,
+    /// Array of ProvenanceEdge entries: { edge_type, neighbour_slug, neighbour_page_type, incoming }.
+    pub edges: serde_json::Value,
+    pub message: String,
 }
 
 fn validator_to_json(v: &ValidatorResult) -> ValidatorJson {
@@ -1517,72 +1535,75 @@ impl RBrainMcpServer {
 
     #[tool(
         name = "brain_evidence_check",
-        description = "Walk the provenance graph from a finding (supports / derived_from / uses_dataset) and \
-            confirm it terminates in at least one registered artifact + dataset. M1 implementation: counts \
-            outgoing supports edges and traversal depth."
+        description = "Walk the provenance graph from a finding and report whether it terminates in \
+            evidence the validators recognise. Supports both shapes: data_analysis \
+            (supports → artifact → derived_from → dataset) and literature_review \
+            (cites/supports → note|raw). Returns the resolved chain (direct_support, \
+            datasets, scripts, literature_sources) plus a validator verdict."
     )]
     async fn evidence_check(
         &self,
         Parameters(args): Parameters<EvidenceCheckArgs>,
     ) -> Json<EvidenceCheckResultJson> {
         let pool = self.engine.get_db();
-        // Outgoing supports edges to registered artifacts.
-        let supports_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM links l
-             JOIN pages p ON p.slug = l.target_slug
-             WHERE l.source_slug = ?
-               AND l.edge_type = 'supports'
-               AND p.page_type = 'artifact'",
-        )
-        .bind(&args.finding_slug)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        match rbrain_engine::evidence::run_evidence_check(pool, &args.finding_slug).await {
+            Ok(report) => {
+                let chain_json =
+                    serde_json::to_value(&report.chain).unwrap_or(serde_json::Value::Null);
+                Json(EvidenceCheckResultJson {
+                    ok: true,
+                    finding_slug: args.finding_slug,
+                    validator: validator_to_json(&report.validator),
+                    chain: chain_json,
+                })
+            }
+            Err(e) => Json(EvidenceCheckResultJson {
+                ok: false,
+                finding_slug: args.finding_slug.clone(),
+                validator: ValidatorJson {
+                    validator: "brain_evidence_check".into(),
+                    status: "fail".into(),
+                    message: format!("traversal failed: {e}"),
+                    affected_slugs: vec![args.finding_slug],
+                    suggested_actions: vec![],
+                },
+                chain: serde_json::Value::Null,
+            }),
+        }
+    }
 
-        // Reachable dataset via 2-hop:
-        // finding --supports--> artifact --derived_from/uses_dataset--> dataset.
-        let dataset_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM links l1
-             JOIN pages artifact ON artifact.slug = l1.target_slug
-             JOIN links l2 ON l2.source_slug = artifact.slug
-             JOIN pages dataset ON dataset.slug = l2.target_slug
-             WHERE l1.source_slug = ?
-               AND l1.edge_type = 'supports'
-               AND l2.edge_type IN ('derived_from','uses_dataset')
-               AND artifact.page_type = 'artifact'
-               AND dataset.page_type = 'dataset'",
-        )
-        .bind(&args.finding_slug)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        let validator = if supports_count == 0 {
-            ValidatorResult::fail(
-                "brain_evidence_check",
-                "finding has no `supports` outlink to an artifact",
-            )
-            .with_affected([args.finding_slug.clone()])
-            .with_actions([SuggestedAction::LinkEvidence {
-                from: args.finding_slug.clone(),
-                to: String::new(),
-                link_type: "supports".into(),
-            }])
-        } else if dataset_count == 0 {
-            ValidatorResult::warn(
-                "brain_evidence_check",
-                "finding supports an artifact but no dataset lineage reached within 2 hops",
-            )
-            .with_affected([args.finding_slug.clone()])
-        } else {
-            ValidatorResult::pass("brain_evidence_check")
-        };
-
-        Json(EvidenceCheckResultJson {
-            ok: true,
-            finding_slug: args.finding_slug,
-            validator: validator_to_json(&validator),
-        })
+    #[tool(
+        name = "brain_provenance_of",
+        description = "Reverse-walk the research graph from a slug to answer 'what produced this?'. \
+            Returns all incoming and outgoing research-context edges (derived_from, \
+            computed_by, uses_dataset, supports, produces, cites, tests_hypothesis, \
+            validates, limits). ZeroClaw renders these as a provenance trail."
+    )]
+    async fn provenance_of(
+        &self,
+        Parameters(args): Parameters<ProvenanceArgs>,
+    ) -> Json<ProvenanceResultJson> {
+        let pool = self.engine.get_db();
+        match rbrain_engine::evidence::provenance_of(pool, &args.slug).await {
+            Ok(report) => {
+                let edges_json =
+                    serde_json::to_value(&report.edges).unwrap_or(serde_json::Value::Array(vec![]));
+                Json(ProvenanceResultJson {
+                    ok: true,
+                    slug: report.slug,
+                    page_type: report.page_type,
+                    edges: edges_json,
+                    message: String::new(),
+                })
+            }
+            Err(e) => Json(ProvenanceResultJson {
+                ok: false,
+                slug: args.slug,
+                page_type: String::new(),
+                edges: serde_json::Value::Array(vec![]),
+                message: format!("provenance_of failed: {e}"),
+            }),
+        }
     }
 }
 

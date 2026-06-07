@@ -10,11 +10,15 @@
 
 pub mod actions;
 pub mod citation;
+pub mod evidence_walk;
+pub mod provenance;
 pub mod result;
 pub mod validators;
 
 pub use actions::SuggestedAction;
 pub use citation::{CitationCheckReport, run_citation_check};
+pub use evidence_walk::{EvidenceChain, EvidenceNode, EvidenceReport, run_evidence_check};
+pub use provenance::{ProvenanceEdge, ProvenanceReport, provenance_of};
 pub use result::{ValidatorResult, ValidatorStatus};
 pub use validators::{
     analysis_plan_exists, artifact_hash_present, dataset_registered, finding_has_dataset_lineage,

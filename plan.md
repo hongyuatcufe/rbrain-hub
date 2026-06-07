@@ -3,6 +3,10 @@
 This note records the code-review findings and roadmap for evolving rbrain-hub into the research memory and quality layer for a lightweight academic research agent stack.
 
 > **Status (2026-06-07)**: The top-level execution plan has been revised to v2; see `../rbrain-hub-execution-plan.md`. The gap analysis below remains authoritative as the *inventory* of rbrain-hub-side debt, but milestone sequencing now follows v2. The "Gap → Milestone mapping" and "Locked decisions" sections at the bottom are the source of truth for which work belongs in which milestone.
+>
+> **M0 + M1 shipped** in commit `0819ae6`: research_runs migration, evidence/research engine modules, 7 consolidated MCP tools, doctor sparse warn, `query --explain` v1, 9-test data_analysis fixture.
+>
+> **M2 shipped** in the follow-up commit: `ResearchEdge` vocabulary (11 edges), real graph-traversal `brain_evidence_check` returning `EvidenceChain`, new `brain_provenance_of(slug)` tool that reverse-walks research edges only (filters out `references`/`mentions`/etc.), `SuggestedAction::RecordAnalysisPlan`, 6-test m2_provenance fixture.
 
 ## Current assessment
 

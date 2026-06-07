@@ -9,10 +9,12 @@
 //!   results and exposed via [`ProtocolState`].
 //! - ZeroClaw executes; rbrain records + validates.
 
+pub mod edges;
 pub mod model;
 pub mod protocol;
 pub mod store;
 
+pub use edges::{ResearchEdge, is_research_edge};
 pub use model::{ResearchRun, RunStatus, TaskType};
 pub use protocol::{NextAction, ProtocolState};
 pub use store::ResearchRunStore;
