@@ -7,7 +7,8 @@ pub mod research;
 pub mod token_budget;
 
 pub use engine::{
-    BrainStats, ChunkResult, CiteEntry, Engine, ExplainedHit, GraphEdge, MergeRecord,
+    BrainStats, ChunkResult, CitationHint, CitationSummary, CitationVerification,
+    CiteEntry, DocCitationReport, Engine, ExplainedHit, GraphEdge, MergeRecord, VerifyStatus,
 };
 pub use evidence::{
     CitationCheckReport, SuggestedAction, ValidatorResult, ValidatorStatus, analysis_plan_exists,

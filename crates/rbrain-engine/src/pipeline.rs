@@ -337,6 +337,46 @@ pub fn clean_json(s: &str) -> &str {
     s.trim()
 }
 
+/// Replace ASCII `"` characters that flank CJK text with single quotes.
+///
+/// In Chinese academic writing, ASCII double-quotes `"…"` are used as quotation
+/// marks around Chinese text. When an LLM copies these verbatim into a JSON string
+/// value, the bare `"` characters break `serde_json` parsing. This function replaces
+/// `"` that immediately precedes or follows a CJK character with `'`, which is safe
+/// to embed in JSON strings without escaping.
+///
+/// This is intentionally lossy but acceptable for citation extraction purposes.
+pub fn sanitize_json_cjk_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+
+    fn is_cjk(c: char) -> bool {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}'  // CJK Unified Ideographs
+            | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
+            | '\u{FF00}'..='\u{FFEF}' // Fullwidth forms
+            | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+            | '\u{20000}'..='\u{2A6DF}' // CJK Extension B (surrogate range)
+        )
+    }
+
+    for i in 0..len {
+        let ch = chars[i];
+        if ch == '"' {
+            // Check neighbors
+            let prev_cjk = i > 0 && (is_cjk(chars[i - 1]) || "，。！？、；：）】」』".contains(chars[i - 1]));
+            let next_cjk = i + 1 < len && (is_cjk(chars[i + 1]) || "，。！？、；：（【「『".contains(chars[i + 1]));
+            if prev_cjk || next_cjk {
+                out.push('\'');
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 // ─── Profile / Workflow TOML structures (Phase 4) ─────────────────────────────
 
 /// A named pipeline profile loaded from `$profiles_dir/{name}.toml`.

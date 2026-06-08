@@ -344,6 +344,18 @@ Plan:
 - Add validation failures as first-class pipeline results.
 - Add schema migrations for reusable research profiles.
 
+### Pipeline gap 6a: compose is single-topic only (multi-topic library not supported)
+
+Current `compose` stage uses `input_mode = "aggregate"` which merges **all** synthesis pages into one wiki document. This works well when a user keeps one research topic per data directory (the current intended usage), but breaks down for users who maintain a large mixed-topic literature corpus.
+
+The problem: concepts extracted from different research topics are structurally identical — there is no topic-level signal in the pipeline that would cause compose to split them. LLM receives all synthesis pages at once and produces one merged narrative, which is typically incoherent across topics.
+
+Two candidate solutions:
+- **Tag-based filtering** (low effort): convention that each note is tagged with a topic tag; pipeline is run with `--tag <topic>` to produce per-topic wiki pages. Already works today with minor convention discipline.
+- **`group_by_tag` compose** (medium effort): extend the pipeline engine so an `aggregate` stage can have `group_by_tag = true` — it splits all matching synthesis pages into tag groups, runs one compose call per group, and saves each to `research/wiki/<tag>.md`. No per-run invocation needed. Requires a new pipeline engine capability.
+
+**Milestone assignment**: M4 or later (not blocking M3). Implement tag-based convention as the interim guidance; build `group_by_tag` when multi-topic corpus users are confirmed.
+
 ### Pipeline gap 6: incremental logic is heuristic
 
 Incremental behavior currently checks output page timestamps or existing links. This works for early literature-review stages but is fragile for data analysis.
@@ -510,6 +522,7 @@ Each gap above maps to a milestone in the v2 execution plan:
 | #3 Inputs page-centric | **M1** `brain_register_input(kind=dataset\|artifact)` handles the external-artifact case. Schema-typed artifacts in **M5**. |
 | #4 Outputs mostly pages | **M1** for artifact registration; **M5** for `save_artifact` output mode in pipelines. |
 | #5 No explicit data contracts | **M3** (JSON Schema for synthesis quality outputs) → **M5** (full schema enforcement). |
+| #6a Compose single-topic only | **M4** (`group_by_tag` compose); interim: tag-based convention (M3). |
 | #6 Heuristic incremental logic | **M5** (fingerprint-based). |
 | #7 Token-budget-aware context packing | **M3** |
 | #8 Hard-coded quality gates | **M2** (validator enum), **M3** (literature-specific gates) |

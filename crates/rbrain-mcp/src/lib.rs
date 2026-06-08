@@ -1,4 +1,5 @@
 use rbrain_core::page::Page;
+use rbrain_engine::engine::CitationHint;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
     ValidatorResult, analysis_plan_exists, artifact_hash_present, bibliography_consistency,
@@ -486,6 +487,35 @@ pub struct ProvenanceResultJson {
     pub page_type: String,
     /// Array of ProvenanceEdge entries: { edge_type, neighbour_slug, neighbour_page_type, incoming }.
     pub edges: serde_json::Value,
+    pub message: String,
+}
+
+/// One optional hint to help resolve an ambiguous citation.
+#[derive(Deserialize, JsonSchema)]
+pub struct CitationHintJson {
+    pub author: Option<String>,
+    pub year: Option<String>,
+    pub title_fragment: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct VerifyCitationsArgs {
+    /// Page slug to verify (or "__external__" if providing raw content via `content`)
+    pub slug: String,
+    /// Raw Markdown content to verify (use when slug is "__external__")
+    pub content: Option<String>,
+    /// Whether to verify claim content against source chunks (default false)
+    pub check_content: Option<bool>,
+    /// Optional hints to help resolve ambiguous citations
+    pub hints: Option<Vec<CitationHintJson>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct VerifyCitationsResultJson {
+    pub ok: bool,
+    pub slug: String,
+    /// Full JSON representation of DocCitationReport
+    pub report: serde_json::Value,
     pub message: String,
 }
 
@@ -1244,6 +1274,9 @@ impl RBrainMcpServer {
             batch_size: 1,
             max_inputs: limit,
             inject_existing_titles: None,
+            model_tier: None,
+            skip_if_target_exists: false,
+            inject_pub_metadata: false,
         };
 
         match self.engine.run_pipeline_step(&step).await {
@@ -1687,6 +1720,61 @@ impl RBrainMcpServer {
                 page_type: String::new(),
                 edges: serde_json::Value::Array(vec![]),
                 message: format!("provenance_of failed: {e}"),
+            }),
+        }
+    }
+
+    #[tool(
+        name = "brain_verify_citations",
+        description = "Given a document (by slug or raw Markdown content), extract all citation instances, \
+            resolve each to its source article via pub_metadata lookup or semantic search, and verify \
+            bibliographic accuracy (author, year, journal). With check_content=true, also verifies \
+            whether the cited source actually supports the stated claim (semantic verification). \
+            Returns a full DocCitationReport with per-citation status (OK/WARN/ERROR) and a summary."
+    )]
+    async fn verify_citations(
+        &self,
+        Parameters(args): Parameters<VerifyCitationsArgs>,
+    ) -> Json<VerifyCitationsResultJson> {
+        let check_content = args.check_content.unwrap_or(false);
+        let hints: Vec<CitationHint> = args
+            .hints
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| CitationHint {
+                author: h.author,
+                year: h.year,
+                title_fragment: h.title_fragment,
+            })
+            .collect();
+        let content_ref = args.content.as_deref();
+
+        match self
+            .engine
+            .verify_document_citations(&args.slug, content_ref, check_content, &hints)
+            .await
+        {
+            Ok(report) => {
+                let report_json =
+                    serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+                Json(VerifyCitationsResultJson {
+                    ok: true,
+                    slug: args.slug,
+                    report: report_json,
+                    message: format!(
+                        "共 {} 条引用，已解析 {}，书目 ERROR {} WARN {}",
+                        report.summary.total,
+                        report.summary.resolved,
+                        report.summary.bib_error,
+                        report.summary.bib_warn
+                    ),
+                })
+            }
+            Err(e) => Json(VerifyCitationsResultJson {
+                ok: false,
+                slug: args.slug,
+                report: serde_json::Value::Null,
+                message: format!("verify_citations failed: {e}"),
             }),
         }
     }

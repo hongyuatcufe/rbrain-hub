@@ -160,15 +160,15 @@ embed_output       = false
 incremental = true
 
 # ── Stage 6: post-hoc citation audit ─────────────────────────────────────────
-# Reads all synthesis pages + the pub_metadata table injected via system prompt,
+# Reads the final wiki/compose page + the pub_metadata table injected via system prompt,
 # compares in-text citations against verified metadata, outputs a diff report.
 [[stages]]
 id = "verify_citations"
 enabled = true
 input_mode  = "aggregate"
-page_type   = "synthesis"
-max_pages   = 25
-chars_per_page = 2500
+page_type   = "wiki"
+max_pages   = 5
+chars_per_page = 8000
 token_budget = 50000
 prompt          = "verify_citations_academic"
 response_format = "markdown"
@@ -176,5 +176,5 @@ output_mode        = "save"
 output_page_type   = "citation_report"
 output_slug_prefix = "research/citation_reports/"
 embed_output       = false
-incremental = true
+incremental = false
 inject_pub_metadata = true

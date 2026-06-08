@@ -77,6 +77,14 @@ fn build_prompt_loader(config: &Config) -> PromptLoader {
         "verify_citations_academic",
         include_str!("prompts/verify_citations_academic.md"),
     );
+    builtins.insert(
+        "extract_citations_from_doc",
+        include_str!("prompts/extract_citations_from_doc.md"),
+    );
+    builtins.insert(
+        "verify_citation_claim",
+        include_str!("prompts/verify_citation_claim.md"),
+    );
     PromptLoader::new(config.prompts_dir.clone(), builtins)
 }
 
@@ -3102,19 +3110,49 @@ impl Engine {
                             }) == 0  // only process pages whose target doesn't exist yet
                         }).collect()
                     } else {
-                        // Default SaveMulti incremental: skip pages that already have outgoing
-                        // "mentions" links created by a previous SaveMulti run.
+                        // Default SaveMulti incremental: skip source pages that already have
+                        // outgoing "mentions" links pointing to pages of the output types
+                        // defined in this stage's type_map.
+                        //
+                        // Type-scoped check prevents cross-stage pollution: if stage A creates
+                        // note→pub_metadata links and stage B creates note→concept links, each
+                        // stage only sees its own prior work and correctly re-processes when needed.
+                        let output_types: Vec<String> = type_map
+                            .values()
+                            .map(|c| c.page_type.clone())
+                            .collect();
                         input_pages.into_iter().filter(|p| {
                             let slug = p.slug.clone();
+                            let types = output_types.clone();
                             tokio::task::block_in_place(|| {
                                 tokio::runtime::Handle::current().block_on(async {
-                                    sqlx::query_scalar::<_, i64>(
-                                        "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND edge_type = 'mentions'"
-                                    )
-                                    .bind(&slug)
-                                    .fetch_one(&db)
-                                    .await
-                                    .unwrap_or(0)
+                                    if types.is_empty() {
+                                        // No type_map: fall back to any mentions link
+                                        sqlx::query_scalar::<_, i64>(
+                                            "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND edge_type = 'mentions'"
+                                        )
+                                        .bind(&slug)
+                                        .fetch_one(&db)
+                                        .await
+                                        .unwrap_or(0)
+                                    } else {
+                                        // Count mentions links to pages of the types produced by this stage
+                                        let placeholders = types.iter().enumerate()
+                                            .map(|(i, _)| format!("?{}", i + 2))
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        let sql = format!(
+                                            "SELECT COUNT(*) FROM links l \
+                                             JOIN pages p ON p.slug = l.target_slug \
+                                             WHERE l.source_slug = ?1 \
+                                             AND l.edge_type = 'mentions' \
+                                             AND p.page_type IN ({})",
+                                            placeholders
+                                        );
+                                        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(&slug);
+                                        for t in &types { q = q.bind(t); }
+                                        q.fetch_one(&db).await.unwrap_or(0)
+                                    }
                                 })
                             }) == 0
                         }).collect()
@@ -5128,6 +5166,588 @@ impl Engine {
         })
     }
 
+    /// Verify citations in a document: extract citation instances, resolve author+year to
+    /// pub_metadata slugs, compare bibliographic fields, and optionally verify claim content.
+    ///
+    /// - `slug`: page slug to verify, or "__external__" when `content` is provided directly
+    /// - `content`: raw Markdown text (used when slug == "__external__")
+    /// - `check_content`: if true, use semantic search to verify each claim against source chunks
+    /// - `hints`: optional author/year hints to aid resolution of ambiguous citations
+    pub async fn verify_document_citations(
+        &self,
+        slug: &str,
+        content: Option<&str>,
+        check_content: bool,
+        hints: &[CitationHint],
+    ) -> Result<DocCitationReport> {
+        let display_slug = if slug == "__external__" {
+            "__external__".to_string()
+        } else {
+            MarkdownParser::normalize_slug(slug)
+        };
+
+        // Step 1a: load document text
+        let doc_text = if slug == "__external__" {
+            content
+                .ok_or_else(|| {
+                    BrainError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "content must be provided when slug is __external__",
+                    ))
+                })?
+                .to_string()
+        } else {
+            let page = self.get_page(&display_slug).await?;
+            page.compiled_truth.clone()
+        };
+
+        // Step 1b: extract citations via LLM flash
+        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
+            BrainError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "DeepSeek client not configured",
+            ))
+        })?;
+
+        let extract_prompt = self.inner.prompts.load("extract_citations_from_doc");
+        // Inject hints into user message if provided
+        let hints_block = if hints.is_empty() {
+            String::new()
+        } else {
+            let hint_lines: Vec<String> = hints
+                .iter()
+                .map(|h| {
+                    format!(
+                        "- 作者: {} | 年份: {} | 标题片段: {}",
+                        h.author.as_deref().unwrap_or(""),
+                        h.year.as_deref().unwrap_or(""),
+                        h.title_fragment.as_deref().unwrap_or("")
+                    )
+                })
+                .collect();
+            format!(
+                "\n\n辅助解析提示（以下引用可能难以自动识别，请重点提取）：\n{}",
+                hint_lines.join("\n")
+            )
+        };
+        let user_msg = format!("文档内容：\n\n{}{}", doc_text, hints_block);
+
+        let raw_response = deepseek.chat(&extract_prompt, &user_msg).await?;
+        let cleaned = clean_json(&raw_response);
+        // Safety net: if serde_json fails (e.g. LLM put bare `"` inside string values
+        // from Chinese academic text), replace ASCII double-quotes flanked by CJK chars
+        // with single quotes and retry.
+        let sanitized: String;
+        let parse_input = if serde_json::from_str::<serde_json::Value>(cleaned).is_ok() {
+            cleaned
+        } else {
+            sanitized = crate::pipeline::sanitize_json_cjk_quotes(cleaned);
+            sanitized.as_str()
+        };
+
+        #[derive(Deserialize)]
+        struct RawCitation {
+            claim_sentence: Option<String>,
+            citation_text: Option<String>,
+            authors: Option<Vec<String>>,
+            year: Option<String>,
+            title_fragment: Option<String>,
+            wikilink_slug: Option<String>,
+        }
+
+        let raw_citations: Vec<RawCitation> = serde_json::from_str(parse_input).unwrap_or_default();
+
+        // Step 1c: load pub_metadata index (all pages) for fast lookup
+        // Build a map: (first_author_normalized, year) -> (slug, full_value)
+        let all_meta_pages = self
+            .list_pages(Some("pub_metadata"), None, None, None, None)
+            .await
+            .unwrap_or_default();
+
+        // Index by first author last-name + year for fast lookup
+        let mut meta_index: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+        for page in &all_meta_pages {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&page.compiled_truth) {
+                let first_author = v
+                    .get("pub_authors")
+                    .and_then(|x| x.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let year = v
+                    .get("pub_year")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                meta_index.push((first_author, year, page.slug.clone(), v));
+            }
+        }
+
+        let lang = rbrain_core::page::Language::ZhHans;
+        let mut citations: Vec<CitationVerification> = Vec::new();
+
+        for rc in raw_citations {
+            let citation_text = rc.citation_text.unwrap_or_default();
+            let claim_sentence = rc.claim_sentence.unwrap_or_default();
+            let authors = rc.authors.unwrap_or_default();
+            let year = rc.year;
+            let wikilink_slug = rc.wikilink_slug;
+
+            // Step 1d: resolve source slug
+            let effective_wikilink = wikilink_slug
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            let (resolved_slug, resolution_confidence, pub_meta_val) = if let Some(wsl) =
+                effective_wikilink
+            {
+                // Wikilink format: direct slug resolution.
+                let exists: Option<String> =
+                    sqlx::query_scalar("SELECT slug FROM pages WHERE slug = ?1")
+                        .bind(wsl)
+                        .fetch_optional(&self.inner.db)
+                        .await
+                        .unwrap_or(None);
+
+                // Fix 3: resolve raw_article → pub_metadata without any LLM calls.
+                // Strategy 1: slug basename matching.
+                //   raw/articles/论文名_作者  →  research/pub_metadata/论文名_作者
+                // Strategy 2: DB mentions-link traversal (fallback).
+                //   The extract_pub_metadata stage creates note→pub_metadata mentions links,
+                //   so we can walk one hop in the links table.
+                let pub_meta: Option<serde_json::Value> = if exists.is_some() {
+                    // Strategy 1: derive expected pub_metadata slug from wsl basename
+                    let basename = wsl.rsplit('/').next().unwrap_or(wsl);
+                    let expected_pm_slug = format!("research/pub_metadata/{}", basename);
+                    let pm_from_slug = meta_index
+                        .iter()
+                        .find(|(_, _, mslug, _)| mslug == &expected_pm_slug)
+                        .map(|(_, _, _, v)| v.clone());
+
+                    if pm_from_slug.is_some() {
+                        pm_from_slug
+                    } else {
+                        // Strategy 2: walk mentions links from the raw article page
+                        let linked_pm: Option<String> = sqlx::query_scalar(
+                            "SELECT l.target_slug FROM links l \
+                             JOIN pages p ON p.slug = l.target_slug \
+                             WHERE l.source_slug = ?1 \
+                             AND l.edge_type = 'mentions' \
+                             AND p.page_type = 'pub_metadata' \
+                             LIMIT 1",
+                        )
+                        .bind(wsl)
+                        .fetch_optional(&self.inner.db)
+                        .await
+                        .unwrap_or(None);
+
+                        linked_pm.and_then(|pm_slug| {
+                            meta_index
+                                .iter()
+                                .find(|(_, _, mslug, _)| mslug == &pm_slug)
+                                .map(|(_, _, _, v)| v.clone())
+                        })
+                    }
+                } else {
+                    None
+                };
+                (exists, 1.0f32, pub_meta)
+            } else {
+                // Author + year lookup
+                let first_author = authors.first().map(|s| s.as_str()).unwrap_or("");
+                let year_str = year.as_deref().unwrap_or("");
+
+                if first_author.is_empty() && year_str.is_empty() {
+                    (None, 0.0f32, None)
+                } else {
+                    // Collect ALL candidates where first_author matches (regardless of year).
+                    // This lets us rank by co-author + title + year rather than stopping at
+                    // the first author match, which caused year-mismatch false-OKs when the
+                    // same author has multiple papers in different years.
+                    let fa_search = first_author.to_lowercase();
+                    let candidates: Vec<&(String, String, String, serde_json::Value)> =
+                        meta_index
+                            .iter()
+                            .filter(|(fa, _, _, _)| {
+                                let fa_lower = fa.to_lowercase();
+                                fa_lower.contains(&fa_search)
+                                    || fa_search.contains(&fa_lower)
+                            })
+                            .collect();
+
+                    if candidates.is_empty() {
+                        // No first_author match at all — fall back to semantic search
+                        let query = format!(
+                            "{} {} {}",
+                            first_author,
+                            year_str,
+                            rc.title_fragment.as_deref().unwrap_or("")
+                        );
+                        let hits = self
+                            .search_with_context(&query, &lang, 5, false, 3)
+                            .await
+                            .unwrap_or_default();
+                        let top_hit = hits.first().filter(|h| h.score > 0.3);
+                        if let Some(hit) = top_hit {
+                            let mv = meta_index
+                                .iter()
+                                .find(|(_, _, s, _)| s == &hit.page_slug)
+                                .map(|(_, _, _, v)| v.clone());
+                            (Some(hit.page_slug.clone()), 0.5f32, mv)
+                        } else {
+                            (None, 0.0f32, None)
+                        }
+                    } else {
+                        // Score each candidate and pick the best.
+                        // Scoring (higher = better match):
+                        //   +4  year matches exactly
+                        //   +3  every cited co-author appears in meta author list
+                        //   +2  at least one cited co-author appears in meta author list
+                        //   +1  title_fragment words overlap with meta title
+                        //   (candidates with zero score are still considered — best effort)
+                        let title_frag = rc.title_fragment.as_deref().unwrap_or("");
+                        let cited_coauthors: Vec<String> = authors
+                            .iter()
+                            .skip(1)
+                            .map(|s| s.to_lowercase())
+                            .collect();
+
+                        // Collect CJK character bigrams from a string for overlap scoring.
+                        let bigrams = |s: &str| -> Vec<String> {
+                            let chars: Vec<char> = s.chars()
+                                .filter(|c| c.is_alphanumeric())
+                                .collect();
+                            chars.windows(2).map(|w| w.iter().collect()).collect()
+                        };
+                        let claim_bigrams = bigrams(&claim_sentence);
+
+                        let score_candidate =
+                            |(_, yr, _, mv): &(String, String, String, serde_json::Value)| {
+                                let mut score = 0i32;
+
+                                // +4 year matches exactly
+                                if !year_str.is_empty() && yr == year_str {
+                                    score += 4;
+                                }
+
+                                // +3/+2 co-author match
+                                if !cited_coauthors.is_empty() {
+                                    let meta_authors_lower: Vec<String> = mv
+                                        .get("pub_authors")
+                                        .and_then(|x| x.as_array())
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|x| x.as_str())
+                                                .map(|s| s.to_lowercase())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let matched = cited_coauthors.iter().filter(|ca| {
+                                        meta_authors_lower
+                                            .iter()
+                                            .any(|ma| ma.contains(ca.as_str()) || ca.contains(ma.as_str()))
+                                    }).count();
+                                    if matched == cited_coauthors.len() {
+                                        score += 3;
+                                    } else if matched > 0 {
+                                        score += 2;
+                                    }
+                                }
+
+                                let meta_title = mv
+                                    .get("pub_title")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_lowercase();
+
+                                // +1 per matching title_fragment word (word-level, space-split)
+                                if !title_frag.is_empty() {
+                                    let words: Vec<&str> = title_frag.split_whitespace().collect();
+                                    let matched_words = words.iter()
+                                        .filter(|w| meta_title.contains(&w.to_lowercase()))
+                                        .count();
+                                    score += matched_words as i32;
+                                }
+
+                                // Tie-breaker: claim_sentence bigram overlap with pub_title
+                                // (scaled to 0–3 to not outweigh year/co-author)
+                                if !claim_bigrams.is_empty() && !meta_title.is_empty() {
+                                    let title_bigrams = bigrams(&meta_title);
+                                    let overlap = claim_bigrams.iter()
+                                        .filter(|bg| title_bigrams.contains(bg))
+                                        .count();
+                                    // Cap at 3 bonus points regardless of overlap count
+                                    score += (overlap.min(9) / 3) as i32;
+                                }
+
+                                score
+                            };
+
+                        let best = candidates
+                            .iter()
+                            .max_by_key(|c| score_candidate(c))
+                            .unwrap(); // safe: candidates is non-empty
+
+                        (Some(best.2.clone()), 0.95f32, Some(best.3.clone()))
+                    }
+                }
+            };
+
+            // Step 1e: bibliographic check
+            let bibliographic_status = if let Some(mv) = &pub_meta_val {
+                let meta_year = mv
+                    .get("pub_year")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let year_ok = year
+                    .as_deref()
+                    .filter(|y| !y.is_empty())
+                    .map(|y| y == meta_year || meta_year.is_empty())
+                    .unwrap_or(true);
+
+                let meta_authors: Vec<String> = mv
+                    .get("pub_authors")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !year_ok {
+                    VerifyStatus::Error(format!(
+                        "年份不一致：文中「{}」vs 来源「{}」",
+                        year.as_deref().filter(|y| !y.is_empty()).unwrap_or("?"),
+                        meta_year
+                    ))
+                } else if !authors.is_empty() && !meta_authors.is_empty() {
+                    let meta_authors_lower: Vec<String> =
+                        meta_authors.iter().map(|s| s.to_lowercase()).collect();
+                    let first_meta = &meta_authors_lower[0];
+                    let first_cited = authors[0].to_lowercase();
+
+                    if !(first_meta.contains(&first_cited)
+                        || first_cited.contains(first_meta.as_str()))
+                    {
+                        VerifyStatus::Warn(format!(
+                            "第一作者不匹配：文中「{}」vs 来源「{}」",
+                            authors[0], meta_authors[0]
+                        ))
+                    } else {
+                        // First author matches — now check co-authors.
+                        // If the citation lists specific co-authors, verify they
+                        // appear in the resolved paper (catches wrong-paper matches).
+                        let cited_coauthors: Vec<&str> =
+                            authors.iter().skip(1).map(|s| s.as_str()).collect();
+                        if !cited_coauthors.is_empty() {
+                            let unmatched: Vec<&str> = cited_coauthors
+                                .iter()
+                                .copied()
+                                .filter(|ca| {
+                                    let ca_lower = ca.to_lowercase();
+                                    !meta_authors_lower.iter().any(|ma| {
+                                        ma.contains(&ca_lower) || ca_lower.contains(ma.as_str())
+                                    })
+                                })
+                                .collect();
+                            if !unmatched.is_empty() {
+                                // Cited co-author not in meta — likely resolved to wrong paper
+                                VerifyStatus::Error(format!(
+                                    "共同作者不匹配：文中「{}」在来源作者列表「{}」中不存在，可能解析到了错误的文献",
+                                    unmatched.join("、"),
+                                    meta_authors.join("、")
+                                ))
+                            } else if authors.len() < meta_authors.len() {
+                                VerifyStatus::Warn(format!(
+                                    "文中作者列表不完整（来源有{}位作者）",
+                                    meta_authors.len()
+                                ))
+                            } else {
+                                VerifyStatus::Ok
+                            }
+                        } else if authors.len() < meta_authors.len() && meta_authors.len() > 1 {
+                            // Citation only lists first author but paper has co-authors
+                            VerifyStatus::Warn(format!(
+                                "文中作者列表不完整（来源有{}位作者）",
+                                meta_authors.len()
+                            ))
+                        } else {
+                            VerifyStatus::Ok
+                        }
+                    }
+                } else {
+                    VerifyStatus::Ok
+                }
+            } else if resolved_slug.is_some() {
+                // Resolved via wikilink or search but no pub_metadata — can't check bib
+                VerifyStatus::Warn("来源已解析但缺少pub_metadata，无法核校书目".to_string())
+            } else {
+                VerifyStatus::Warn("未能解析来源，书目信息无法核实".to_string())
+            };
+
+            // Step 1f: content check (optional)
+            let (content_status, supporting_chunks) = if check_content {
+                if let Some(ref src_slug) = resolved_slug {
+                    // Search within the resolved source page
+                    let hits = self
+                        .search_with_context(&claim_sentence, &lang, 5, false, 5)
+                        .await
+                        .unwrap_or_default();
+
+                    // Filter hits to the resolved source slug
+                    let source_chunks: Vec<String> = hits
+                        .into_iter()
+                        .filter(|h| &h.page_slug == src_slug)
+                        .map(|h| h.text)
+                        .collect();
+
+                    if source_chunks.is_empty() {
+                        (Some("unchecked（来源页面无相关chunks）".to_string()), vec![])
+                    } else {
+                        // Ask LLM to verify claim vs chunks
+                        let verify_prompt = self.inner.prompts.load("verify_citation_claim");
+                        let chunks_text: Vec<String> = source_chunks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| format!("[chunk {}]\n{}", i, c))
+                            .collect();
+                        let verify_user = format!(
+                            "引用表述 (claim):\n{}\n\n来源文本 chunks:\n{}",
+                            claim_sentence,
+                            chunks_text.join("\n\n")
+                        );
+                        let vr = deepseek.chat(&verify_prompt, &verify_user).await?;
+                        let vr_clean = clean_json(&vr);
+
+                        #[derive(Deserialize)]
+                        struct VerifyResult {
+                            status: Option<String>,
+                            reason: Option<String>,
+                            best_chunk_index: Option<i64>,
+                        }
+                        let vres: VerifyResult =
+                            serde_json::from_str(vr_clean).unwrap_or(VerifyResult {
+                                status: None,
+                                reason: None,
+                                best_chunk_index: None,
+                            });
+
+                        let status_str = match vres.status.as_deref() {
+                            Some("supported") => format!(
+                                "supported（{}）",
+                                vres.reason.as_deref().unwrap_or("")
+                            ),
+                            Some("partial") => format!(
+                                "partial（{}）",
+                                vres.reason.as_deref().unwrap_or("")
+                            ),
+                            Some("unsupported") => format!(
+                                "unsupported（{}）",
+                                vres.reason.as_deref().unwrap_or("")
+                            ),
+                            _ => "unknown".to_string(),
+                        };
+
+                        let best_chunks: Vec<String> =
+                            if let Some(idx) = vres.best_chunk_index {
+                                if idx >= 0 && (idx as usize) < source_chunks.len() {
+                                    vec![source_chunks[idx as usize].clone()]
+                                } else {
+                                    source_chunks.into_iter().take(2).collect()
+                                }
+                            } else {
+                                source_chunks.into_iter().take(2).collect()
+                            };
+
+                        (Some(status_str), best_chunks)
+                    }
+                } else {
+                    (Some("unchecked（来源未解析）".to_string()), vec![])
+                }
+            } else {
+                (None, vec![])
+            };
+
+            let detail = if resolved_slug.is_none() && !authors.is_empty() {
+                format!(
+                    "作者「{}」年份「{}」在pub_metadata中无匹配记录",
+                    authors.join("、"),
+                    year.as_deref().unwrap_or("?")
+                )
+            } else {
+                String::new()
+            };
+
+            citations.push(CitationVerification {
+                text_excerpt: claim_sentence,
+                citation_text,
+                detected_authors: authors,
+                detected_year: year,
+                resolved_slug,
+                resolution_confidence,
+                bibliographic_status,
+                content_status,
+                supporting_chunks,
+                detail,
+            });
+        }
+
+        // Build summary
+        let total = citations.len();
+        let resolved = citations
+            .iter()
+            .filter(|c| c.resolved_slug.is_some())
+            .count();
+        let bib_ok = citations
+            .iter()
+            .filter(|c| c.bibliographic_status == VerifyStatus::Ok)
+            .count();
+        let bib_warn = citations
+            .iter()
+            .filter(|c| matches!(c.bibliographic_status, VerifyStatus::Warn(_)))
+            .count();
+        let bib_error = citations
+            .iter()
+            .filter(|c| matches!(c.bibliographic_status, VerifyStatus::Error(_)))
+            .count();
+        let unresolved = total - resolved;
+
+        let count_content = |pat: &str| {
+            citations
+                .iter()
+                .filter(|c| {
+                    c.content_status
+                        .as_deref()
+                        .map(|s| s.starts_with(pat))
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        let content_supported = count_content("supported");
+        let content_partial = count_content("partial");
+        let content_unsupported = count_content("unsupported");
+
+        let summary = CitationSummary {
+            total,
+            resolved,
+            bib_ok,
+            bib_warn,
+            bib_error,
+            unresolved,
+            content_supported,
+            content_partial,
+            content_unsupported,
+        };
+
+        Ok(DocCitationReport {
+            slug: display_slug,
+            citations,
+            summary,
+        })
+    }
+
     /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
     /// Returns a deduplicated list of source entries with their traversal path.
     pub async fn cite(&self, slug: &str, depth: u8) -> Result<Vec<CiteEntry>> {
@@ -5444,6 +6064,137 @@ impl AuditReport {
                     out.push_str(&format!("  建议: {}\n", s));
                 }
             }
+        }
+        out
+    }
+}
+
+// ── Citation verification types ─────────────────────────────────────────────
+
+/// Optional hint to help resolve an ambiguous citation by author + year.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationHint {
+    pub author: Option<String>,
+    pub year: Option<String>,
+    pub title_fragment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyStatus {
+    Ok,
+    Warn(String),
+    Error(String),
+}
+
+impl VerifyStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            VerifyStatus::Ok => "OK",
+            VerifyStatus::Warn(_) => "WARN",
+            VerifyStatus::Error(_) => "ERROR",
+        }
+    }
+    pub fn detail(&self) -> &str {
+        match self {
+            VerifyStatus::Ok => "",
+            VerifyStatus::Warn(s) | VerifyStatus::Error(s) => s.as_str(),
+        }
+    }
+}
+
+/// Result for a single citation instance inside a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationVerification {
+    pub text_excerpt: String,
+    pub citation_text: String,
+    pub detected_authors: Vec<String>,
+    pub detected_year: Option<String>,
+    pub resolved_slug: Option<String>,
+    pub resolution_confidence: f32,
+    pub bibliographic_status: VerifyStatus,
+    pub content_status: Option<String>,
+    pub supporting_chunks: Vec<String>,
+    pub detail: String,
+}
+
+/// Summary counts across all citations in a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationSummary {
+    pub total: usize,
+    pub resolved: usize,
+    pub bib_ok: usize,
+    pub bib_warn: usize,
+    pub bib_error: usize,
+    pub unresolved: usize,
+    pub content_supported: usize,
+    pub content_partial: usize,
+    pub content_unsupported: usize,
+}
+
+/// Full citation verification report for a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocCitationReport {
+    pub slug: String,
+    pub citations: Vec<CitationVerification>,
+    pub summary: CitationSummary,
+}
+
+impl DocCitationReport {
+    pub fn format_text(&self) -> String {
+        let mut out = format!("# 引用核校报告：{}\n\n", self.slug);
+        let s = &self.summary;
+        out.push_str(&format!(
+            "共 {} 条引用 | 已解析 {} | 书目 OK {} / WARN {} / ERROR {} | 未解析 {}\n",
+            s.total, s.resolved, s.bib_ok, s.bib_warn, s.bib_error, s.unresolved
+        ));
+        if s.content_supported + s.content_partial + s.content_unsupported > 0 {
+            out.push_str(&format!(
+                "内容核实：支持 {} / 部分 {} / 不支持 {}\n",
+                s.content_supported, s.content_partial, s.content_unsupported
+            ));
+        }
+        out.push('\n');
+
+        for (i, c) in self.citations.iter().enumerate() {
+            let status_icon = match &c.bibliographic_status {
+                VerifyStatus::Ok => "✓",
+                VerifyStatus::Warn(_) => "⚠",
+                VerifyStatus::Error(_) => "✗",
+            };
+            out.push_str(&format!(
+                "## [{i}] {status_icon} {}\n",
+                c.citation_text
+            ));
+            out.push_str(&format!("  **语境**: {}\n", c.text_excerpt));
+            if let Some(slug) = &c.resolved_slug {
+                out.push_str(&format!(
+                    "  **来源**: {} (置信度 {:.0}%)\n",
+                    slug,
+                    c.resolution_confidence * 100.0
+                ));
+            } else {
+                out.push_str("  **来源**: 未能解析\n");
+            }
+            out.push_str(&format!(
+                "  **书目状态**: {} {}\n",
+                c.bibliographic_status.label(),
+                c.bibliographic_status.detail()
+            ));
+            if !c.detail.is_empty() {
+                out.push_str(&format!("  **说明**: {}\n", c.detail));
+            }
+            if let Some(cs) = &c.content_status {
+                out.push_str(&format!("  **内容核实**: {}\n", cs));
+            }
+            if !c.supporting_chunks.is_empty() {
+                out.push_str("  **来源原文**:\n");
+                for chunk in c.supporting_chunks.iter().take(2) {
+                    let snippet: String = chunk.chars().take(200).collect();
+                    out.push_str(&format!("  > {}\n", snippet.replace('\n', " ")));
+                }
+            }
+            out.push('\n');
         }
         out
     }

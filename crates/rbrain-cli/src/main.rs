@@ -3,6 +3,7 @@ use rbrain_core::config::Config;
 use rbrain_core::embedder::Embedder;
 use rbrain_core::markdown::MarkdownParser;
 use rbrain_core::page::Page;
+use rbrain_engine::engine::CitationHint;
 use rbrain_engine::{Engine, extract_links};
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_llm::qwen::QwenEmbedder;
@@ -172,6 +173,20 @@ enum Commands {
             help = "Auto-fix duplicate and orphan bibliography entries (does not replace citation slugs)"
         )]
         fix: bool,
+    },
+    /// Verify citations in a document: resolve author/year to source articles, check bibliographic accuracy
+    VerifyCitations {
+        /// Page slug (e.g. research/wiki/compose) or local file path (e.g. /path/to/paper.md)
+        target: String,
+        /// Also verify that each cited source actually supports the stated claim (extra LLM calls)
+        #[arg(long, help = "Enable semantic content verification against source chunks")]
+        content: bool,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        output: String,
+        /// Author hint for resolving ambiguous citations (format: "作者名:年份")
+        #[arg(long, help = "Author+year hint, e.g. '张三:2023'")]
+        hint: Vec<String>,
     },
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
@@ -983,6 +998,62 @@ async fn main() -> anyhow::Result<()> {
             let engine = Engine::open(config).await?;
             let report = engine.audit_citations(&slug, fix).await?;
             print!("{}", report.format_text());
+        }
+        Commands::VerifyCitations {
+            target,
+            content,
+            output,
+            hint,
+        } => {
+            let config = load_config!();
+            let engine = Engine::open(config).await?;
+
+            // Determine if target is a file path or a slug
+            let (slug, file_content) =
+                if target.contains('/') && (target.ends_with(".md") || std::path::Path::new(&target).exists()) {
+                    let text = std::fs::read_to_string(&target)
+                        .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", target, e))?;
+                    ("__external__".to_string(), Some(text))
+                } else {
+                    (target.clone(), None)
+                };
+
+            // Parse hints: "作者:年份" format
+            let hints: Vec<CitationHint> = hint
+                .iter()
+                .filter_map(|h| {
+                    let parts: Vec<&str> = h.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        Some(CitationHint {
+                            author: Some(parts[0].to_string()),
+                            year: Some(parts[1].to_string()),
+                            title_fragment: None,
+                        })
+                    } else if !h.is_empty() {
+                        Some(CitationHint {
+                            author: Some(h.clone()),
+                            year: None,
+                            title_fragment: None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let report = engine
+                .verify_document_citations(&slug, file_content.as_deref(), content, &hints)
+                .await?;
+
+            match output.as_str() {
+                "json" => {
+                    let json = serde_json::to_string_pretty(&report)?;
+                    println!("{}", json);
+                }
+                _ => {
+                    print!("{}", report.format_text());
+                }
+            }
         }
         Commands::Query {
             query,
