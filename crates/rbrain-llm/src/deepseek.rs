@@ -90,7 +90,7 @@ impl DeepSeekClient {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| BrainError::ApiUnreachable {
                 provider: "deepseek".to_string(),
