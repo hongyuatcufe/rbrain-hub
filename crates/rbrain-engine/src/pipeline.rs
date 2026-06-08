@@ -37,6 +37,11 @@ pub enum InputSpec {
         /// sources is skipped. 0.0 = disabled (default). Typical useful value: 0.8.
         #[serde(default)]
         dedup_sources_threshold: f32,
+        /// M3 Slice 5: cap total prompt context at this many estimated tokens
+        /// across all source blocks for one anchor. None = no token cap
+        /// (legacy char-only behavior).
+        #[serde(default)]
+        token_budget: Option<usize>,
     },
 
     /// Aggregate all pages of a given type into a single LLM call → one output page (COMPOSE).
@@ -52,6 +57,11 @@ pub enum InputSpec {
         /// Max chars of compiled_truth to include per page (truncates long pages).
         #[serde(default = "default_chars_per_page")]
         chars_per_page: usize,
+        /// M3 Slice 5: cap total prompt context at this many estimated tokens.
+        /// Pages are packed greedily until the budget is reached. None = no
+        /// token cap (legacy chars_per_page × max_pages behavior).
+        #[serde(default)]
+        token_budget: Option<usize>,
     },
 }
 
@@ -364,6 +374,10 @@ pub struct StageConfig {
     pub max_pages: usize,
     #[serde(default = "default_chars_per_page")]
     pub chars_per_page: usize,
+    /// M3 Slice 5: optional token-budget for AggregateContent / LinkedSources.
+    /// When set, prefer this over chars × max_pages as the prompt size cap.
+    #[serde(default)]
+    pub token_budget: Option<usize>,
 
     // ── Processing ──
     pub prompt: String,
@@ -419,12 +433,14 @@ impl StageConfig {
                 min_sources: self.min_sources,
                 use_chunks: self.use_chunks,
                 dedup_sources_threshold: self.dedup_sources_threshold,
+                token_budget: self.token_budget,
             },
             "aggregate" => InputSpec::AggregateContent {
                 page_type: self.page_type.unwrap_or_default(),
                 tag: self.tag,
                 max_pages: self.max_pages,
                 chars_per_page: self.chars_per_page,
+                token_budget: self.token_budget,
             },
             other => return Err(rbrain_core::error::BrainError::Conflict(
                 format!("unknown input_mode '{other}'")
@@ -465,5 +481,90 @@ impl StageConfig {
             max_inputs: self.max_inputs,
             inject_existing_titles: self.inject_existing_titles,
         })
+    }
+}
+
+#[cfg(test)]
+mod token_budget_wiring_tests {
+    //! Verify that TOML `token_budget = N` reaches InputSpec correctly
+    //! for both AggregateContent and LinkedSources stages.
+
+    use super::*;
+
+    #[test]
+    fn aggregate_token_budget_threads_through_from_toml() {
+        let toml = r#"
+            id = "compose"
+            input_mode = "aggregate"
+            page_type = "synthesis"
+            max_pages = 25
+            chars_per_page = 2500
+            token_budget = 50000
+            prompt = "compose_lit"
+            response_format = "markdown"
+            output_mode = "save"
+            output_page_type = "wiki"
+            output_slug_prefix = "research/wiki/"
+        "#;
+        let cfg: StageConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.token_budget, Some(50000));
+        let step = cfg.into_step().expect("to step");
+        match step.input {
+            InputSpec::AggregateContent { token_budget, .. } => {
+                assert_eq!(token_budget, Some(50000));
+            }
+            other => panic!("expected AggregateContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linked_sources_token_budget_threads_through_from_toml() {
+        let toml = r#"
+            id = "synthesize"
+            input_mode = "linked_sources"
+            anchor_type = "concept"
+            source_type = "note"
+            min_sources = 2
+            token_budget = 30000
+            prompt = "synth"
+            response_format = "markdown"
+            output_mode = "save"
+            output_page_type = "synthesis"
+            output_slug_prefix = "research/synthesis/"
+        "#;
+        let cfg: StageConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.token_budget, Some(30000));
+        let step = cfg.into_step().expect("to step");
+        match step.input {
+            InputSpec::LinkedSources { token_budget, .. } => {
+                assert_eq!(token_budget, Some(30000));
+            }
+            other => panic!("expected LinkedSources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_token_budget_is_none_for_backward_compat() {
+        let toml = r#"
+            id = "compose"
+            input_mode = "aggregate"
+            page_type = "synthesis"
+            max_pages = 10
+            chars_per_page = 1000
+            prompt = "compose"
+            response_format = "markdown"
+            output_mode = "save"
+            output_page_type = "wiki"
+            output_slug_prefix = "research/wiki/"
+        "#;
+        let cfg: StageConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.token_budget, None);
+        let step = cfg.into_step().expect("to step");
+        match step.input {
+            InputSpec::AggregateContent { token_budget, .. } => {
+                assert_eq!(token_budget, None);
+            }
+            other => panic!("expected AggregateContent, got {other:?}"),
+        }
     }
 }

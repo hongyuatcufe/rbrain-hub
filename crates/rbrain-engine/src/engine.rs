@@ -2216,7 +2216,15 @@ impl Engine {
         for c in &chunks {
             context_parts.push(self.build_chunk_block(c, is_cjk).await);
         }
-        let context = context_parts.join("\n\n---\n\n");
+        // M3 Slice 5: cap context at THINK_TOKEN_BUDGET so CJK queries don't
+        // overflow the LLM context window. Chunks are already ranked by RRF
+        // so the highest-relevance ones survive the cap.
+        let kept = crate::token_budget::pack_within_budget(
+            context_parts,
+            THINK_TOKEN_BUDGET,
+            |s| crate::token_budget::estimate_tokens(s),
+        );
+        let context = kept.join("\n\n---\n\n");
 
         let (system, user) = if is_cjk {
             let raw = self.inner.prompts.load("think_cjk");
@@ -2902,6 +2910,7 @@ impl Engine {
                 tag,
                 max_pages,
                 chars_per_page,
+                token_budget,
             } => {
                 // AggregateContent is handled as a single synthetic "page" carrying all content.
                 // We build the combined context here and return a single placeholder entry.
@@ -2941,7 +2950,8 @@ impl Engine {
                     }
                 }
 
-                let combined = pages
+                let total_pages = pages.len();
+                let page_blocks: Vec<String> = pages
                     .iter()
                     .enumerate()
                     .map(|(i, p)| {
@@ -2949,14 +2959,31 @@ impl Engine {
                         format!(
                             "## [{}/{}] {}\nSlug: {}\n\n{}",
                             i + 1,
-                            pages.len(),
+                            total_pages,
                             p.title,
                             p.slug,
                             body
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n");
+                    .collect();
+                // M3 Slice 5: apply token-budget cap if configured. Pages were
+                // already truncated to chars_per_page above, so each block has
+                // a bounded per-item cost.
+                let kept_blocks = if let Some(budget) = token_budget {
+                    crate::token_budget::pack_within_budget(page_blocks, *budget, |s| {
+                        crate::token_budget::estimate_tokens(s)
+                    })
+                } else {
+                    page_blocks
+                };
+                let kept = kept_blocks.len();
+                if kept < total_pages {
+                    println!(
+                        "  [{}] token_budget capped aggregate at {}/{} page(s)",
+                        step.id, kept, total_pages
+                    );
+                }
+                let combined = kept_blocks.join("\n\n---\n\n");
 
                 println!(
                     "  [{}] Aggregating {} {} page(s) into single compose call...",
@@ -3180,6 +3207,7 @@ impl Engine {
                     source_page_type,
                     min_sources,
                     use_chunks,
+                    token_budget,
                     ..
                 } => {
                     // Gather source pages linked to this anchor
@@ -3281,13 +3309,32 @@ impl Engine {
                             }
                         }
                     }
+                    // M3 Slice 5: pack source blocks into the per-anchor
+                    // token budget if set. Sources are kept in DB ordering
+                    // (insertion / chunk order) so the LLM sees them in a
+                    // stable sequence.
+                    let total_sources = context_items.len();
+                    let kept_items = if let Some(budget) = token_budget {
+                        crate::token_budget::pack_within_budget(context_items, *budget, |s| {
+                            crate::token_budget::estimate_tokens(s)
+                        })
+                    } else {
+                        context_items
+                    };
+                    if kept_items.len() < total_sources {
+                        println!(
+                            "    → token_budget capped sources at {}/{}",
+                            kept_items.len(),
+                            total_sources
+                        );
+                    }
                     let anchor_desc: String = page.compiled_truth.chars().take(500).collect();
                     format!(
                         "Anchor: {} ({})\nDescription: {}\n\nSources:\n\n{}",
                         page.title,
                         page.slug,
                         anchor_desc,
-                        context_items.join("\n\n---\n\n")
+                        kept_items.join("\n\n---\n\n")
                     )
                 }
                 // AggregateContent never reaches this loop — it returns early via run_aggregate_step.
@@ -5370,6 +5417,12 @@ pub fn apply_page_cap(
 /// Default per-page cap for `search_with_context` callers that want
 /// max-pool diversity (M3 Slice 4 / plan.md gap #3).
 pub const MAX_POOL_DEFAULT: usize = 1;
+
+/// Token budget for `think()` context assembly. Sized so a CJK-heavy
+/// query plus system prompt + output reservation stays under DeepSeek's
+/// 64K context window. Callers that need a different cap should drive
+/// the pipeline directly (M3 Slice 5).
+pub const THINK_TOKEN_BUDGET: usize = 24_000;
 
 fn json_value_to_items(value: serde_json::Value) -> Vec<serde_json::Value> {
     match value {

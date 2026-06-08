@@ -3,6 +3,7 @@ pub mod evidence;
 pub mod links;
 pub mod pipeline;
 pub mod research;
+pub mod token_budget;
 
 pub use engine::{
     BrainStats, ChunkResult, CiteEntry, Engine, ExplainedHit, GraphEdge, MergeRecord,

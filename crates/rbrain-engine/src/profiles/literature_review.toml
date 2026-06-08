@@ -39,6 +39,11 @@ source_type   = "note"
 min_sources   = 2
 use_chunks    = true
 dedup_sources_threshold = 0.8
+# M3 Slice 5: per-anchor token cap. Each synthesize call sees one concept
+# + up to ~30K tokens of source chunks, leaving headroom for prompt + output
+# under DeepSeek's 64K context window. Without this, large source sets in
+# CJK could blow past the limit silently.
+token_budget = 30000
 prompt          = "synthesize_academic"
 response_format = "markdown"
 output_mode        = "save"
@@ -55,6 +60,10 @@ input_mode  = "aggregate"
 page_type   = "synthesis"
 max_pages   = 25
 chars_per_page = 2500
+# M3 Slice 5: 50K token cap leaves ~14K for prompt + output within DeepSeek's
+# 64K window. Chinese synthesis pages tokenise close to 1:1 so 25×2500 chars
+# could otherwise hit ~62K input tokens alone.
+token_budget = 50000
 prompt          = "compose_literature_review"
 response_format = "markdown"
 output_mode        = "save"
@@ -74,6 +83,7 @@ input_mode  = "aggregate"
 page_type   = "synthesis"
 max_pages   = 25
 chars_per_page = 2500
+token_budget = 50000
 prompt          = "detect_gaps_academic"
 response_format = "markdown"
 output_mode        = "save"
@@ -89,6 +99,7 @@ input_mode  = "aggregate"
 page_type   = "synthesis"
 max_pages   = 25
 chars_per_page = 2500
+token_budget = 50000
 prompt          = "detect_contradictions_academic"
 response_format = "markdown"
 output_mode        = "save"
