@@ -120,6 +120,7 @@ fn checklist_for(task_type: TaskType) -> &'static [&'static str] {
             "compose_review_draft",
             "validate_citations",
             "detect_gaps",
+            "detect_contradictions",
             "save_research_memo",
         ],
         TaskType::MixedMethods | TaskType::TheoryBuilding => &[
@@ -178,6 +179,7 @@ fn validator_for_step(step: &str) -> StepKind {
         "validate_findings" => StepKind::Validator("finding_has_supporting_artifact"),
         "validate_citations" => StepKind::Validator("citation_chunks_exist"),
         "detect_gaps" => StepKind::Validator("gap_analysis_present"),
+        "detect_contradictions" => StepKind::Validator("contradictions_recorded"),
         _ => StepKind::Manual,
     }
 }

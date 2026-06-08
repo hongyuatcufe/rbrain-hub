@@ -14,8 +14,8 @@ use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
     ValidatorStatus, bibliography_consistency, citation_chunk_matches_slug, citation_chunks_exist,
-    primary_source_ratio, review_links_to_synthesis_pages, source_count_minimum,
-    synthesis_sections_have_citations,
+    contradictions_recorded, gap_analysis_present, primary_source_ratio,
+    review_links_to_synthesis_pages, source_count_minimum, synthesis_sections_have_citations,
 };
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_search::{LanceStore, TantivyIndex};
@@ -423,4 +423,92 @@ async fn citation_chunks_exist_failure_message_includes_snippet() {
         "message should reference the bad chunk id but got: {}",
         r.message
     );
+}
+
+// ─── gap_analysis_present (Slice 3) ────────────────────────────────────────
+
+#[tokio::test]
+async fn gap_analysis_present_warns_when_no_synthesis() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let r = gap_analysis_present(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Warn);
+}
+
+#[tokio::test]
+async fn gap_analysis_present_fails_when_synthesis_but_no_gap_page() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", "# X\n".into()).await;
+
+    let r = gap_analysis_present(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+}
+
+#[tokio::test]
+async fn gap_analysis_present_passes_when_gap_page_exists() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", "# X\n".into()).await;
+    put_typed_page(
+        &engine,
+        "research/gaps/topic",
+        "gap_analysis",
+        "Gaps",
+        "# Gaps\n\n## 覆盖现状\n\n[[research/synthesis/x | chunk:1]]\n".into(),
+    )
+    .await;
+
+    let r = gap_analysis_present(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Pass);
+}
+
+// ─── contradictions_recorded (Slice 3) ─────────────────────────────────────
+
+#[tokio::test]
+async fn contradictions_recorded_warns_when_no_synthesis() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let r = contradictions_recorded(engine.get_db(), RUN_SLUG)
+        .await
+        .unwrap();
+    assert_eq!(r.status, ValidatorStatus::Warn);
+}
+
+#[tokio::test]
+async fn contradictions_recorded_fails_when_synthesis_but_no_contradiction_page() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", "# X\n".into()).await;
+
+    let r = contradictions_recorded(engine.get_db(), RUN_SLUG)
+        .await
+        .unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+}
+
+#[tokio::test]
+async fn contradictions_recorded_passes_when_contradiction_page_exists() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", "# X\n".into()).await;
+    put_typed_page(
+        &engine,
+        "research/contradictions/topic",
+        "contradiction_note",
+        "Contradictions",
+        "# Contradictions\n\n## 直接矛盾\n\n未识别到\n".into(),
+    )
+    .await;
+
+    let r = contradictions_recorded(engine.get_db(), RUN_SLUG)
+        .await
+        .unwrap();
+    assert_eq!(r.status, ValidatorStatus::Pass);
 }

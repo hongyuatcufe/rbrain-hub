@@ -62,3 +62,37 @@ output_page_type   = "wiki"
 output_slug_prefix = "research/wiki/"
 embed_output       = true
 incremental = true
+
+# M3 Slice 3: post-compose quality stages. Both run against the full set of
+# synthesis pages and produce a single aggregate page each — one LLM call
+# per stage (vs N² pair-wise traversal) keeps cost bounded for large corpora.
+
+[[stages]]
+id = "detect_gaps"
+enabled = true
+input_mode  = "aggregate"
+page_type   = "synthesis"
+max_pages   = 25
+chars_per_page = 2500
+prompt          = "detect_gaps_academic"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "gap_analysis"
+output_slug_prefix = "research/gaps/"
+embed_output       = false
+incremental = true
+
+[[stages]]
+id = "detect_contradictions"
+enabled = true
+input_mode  = "aggregate"
+page_type   = "synthesis"
+max_pages   = 25
+chars_per_page = 2500
+prompt          = "detect_contradictions_academic"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "contradiction_note"
+output_slug_prefix = "research/contradictions/"
+embed_output       = false
+incremental = true

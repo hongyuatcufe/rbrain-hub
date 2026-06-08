@@ -61,6 +61,14 @@ fn build_prompt_loader(config: &Config) -> PromptLoader {
         "compose_literature_review",
         include_str!("prompts/compose_literature_review.md"),
     );
+    builtins.insert(
+        "detect_gaps_academic",
+        include_str!("prompts/detect_gaps_academic.md"),
+    );
+    builtins.insert(
+        "detect_contradictions_academic",
+        include_str!("prompts/detect_contradictions_academic.md"),
+    );
     PromptLoader::new(config.prompts_dir.clone(), builtins)
 }
 

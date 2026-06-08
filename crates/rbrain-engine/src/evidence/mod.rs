@@ -22,7 +22,8 @@ pub use provenance::{ProvenanceEdge, ProvenanceReport, provenance_of};
 pub use result::{ValidatorResult, ValidatorStatus};
 pub use validators::{
     analysis_plan_exists, artifact_hash_present, bibliography_consistency, check_synthesis_quality,
-    citation_chunk_matches_slug, citation_chunks_exist, dataset_registered,
-    finding_has_dataset_lineage, finding_has_supporting_artifact, primary_source_ratio,
-    review_links_to_synthesis_pages, source_count_minimum, synthesis_sections_have_citations,
+    citation_chunk_matches_slug, citation_chunks_exist, contradictions_recorded,
+    dataset_registered, finding_has_dataset_lineage, finding_has_supporting_artifact,
+    gap_analysis_present, primary_source_ratio, review_links_to_synthesis_pages,
+    source_count_minimum, synthesis_sections_have_citations,
 };

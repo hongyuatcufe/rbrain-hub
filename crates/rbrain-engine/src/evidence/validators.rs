@@ -539,6 +539,72 @@ pub async fn review_links_to_synthesis_pages(
     .with_affected(unbacked))
 }
 
+/// True iff at least one `page_type = ?` page exists in the database.
+async fn any_page_of_type(pool: &SqlitePool, page_type: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pages WHERE page_type = ?")
+        .bind(page_type)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(n > 0)
+}
+
+/// Shared shape for the two M3 Slice 3 validators: "is there a corresponding
+/// derived page for the analysis stage that should have run?". Pass if the
+/// derived page_type exists; Fail if `synthesis` exists but the derived page
+/// is missing (the pipeline stage hasn't been run); Warn if there are no
+/// synthesis pages to analyze yet.
+async fn derived_stage_output_present(
+    pool: &SqlitePool,
+    validator_name: &'static str,
+    derived_page_type: &'static str,
+    missing_message: &'static str,
+) -> Result<ValidatorResult> {
+    if !any_page_of_type(pool, "synthesis").await? {
+        return Ok(ValidatorResult::warn(
+            validator_name,
+            "no synthesis pages yet — nothing to analyze",
+        ));
+    }
+    if any_page_of_type(pool, derived_page_type).await? {
+        Ok(ValidatorResult::pass(validator_name))
+    } else {
+        Ok(ValidatorResult::fail(validator_name, missing_message))
+    }
+}
+
+/// At least one `gap_analysis` page must exist once synthesis pages are
+/// available — produced by the `detect_gaps` pipeline stage.
+pub async fn gap_analysis_present(
+    pool: &SqlitePool,
+    _run_slug: &str,
+) -> Result<ValidatorResult> {
+    derived_stage_output_present(
+        pool,
+        "gap_analysis_present",
+        "gap_analysis",
+        "synthesis pages exist but no gap_analysis page found — run the detect_gaps pipeline stage",
+    )
+    .await
+}
+
+/// At least one `contradiction_note` page must exist once synthesis pages
+/// are available — produced by the `detect_contradictions` pipeline stage.
+/// The page may legitimately state "no contradictions identified" if the
+/// corpus is harmonious; the validator only checks existence.
+pub async fn contradictions_recorded(
+    pool: &SqlitePool,
+    _run_slug: &str,
+) -> Result<ValidatorResult> {
+    derived_stage_output_present(
+        pool,
+        "contradictions_recorded",
+        "contradiction_note",
+        "synthesis pages exist but no contradiction_note page found — run the detect_contradictions pipeline stage",
+    )
+    .await
+}
+
 /// Per-page primary-source ratio. For each synthesis/wiki page, classify
 /// every wikilink target by `page_type`:
 ///

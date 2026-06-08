@@ -2,10 +2,10 @@ use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
     ValidatorResult, analysis_plan_exists, artifact_hash_present, bibliography_consistency,
-    citation_chunk_matches_slug, citation_chunks_exist, dataset_registered,
-    finding_has_dataset_lineage, finding_has_supporting_artifact, primary_source_ratio,
-    review_links_to_synthesis_pages, run_citation_check, source_count_minimum,
-    synthesis_sections_have_citations,
+    citation_chunk_matches_slug, citation_chunks_exist, contradictions_recorded,
+    dataset_registered, finding_has_dataset_lineage, finding_has_supporting_artifact,
+    gap_analysis_present, primary_source_ratio, review_links_to_synthesis_pages,
+    run_citation_check, source_count_minimum, synthesis_sections_have_citations,
 };
 use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
 use rbrain_engine::research::{
@@ -652,6 +652,16 @@ async fn run_research_validators(
                 "bibliography_consistency",
                 &mut validators,
                 bibliography_consistency(engine, &run.slug).await,
+            );
+            push_validator_result(
+                "gap_analysis_present",
+                &mut validators,
+                gap_analysis_present(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "contradictions_recorded",
+                &mut validators,
+                contradictions_recorded(pool, &run.slug).await,
             );
         }
     }
@@ -1487,7 +1497,8 @@ impl RBrainMcpServer {
             literature_review: source_count_minimum, citation_chunks_exist, \
             citation_chunk_matches_slug, synthesis_sections_have_citations, \
             review_links_to_synthesis_pages, primary_source_ratio, \
-            bibliography_consistency. \
+            bibliography_consistency, gap_analysis_present, \
+            contradictions_recorded. \
             Returns structured results with controlled suggested_actions enum and the derived \
             protocol state so ZeroClaw knows the next step."
     )]
