@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// Loads prompt files with a two-level fallback:
 ///   1. `$prompts_dir/{name}.md`  (user override)
 ///   2. Built-in defaults compiled into the binary
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PromptLoader {
     prompts_dir: PathBuf,
     builtins: HashMap<&'static str, &'static str>,

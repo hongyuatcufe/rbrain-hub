@@ -44,9 +44,39 @@ fn schema(dim: i32) -> Arc<Schema> {
     ]))
 }
 
+fn validate_items(items: &[(i64, Vec<f32>, SparseVec)], dim: usize) -> Result<()> {
+    for (chunk_id, dense, sparse) in items {
+        if dense.len() != dim {
+            return Err(io_err(format!(
+                "chunk {} dense vector has dim {}, expected {}",
+                chunk_id,
+                dense.len(),
+                dim
+            )));
+        }
+        if sparse.indices.len() != sparse.values.len() {
+            return Err(io_err(format!(
+                "chunk {} sparse vector has {} indices but {} values",
+                chunk_id,
+                sparse.indices.len(),
+                sparse.values.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct LanceStore {
     table: Table,
     dim: usize,
+}
+
+impl std::fmt::Debug for LanceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanceStore")
+            .field("dim", &self.dim)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LanceStore {
@@ -118,6 +148,7 @@ impl VectorStore for LanceStore {
         if items.is_empty() {
             return Ok(());
         }
+        validate_items(items, self.dim)?;
 
         // Delete any existing entries for these IDs (true upsert semantics).
         let id_list: String = items
@@ -125,7 +156,10 @@ impl VectorStore for LanceStore {
             .map(|(id, _, _)| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let _ = self.table.delete(&format!("id IN ({})", id_list)).await;
+        self.table
+            .delete(&format!("id IN ({})", id_list))
+            .await
+            .map_err(io_err)?;
 
         let schema = self.schema();
         let dim = self.dim as i32;
@@ -213,6 +247,17 @@ impl VectorStore for LanceStore {
     }
 
     async fn search_dense(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.dim {
+            return Err(io_err(format!(
+                "query dense vector has dim {}, expected {}",
+                query.len(),
+                self.dim
+            )));
+        }
+
         let stream = self
             .table
             .query()
@@ -250,5 +295,47 @@ impl VectorStore for LanceStore {
         // LanceDB Rust SDK 0.17 does not yet expose sparse ANN search.
         // Return empty — hybrid_search gracefully skips empty lists in RRF.
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_items_accepts_matching_dense_and_sparse_lengths() {
+        let items = vec![(
+            1,
+            vec![0.1, 0.2, 0.3],
+            SparseVec {
+                indices: vec![7, 11],
+                values: vec![0.4, 0.5],
+            },
+        )];
+
+        assert!(validate_items(&items, 3).is_ok());
+    }
+
+    #[test]
+    fn validate_items_rejects_wrong_dense_dim() {
+        let items = vec![(1, vec![0.1, 0.2], SparseVec::default())];
+
+        let err = validate_items(&items, 3).unwrap_err().to_string();
+        assert!(err.contains("dense vector has dim 2, expected 3"));
+    }
+
+    #[test]
+    fn validate_items_rejects_sparse_length_mismatch() {
+        let items = vec![(
+            1,
+            vec![0.1, 0.2, 0.3],
+            SparseVec {
+                indices: vec![7, 11],
+                values: vec![0.4],
+            },
+        )];
+
+        let err = validate_items(&items, 3).unwrap_err().to_string();
+        assert!(err.contains("sparse vector has 2 indices but 1 values"));
     }
 }
