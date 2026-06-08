@@ -125,7 +125,7 @@ async fn data_analysis_protocol_runs_end_to_end() {
     )
     .await;
     engine
-        .add_link(run_slug, plan_slug, "tests_hypothesis", None, None)
+        .add_link(run_slug, plan_slug, "produces", None, None)
         .await
         .expect("link run→analysis_plan");
 
@@ -420,7 +420,7 @@ async fn analysis_plan_exists_fails_without_plan_and_emits_typed_action() {
 }
 
 #[tokio::test]
-async fn analysis_plan_exists_passes_after_tests_hypothesis_link() {
+async fn analysis_plan_exists_passes_after_produces_link() {
     let tb = TestBrain::new().await;
     let engine = open_mock_engine(&tb).await;
     let store = ResearchRunStore::new(engine.get_db());
@@ -449,7 +449,7 @@ async fn analysis_plan_exists_passes_after_tests_hypothesis_link() {
     )
     .await;
     engine
-        .add_link(run_slug, plan_slug, "tests_hypothesis", None, None)
+        .add_link(run_slug, plan_slug, "produces", None, None)
         .await
         .expect("link");
 

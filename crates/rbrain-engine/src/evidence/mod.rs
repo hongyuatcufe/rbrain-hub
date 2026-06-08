@@ -21,6 +21,8 @@ pub use evidence_walk::{EvidenceChain, EvidenceNode, EvidenceReport, run_evidenc
 pub use provenance::{ProvenanceEdge, ProvenanceReport, provenance_of};
 pub use result::{ValidatorResult, ValidatorStatus};
 pub use validators::{
-    analysis_plan_exists, artifact_hash_present, dataset_registered, finding_has_dataset_lineage,
-    finding_has_supporting_artifact,
+    analysis_plan_exists, artifact_hash_present, check_synthesis_quality, citation_chunk_matches_slug,
+    citation_chunks_exist, dataset_registered, finding_has_dataset_lineage,
+    finding_has_supporting_artifact, review_links_to_synthesis_pages, source_count_minimum,
+    synthesis_sections_have_citations,
 };

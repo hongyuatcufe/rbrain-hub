@@ -5348,87 +5348,11 @@ fn json_value_to_items(value: serde_json::Value) -> Vec<serde_json::Value> {
     }
 }
 
-fn validate_synthesis_quality(
-    content: &str,
-    source_count: usize,
-) -> std::result::Result<(), String> {
-    let citation_count = content.matches("| chunk:").count();
-    let required_citations = source_count.clamp(1, 3);
-    if citation_count < required_citations {
-        return Err(format!(
-            "only {citation_count} traceable citation(s), expected at least {required_citations}"
-        ));
-    }
-
-    let sections = markdown_sections(content);
-    let section_count = sections.len();
-    // Allow more sections when there are many source articles.
-    let max_sections = if source_count > 8 { 20 } else { 12 };
-    if section_count > max_sections {
-        return Err(format!(
-            "{section_count} second-level section(s), maximum is {max_sections} for {source_count} source(s)"
-        ));
-    }
-
-    let mut uncited_body_sections = 0usize;
-    let mut thin_sections = 0usize;
-    for (heading, body) in &sections {
-        let exempt = is_synthesis_meta_section(heading);
-        let has_citation = body.contains("| chunk:");
-        let body_chars = body.trim().chars().count();
-        if !exempt && !has_citation {
-            uncited_body_sections += 1;
-        }
-        if !exempt && body_chars < 80 {
-            thin_sections += 1;
-        }
-    }
-
-    if uncited_body_sections > 2 {
-        return Err(format!(
-            "{uncited_body_sections} substantive section(s) have no traceable citation"
-        ));
-    }
-    if thin_sections > 2 {
-        return Err(format!(
-            "{thin_sections} substantive section(s) are too thin"
-        ));
-    }
-
-    Ok(())
-}
-
-fn markdown_sections(content: &str) -> Vec<(String, String)> {
-    let mut sections: Vec<(String, String)> = Vec::new();
-    let mut current_heading: Option<String> = None;
-    let mut current_body = String::new();
-
-    for line in content.lines() {
-        if line.starts_with("## ") {
-            if let Some(heading) = current_heading.replace(line.trim().to_string()) {
-                sections.push((heading, current_body.trim().to_string()));
-                current_body.clear();
-            }
-        } else if current_heading.is_some() {
-            current_body.push_str(line);
-            current_body.push('\n');
-        }
-    }
-
-    if let Some(heading) = current_heading {
-        sections.push((heading, current_body.trim().to_string()));
-    }
-
-    sections
-}
-
-fn is_synthesis_meta_section(heading: &str) -> bool {
-    let heading = heading.trim_start_matches('#').trim();
-    matches!(
-        heading,
-        "Working Judgment" | "Open Questions" | "综合判断" | "开放问题" | "待研究问题" | "未决问题"
-    )
-}
+// Alias kept for backwards compatibility with pipeline call sites and existing
+// tests. The single source of truth lives in `evidence::check_synthesis_quality`
+// so the M3 validator `synthesis_sections_have_citations` and this gate stay in
+// sync.
+use crate::evidence::check_synthesis_quality as validate_synthesis_quality;
 
 #[cfg(test)]
 mod event_filter_tests {

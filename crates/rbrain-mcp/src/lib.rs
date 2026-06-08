@@ -1,8 +1,10 @@
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
-    ValidatorResult, analysis_plan_exists, artifact_hash_present, dataset_registered,
-    finding_has_dataset_lineage, finding_has_supporting_artifact, run_citation_check,
+    ValidatorResult, analysis_plan_exists, artifact_hash_present, citation_chunk_matches_slug,
+    citation_chunks_exist, dataset_registered, finding_has_dataset_lineage,
+    finding_has_supporting_artifact, review_links_to_synthesis_pages, run_citation_check,
+    source_count_minimum, synthesis_sections_have_citations,
 };
 use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
 use rbrain_engine::research::{
@@ -614,10 +616,31 @@ async fn run_research_validators(
             );
         }
         TaskType::LiteratureReview => {
-            validators.push(ValidatorResult::warn(
-                "literature_validators",
-                "not implemented until M3 — no validators run for this task_type",
-            ));
+            push_validator_result(
+                "source_count_minimum",
+                &mut validators,
+                source_count_minimum(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "citation_chunks_exist",
+                &mut validators,
+                citation_chunks_exist(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "citation_chunk_matches_slug",
+                &mut validators,
+                citation_chunk_matches_slug(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "synthesis_sections_have_citations",
+                &mut validators,
+                synthesis_sections_have_citations(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "review_links_to_synthesis_pages",
+                &mut validators,
+                review_links_to_synthesis_pages(pool, &run.slug).await,
+            );
         }
     }
     validators
@@ -1450,7 +1473,9 @@ impl RBrainMcpServer {
             finding_has_dataset_lineage, finding_has_supporting_artifact. \
             mixed_methods | theory_building: analysis_plan_exists, artifact_hash_present, \
             finding_has_supporting_artifact. \
-            literature_review: validators land in M3 — overall returns 'warn' until then. \
+            literature_review: source_count_minimum, citation_chunks_exist, \
+            citation_chunk_matches_slug, synthesis_sections_have_citations, \
+            review_links_to_synthesis_pages. \
             Returns structured results with controlled suggested_actions enum and the derived \
             protocol state so ZeroClaw knows the next step."
     )]
