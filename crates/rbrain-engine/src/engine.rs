@@ -69,6 +69,14 @@ fn build_prompt_loader(config: &Config) -> PromptLoader {
         "detect_contradictions_academic",
         include_str!("prompts/detect_contradictions_academic.md"),
     );
+    builtins.insert(
+        "extract_pub_metadata",
+        include_str!("prompts/extract_pub_metadata.md"),
+    );
+    builtins.insert(
+        "verify_citations_academic",
+        include_str!("prompts/verify_citations_academic.md"),
+    );
     PromptLoader::new(config.prompts_dir.clone(), builtins)
 }
 
@@ -3067,24 +3075,50 @@ impl Engine {
                         })
                         .collect()
                 }
-                OutputMode::SaveMulti { .. } => {
-                    // For SaveMulti incremental: a source page is considered "done" if it
-                    // already has any outgoing "mentions" links (created during SaveMulti).
+                OutputMode::SaveMulti { type_map } => {
                     let db = self.inner.db.clone();
-                    input_pages.into_iter().filter(|p| {
-                        let slug = p.slug.clone();
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                sqlx::query_scalar::<_, i64>(
-                                    "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND edge_type = 'mentions'"
-                                )
-                                .bind(&slug)
-                                .fetch_one(&db)
-                                .await
-                                .unwrap_or(0)
-                            })
-                        }) == 0  // only process pages with no existing mentions links
-                    }).collect()
+                    if step.skip_if_target_exists {
+                        // CNKI-priority path: skip source pages whose expected output slug already
+                        // exists in the DB. Target slug = slug_prefix + slugify(source_basename).
+                        // Used by extract_pub_metadata_auto so CNKI-derived pages win.
+                        let slug_prefix = type_map
+                            .values()
+                            .next()
+                            .map(|c| c.slug_prefix.clone())
+                            .unwrap_or_default();
+                        input_pages.into_iter().filter(|p| {
+                            let basename = p.slug.split('/').last().unwrap_or(&p.slug);
+                            let target_slug = format!("{}{}", slug_prefix, slugify(basename));
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    sqlx::query_scalar::<_, i64>(
+                                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
+                                    )
+                                    .bind(&target_slug)
+                                    .fetch_one(&db)
+                                    .await
+                                    .unwrap_or(0)
+                                })
+                            }) == 0  // only process pages whose target doesn't exist yet
+                        }).collect()
+                    } else {
+                        // Default SaveMulti incremental: skip pages that already have outgoing
+                        // "mentions" links created by a previous SaveMulti run.
+                        input_pages.into_iter().filter(|p| {
+                            let slug = p.slug.clone();
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    sqlx::query_scalar::<_, i64>(
+                                        "SELECT COUNT(*) FROM links WHERE source_slug = ?1 AND edge_type = 'mentions'"
+                                    )
+                                    .bind(&slug)
+                                    .fetch_one(&db)
+                                    .await
+                                    .unwrap_or(0)
+                                })
+                            }) == 0
+                        }).collect()
+                    }
                 }
                 _ => input_pages,
             }
@@ -3387,6 +3421,74 @@ impl Engine {
                     None => user_msg.clone(),
                 };
 
+                // model_tier="none": bypass LLM, use CnkiRefParser on the page content.
+                // Produce a synthetic parsed_items compatible with the SaveMulti handler.
+                if step.model_tier.as_deref() == Some("none") {
+                    use crate::citation::CnkiRefParser;
+                    let metas = CnkiRefParser::parse(&page.compiled_truth);
+                    println!(
+                        "    → CnkiRefParser: {} record(s) parsed from {}",
+                        metas.len(), page.slug
+                    );
+                    let pub_metadata_items: Vec<serde_json::Value> = metas
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "name": m.canonical_name(),
+                                "description": m.to_json_description(),
+                            })
+                        })
+                        .collect();
+                    let items: Vec<serde_json::Value> = if pub_metadata_items.is_empty() {
+                        vec![]
+                    } else {
+                        vec![serde_json::json!({ "pub_metadata": pub_metadata_items })]
+                    };
+                    // Feed directly into the existing output handler (SaveMulti path).
+                    match &step.output_mode {
+                        OutputMode::SaveMulti { type_map } => {
+                            let mut used_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                            let mut created_count = 0usize;
+                            for item in &items {
+                                for (key, cfg) in type_map {
+                                    if let Some(arr) = item.get(key).and_then(|v| v.as_array()) {
+                                        for entry in arr {
+                                            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+                                            if name.trim().is_empty() { continue; }
+                                            let content = entry.get("description").or_else(|| entry.get("content")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let base_slug = format!("{}{}", cfg.slug_prefix, slugify(name));
+                                            let out_slug = if used_slugs.contains(&base_slug) {
+                                                let mut i = 2usize;
+                                                loop {
+                                                    let c = format!("{}-{}", base_slug, i);
+                                                    if !used_slugs.contains(&c) { break c; }
+                                                    i += 1;
+                                                }
+                                            } else { base_slug.clone() };
+                                            used_slugs.insert(out_slug.clone());
+                                            let already_exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                                                .bind(&out_slug).fetch_one(&self.inner.db).await.unwrap_or(0) > 0;
+                                            if !already_exists {
+                                                let mut out_page = Page::new(out_slug.clone(), cfg.page_type.clone(), content);
+                                                out_page.title = name.to_string();
+                                                self.put_page(out_page).await?;
+                                                created_count += 1;
+                                            }
+                                            let _ = self.add_link(&page.slug, &out_slug, "mentions", None, None).await;
+                                            all_results.push(serde_json::json!({"slug": out_slug, "action": if already_exists { "skipped" } else { "saved" }, "type": cfg.page_type}));
+                                        }
+                                    }
+                                }
+                            }
+                            println!("    → extracted: {} new pub_metadata page(s)", created_count);
+                        }
+                        _ => {
+                            eprintln!("    WARN: model_tier='none' requires output_mode='save_multi'; got {:?}", step.output_mode);
+                        }
+                    }
+                    break 'retry;
+                }
+
                 println!(
                     "    → calling LLM (prompt: {})...",
                     match &step.prompt {
@@ -3398,10 +3500,14 @@ impl Engine {
                     &step.output_mode,
                     OutputMode::SaveAs { page_type, .. } if page_type == "synthesis"
                 );
-                let response = match if is_synthesis {
-                    deepseek.chat_pro(&system_prompt, &effective_user_msg).await
-                } else {
-                    deepseek.chat(&system_prompt, &effective_user_msg).await
+                let response = match match step.model_tier.as_deref() {
+                    Some("pro") => deepseek.chat_pro(&system_prompt, &effective_user_msg).await,
+                    Some("flash") => deepseek.chat(&system_prompt, &effective_user_msg).await,
+                    _ => if is_synthesis {
+                        deepseek.chat_pro(&system_prompt, &effective_user_msg).await
+                    } else {
+                        deepseek.chat(&system_prompt, &effective_user_msg).await
+                    },
                 } {
                     Ok(r) => r,
                     Err(e) => {
@@ -3698,6 +3804,22 @@ impl Engine {
     ) -> Result<Vec<serde_json::Value>> {
         use crate::pipeline::{OutputMode, PromptSpec, ResponseFormat};
 
+        // inject_pub_metadata: prepend a citation reference table to the system prompt
+        // so the LLM uses correct author/year/journal when composing the literature review.
+        let effective_system_prompt: String = if step.inject_pub_metadata {
+            let table = self.build_pub_metadata_table().await;
+            if table.is_empty() {
+                system_prompt.to_string()
+            } else {
+                format!(
+                    "{}\n\n## Publication Metadata Reference\n\nUse the following verified citation data when citing sources. Prefer this over any metadata inferred from article content.\n\n{}\n",
+                    system_prompt, table
+                )
+            }
+        } else {
+            system_prompt.to_string()
+        };
+
         let user_msg = format!(
             "Topic: {}\n\n{}",
             synthetic_page.title, synthetic_page.compiled_truth
@@ -3710,7 +3832,10 @@ impl Engine {
             }
         );
 
-        let response = match deepseek.chat_pro(system_prompt, &user_msg).await {
+        let response = match match step.model_tier.as_deref() {
+            Some("flash") => deepseek.chat(&effective_system_prompt, &user_msg).await,
+            _ => deepseek.chat_pro(&effective_system_prompt, &user_msg).await,
+        } {
             Ok(r) => r,
             Err(e) => {
                 return Err(BrainError::Io(std::io::Error::new(
@@ -3763,6 +3888,113 @@ impl Engine {
             }
         }
         Ok(results)
+    }
+
+    /// Build a Markdown table of all pub_metadata pages for compose-time injection.
+    ///
+    /// Deduplicates by (title + first_author), keeping the highest-confidence entry
+    /// ("high" from CNKI beats "medium" from LLM auto-extract).
+    async fn build_pub_metadata_table(&self) -> String {
+        let pages = match self
+            .list_pages(Some("pub_metadata"), None, None, None, None)
+            .await
+        {
+            Ok(p) => p,
+            Err(_) => return String::new(),
+        };
+
+        if pages.is_empty() {
+            return String::new();
+        }
+
+        // Dedup: for each (canonical_title + first_author) keep highest-confidence entry.
+        let mut seen: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for page in &pages {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&page.compiled_truth) else {
+                continue;
+            };
+            let title = v
+                .get("pub_title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let first_author = v
+                .get("pub_authors")
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.first())
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let key = format!("{}_{}", title, first_author);
+            let confidence = v
+                .get("confidence")
+                .and_then(|x| x.as_str())
+                .unwrap_or("medium");
+            let should_insert = match seen.get(&key) {
+                None => true,
+                Some(existing) => {
+                    let existing_conf = existing
+                        .get("confidence")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("medium");
+                    // "high" beats "medium"
+                    confidence == "high" && existing_conf != "high"
+                }
+            };
+            if should_insert {
+                seen.insert(key, v);
+            }
+        }
+
+        if seen.is_empty() {
+            return String::new();
+        }
+
+        let mut rows: Vec<String> = seen
+            .values()
+            .map(|v| {
+                let title = v.get("pub_title").and_then(|x| x.as_str()).unwrap_or("-");
+                let authors = v
+                    .get("pub_authors")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    })
+                    .unwrap_or_default();
+                let year = v
+                    .get("pub_year")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("-");
+                let journal = v
+                    .get("pub_journal")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("-");
+                let volume = v.get("pub_volume").and_then(|x| x.as_str()).unwrap_or("");
+                let issue = v.get("pub_issue").and_then(|x| x.as_str()).unwrap_or("");
+                let vol_issue = match (volume, issue) {
+                    ("", "") => String::new(),
+                    (v, "") => format!("第{}卷", v),
+                    ("", i) => format!("第{}期", i),
+                    (v, i) => format!("第{}卷第{}期", v, i),
+                };
+                let confidence = v
+                    .get("confidence")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("medium");
+                format!(
+                    "| {} | {} | {} | {} | {} | {} |",
+                    title, authors, year, journal, vol_issue, confidence
+                )
+            })
+            .collect();
+        rows.sort(); // deterministic ordering
+
+        let header = "| 标题 | 作者 | 年份 | 期刊 | 卷期 | 来源可信度 |\n|---|---|---|---|---|---|";
+        format!("{}\n{}", header, rows.join("\n"))
     }
 
     /// Blocking helper: get a page's updated_at without async (used in filter closures).

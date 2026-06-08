@@ -1,3 +1,4 @@
+pub mod citation;
 pub mod engine;
 pub mod evidence;
 pub mod links;

@@ -2,6 +2,52 @@
 name = "literature_review"
 description = "Academic literature review: extract → per-concept synthesis → final composed document"
 
+# ── Stage 0a: extract pub_metadata from CNKI export files (ref_entry pages) ──
+# model_tier="none" bypasses the LLM and runs CnkiRefParser directly.
+# confidence="high". Runs before auto-extract so CNKI data takes priority.
+[[stages]]
+id = "extract_pub_metadata_cnki"
+enabled = true
+input_mode = "self"
+page_type  = "ref_entry"
+prompt          = "extract_pub_metadata"
+response_format = "json"
+output_mode = "save_multi"
+incremental = true
+batch_size  = 1
+model_tier  = "none"
+
+[stages.type_map.pub_metadata]
+page_type    = "pub_metadata"
+slug_prefix  = "research/pub_metadata/"
+embed        = false
+enrich_existing = false
+
+# ── Stage 0b: auto-extract pub_metadata from note files (LLM, flash model) ──
+# skip_if_target_exists=true: if a CNKI-derived pub_metadata page already
+# exists for this note (same slug_prefix + slugify(basename)), skip it.
+# incremental=false because note pages always have "mentions" links from the
+# extract stage; the standard SaveMulti incremental check would skip them all.
+[[stages]]
+id = "extract_pub_metadata_auto"
+enabled = true
+input_mode = "self"
+page_type  = "note"
+prompt          = "extract_pub_metadata"
+response_format = "json"
+output_mode = "save_multi"
+incremental = false
+skip_if_target_exists = true
+batch_size  = 1
+model_tier  = "flash"
+
+[stages.type_map.pub_metadata]
+page_type    = "pub_metadata"
+slug_prefix  = "research/pub_metadata/"
+embed        = false
+enrich_existing = false
+
+# ── Stage 1: extract concepts / figures / evidence from each note ─────────────
 [[stages]]
 id = "extract"
 enabled = true
@@ -30,6 +76,7 @@ page_type = "evidence"
 slug_prefix = "research/evidence/"
 embed = false
 
+# ── Stage 2: per-concept synthesis ────────────────────────────────────────────
 [[stages]]
 id = "synthesize"
 enabled = true
@@ -53,6 +100,9 @@ embed_output       = true
 incremental = true
 batch_size  = 1
 
+# ── Stage 3: compose final literature review ──────────────────────────────────
+# inject_pub_metadata=true: prepend verified citation table to system prompt
+# so the LLM uses correct author/year/journal when composing.
 [[stages]]
 id = "compose"
 enabled = true
@@ -71,6 +121,7 @@ output_page_type   = "wiki"
 output_slug_prefix = "research/wiki/"
 embed_output       = true
 incremental = true
+inject_pub_metadata = true
 
 # M3 Slice 3: post-compose quality stages. Both run against the full set of
 # synthesis pages and produce a single aggregate page each — one LLM call
@@ -107,3 +158,23 @@ output_page_type   = "contradiction_note"
 output_slug_prefix = "research/contradictions/"
 embed_output       = false
 incremental = true
+
+# ── Stage 6: post-hoc citation audit ─────────────────────────────────────────
+# Reads all synthesis pages + the pub_metadata table injected via system prompt,
+# compares in-text citations against verified metadata, outputs a diff report.
+[[stages]]
+id = "verify_citations"
+enabled = true
+input_mode  = "aggregate"
+page_type   = "synthesis"
+max_pages   = 25
+chars_per_page = 2500
+token_budget = 50000
+prompt          = "verify_citations_academic"
+response_format = "markdown"
+output_mode        = "save"
+output_page_type   = "citation_report"
+output_slug_prefix = "research/citation_reports/"
+embed_output       = false
+incremental = true
+inject_pub_metadata = true

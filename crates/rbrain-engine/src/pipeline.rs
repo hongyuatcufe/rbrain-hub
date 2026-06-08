@@ -161,6 +161,20 @@ pub struct PipelineStep {
     // Context injection
     #[serde(default)]
     pub inject_existing_titles: Option<String>,
+
+    // Model selection — "none" bypasses LLM (e.g. CnkiRefParser), "flash" or "pro" overrides default routing.
+    #[serde(default)]
+    pub model_tier: Option<String>,
+
+    // When true and output_mode = SaveMulti: skip a source page if its expected target slug already
+    // exists in the DB. Used by extract_pub_metadata_auto so CNKI-derived pages take priority.
+    #[serde(default)]
+    pub skip_if_target_exists: bool,
+
+    // When true: query all pub_metadata pages and prepend a citation table to the system prompt
+    // before the LLM call. Used by the compose stage to inject correct author/year/journal data.
+    #[serde(default)]
+    pub inject_pub_metadata: bool,
 }
 
 fn default_batch_size() -> usize { 1 }
@@ -412,6 +426,22 @@ pub struct StageConfig {
     /// Example: "concept" — prevents synonym proliferation in extract stages.
     #[serde(default)]
     pub inject_existing_titles: Option<String>,
+
+    // ── Model / bypass ──
+    /// "none" = bypass LLM entirely (use CnkiRefParser for ref_entry pages).
+    /// "flash" | "pro" = explicit model tier override.
+    /// Absent = default routing heuristic (pro for synthesis, flash otherwise).
+    #[serde(default)]
+    pub model_tier: Option<String>,
+
+    /// When true and output_mode = save_multi: skip source pages whose expected
+    /// target slug already exists in DB (slug_prefix + slugify(source_basename)).
+    #[serde(default)]
+    pub skip_if_target_exists: bool,
+
+    /// When true: prepend a pub_metadata citation table to the compose system prompt.
+    #[serde(default)]
+    pub inject_pub_metadata: bool,
 }
 
 fn default_input_mode() -> String { "self".to_string() }
@@ -480,6 +510,9 @@ impl StageConfig {
             batch_size: self.batch_size,
             max_inputs: self.max_inputs,
             inject_existing_titles: self.inject_existing_titles,
+            model_tier: self.model_tier,
+            skip_if_target_exists: self.skip_if_target_exists,
+            inject_pub_metadata: self.inject_pub_metadata,
         })
     }
 }
