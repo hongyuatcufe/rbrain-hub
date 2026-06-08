@@ -47,7 +47,10 @@ pub fn derive_state(run: &ResearchRun, validators: &[ValidatorResult]) -> Protoc
     let (completed_steps, current_step) = match run.status {
         RunStatus::Planned => (
             vec!["create_research_run".to_string()],
-            checklist[1].to_string(),
+            checklist
+                .get(1)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "done".to_string()),
         ),
         RunStatus::Complete => (
             checklist.iter().map(|s| s.to_string()).collect(),

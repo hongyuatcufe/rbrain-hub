@@ -105,7 +105,7 @@ pub async fn analysis_plan_exists(pool: &SqlitePool, run_slug: &str) -> Result<V
         "SELECT COUNT(*) FROM links l
          JOIN pages p ON p.slug = l.target_slug
          WHERE l.source_slug = ?
-           AND l.edge_type = 'tests_hypothesis'
+           AND l.edge_type = 'produces'
            AND p.page_type = 'analysis_plan'",
     )
     .bind(run_slug)
@@ -131,12 +131,13 @@ pub async fn finding_has_supporting_artifact(
     pool: &SqlitePool,
     run_slug: &str,
 ) -> Result<ValidatorResult> {
-    // All finding pages linked to/from this run.
+    // Only findings this run produced directly (run --produces--> finding).
     let rows = sqlx::query(
         "SELECT DISTINCT p.slug, p.frontmatter FROM pages p
-         JOIN links l ON (l.target_slug = p.slug OR l.source_slug = p.slug)
+         JOIN links l ON l.target_slug = p.slug
          WHERE p.page_type = 'finding'
-           AND (l.source_slug = ?1 OR l.target_slug = ?1)",
+           AND l.source_slug = ?1
+           AND l.edge_type = 'produces'",
     )
     .bind(run_slug)
     .fetch_all(pool)
@@ -213,11 +214,13 @@ pub async fn finding_has_dataset_lineage(
     pool: &SqlitePool,
     run_slug: &str,
 ) -> Result<ValidatorResult> {
+    // Only findings this run produced directly (run --produces--> finding).
     let rows = sqlx::query(
         "SELECT DISTINCT p.slug, p.frontmatter FROM pages p
-         JOIN links l ON (l.target_slug = p.slug OR l.source_slug = p.slug)
+         JOIN links l ON l.target_slug = p.slug
          WHERE p.page_type = 'finding'
-           AND (l.source_slug = ?1 OR l.target_slug = ?1)",
+           AND l.source_slug = ?1
+           AND l.edge_type = 'produces'",
     )
     .bind(run_slug)
     .fetch_all(pool)

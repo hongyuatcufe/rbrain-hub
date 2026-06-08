@@ -83,7 +83,10 @@ impl<'a> ResearchRunStore<'a> {
 
     pub async fn set_status(&self, id: &str, next: RunStatus) -> Result<ResearchRun> {
         let current = self.get(id).await?;
-        if current.status != next && !current.status.can_transition_to(next) {
+        if current.status == next {
+            return Ok(current);
+        }
+        if !current.status.can_transition_to(next) {
             return Err(BrainError::Conflict(format!(
                 "illegal transition for run {id}: {} → {}",
                 current.status, next

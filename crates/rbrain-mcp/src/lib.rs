@@ -562,12 +562,16 @@ fn stored_validator_summary(run: &ResearchRun) -> Option<Vec<ValidatorResult>> {
 }
 
 fn push_validator_result<E: std::fmt::Display>(
+    name: &'static str,
     validators: &mut Vec<ValidatorResult>,
     result: std::result::Result<ValidatorResult, E>,
 ) {
     match result {
         Ok(v) => validators.push(v),
-        Err(e) => tracing::warn!("validator failed: {e}"),
+        Err(e) => {
+            tracing::warn!("validator {name} failed: {e}");
+            validators.push(ValidatorResult::fail(name, format!("db error: {e}")));
+        }
     }
 }
 
@@ -578,33 +582,43 @@ async fn run_research_validators(
     let mut validators = Vec::new();
     match run.task_type {
         TaskType::DataAnalysis => {
-            push_validator_result(&mut validators, dataset_registered(pool, &run.slug).await);
-            push_validator_result(&mut validators, analysis_plan_exists(pool, &run.slug).await);
+            push_validator_result("dataset_registered", &mut validators, dataset_registered(pool, &run.slug).await);
+            push_validator_result("analysis_plan_exists", &mut validators, analysis_plan_exists(pool, &run.slug).await);
             push_validator_result(
+                "artifact_hash_present",
                 &mut validators,
                 artifact_hash_present(pool, &run.slug).await,
             );
             push_validator_result(
+                "finding_has_dataset_lineage",
                 &mut validators,
                 finding_has_dataset_lineage(pool, &run.slug).await,
             );
             push_validator_result(
+                "finding_has_supporting_artifact",
                 &mut validators,
                 finding_has_supporting_artifact(pool, &run.slug).await,
             );
         }
         TaskType::MixedMethods | TaskType::TheoryBuilding => {
-            push_validator_result(&mut validators, analysis_plan_exists(pool, &run.slug).await);
+            push_validator_result("analysis_plan_exists", &mut validators, analysis_plan_exists(pool, &run.slug).await);
             push_validator_result(
+                "artifact_hash_present",
                 &mut validators,
                 artifact_hash_present(pool, &run.slug).await,
             );
             push_validator_result(
+                "finding_has_supporting_artifact",
                 &mut validators,
                 finding_has_supporting_artifact(pool, &run.slug).await,
             );
         }
-        TaskType::LiteratureReview => {}
+        TaskType::LiteratureReview => {
+            validators.push(ValidatorResult::warn(
+                "literature_validators",
+                "not implemented until M3 — no validators run for this task_type",
+            ));
+        }
     }
     validators
 }
@@ -642,13 +656,18 @@ fn derive_run_slug(title: &str, given: Option<&str>) -> String {
     if let Some(s) = given {
         return s.to_string();
     }
+    let mut prev_dash = false;
     let cleaned: String = title
         .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                prev_dash = false;
+                Some(c.to_ascii_lowercase())
+            } else if !prev_dash {
+                prev_dash = true;
+                Some('-')
             } else {
-                '-'
+                None
             }
         })
         .collect();
@@ -1259,14 +1278,18 @@ impl RBrainMcpServer {
                 status: run.status.to_string(),
                 message: "research_run created".into(),
             }),
-            Err(e) => Json(ResearchRunResult {
-                ok: false,
-                run_id: String::new(),
-                slug,
-                task_type: task_type.to_string(),
-                status: String::new(),
-                message: format!("store.create failed: {e}"),
-            }),
+            Err(e) => {
+                // Compensate: remove the orphan page so DB and page store stay consistent.
+                let _ = self.engine.delete_page(&slug).await;
+                Json(ResearchRunResult {
+                    ok: false,
+                    run_id: String::new(),
+                    slug,
+                    task_type: task_type.to_string(),
+                    status: String::new(),
+                    message: format!("store.create failed: {e}"),
+                })
+            }
         }
     }
 
@@ -1381,8 +1404,8 @@ impl RBrainMcpServer {
 
         let (page_type, edge_type) = match args.kind.as_str() {
             "finding" => ("finding", "produces"),
-            "limitation" => ("limitation", "limits"),
-            "analysis_plan" => ("analysis_plan", "tests_hypothesis"),
+            "limitation" => ("limitation", "produces"),
+            "analysis_plan" => ("analysis_plan", "produces"),
             other => {
                 return Json(MutationResult::err(format!(
                     "kind must be finding|limitation|analysis_plan, got {other}"
@@ -1475,8 +1498,15 @@ impl RBrainMcpServer {
         // Persist summary for protocol derivation across sessions.
         let mut latest_run = run.clone();
         if let Ok(json) = serde_json::to_string(&vs) {
+            let fingerprint = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                json.hash(&mut h);
+                format!("{:016x}", h.finish())
+            };
             if let Ok(updated) = store
-                .record_validation(&run.id, &run.fingerprint, &json)
+                .record_validation(&run.id, &fingerprint, &json)
                 .await
             {
                 latest_run = updated;
