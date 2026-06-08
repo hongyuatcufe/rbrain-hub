@@ -372,7 +372,11 @@ pub async fn citation_chunks_exist(pool: &SqlitePool, _run_slug: &str) -> Result
         .collect();
     Ok(ValidatorResult::fail(
         "citation_chunks_exist",
-        format!("{} citation(s) reference non-existent chunk ID(s)", missing.len()),
+        format!(
+            "{} citation(s) reference non-existent chunk ID(s); examples: {}",
+            missing.len(),
+            render_chunk_ref_snippets(&missing, 3)
+        ),
     )
     .with_affected(affected)
     .with_actions(actions))
@@ -423,8 +427,9 @@ pub async fn citation_chunk_matches_slug(pool: &SqlitePool, _run_slug: &str) -> 
     Ok(ValidatorResult::fail(
         "citation_chunk_matches_slug",
         format!(
-            "{} citation(s) cite a chunk whose actual page slug differs",
-            mismatches.len()
+            "{} citation(s) cite a chunk whose actual page slug differs; examples: {}",
+            mismatches.len(),
+            render_chunk_ref_snippets(&mismatches, 3)
         ),
     )
     .with_affected(affected)
@@ -534,6 +539,178 @@ pub async fn review_links_to_synthesis_pages(
     .with_affected(unbacked))
 }
 
+/// Per-page primary-source ratio. For each synthesis/wiki page, classify
+/// every wikilink target by `page_type`:
+///
+/// - **primary**: `raw` or `note` (the original corpus).
+/// - **derived**: anything else (`concept`, `synthesis`, `wiki`, `draft`,
+///   `memo`, etc.) — the literature_review pipeline's own outputs.
+///
+/// Thresholds:
+/// - `synthesis` pages: 100% primary (any derived citation fails the page).
+/// - `wiki` pages: ≥ 60% primary (the final review may legitimately cite
+///   synthesis pages as section anchors).
+///
+/// External (non-DB) targets are ignored — bib parsers cover that.
+pub async fn primary_source_ratio(
+    pool: &SqlitePool,
+    _run_slug: &str,
+) -> Result<ValidatorResult> {
+    const SYNTHESIS_MIN_RATIO: f64 = 1.0;
+    const WIKI_MIN_RATIO: f64 = 0.60;
+
+    let rows = sqlx::query(
+        "SELECT slug, page_type, compiled_truth FROM pages
+         WHERE page_type IN ('synthesis', 'wiki')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    if rows.is_empty() {
+        return Ok(ValidatorResult::warn(
+            "primary_source_ratio",
+            "no synthesis/wiki pages yet",
+        ));
+    }
+
+    let mut failed: Vec<(String, String, f64)> = Vec::new(); // (slug, page_type, ratio)
+    for row in &rows {
+        let slug: String = row.try_get("slug").map_err(db_err)?;
+        let page_type: String = row.try_get("page_type").map_err(db_err)?;
+        let content: String = row.try_get("compiled_truth").map_err(db_err)?;
+
+        let mut primary = 0usize;
+        let mut counted = 0usize;
+        for link in extract_links(&content) {
+            let target_type: Option<String> = sqlx::query_scalar(
+                "SELECT page_type FROM pages WHERE slug = ?",
+            )
+            .bind(&link.target_slug)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+            let Some(pt) = target_type else { continue };
+            counted += 1;
+            if matches!(pt.as_str(), "raw" | "note") {
+                primary += 1;
+            }
+        }
+
+        if counted == 0 {
+            // No internal citations — nothing to ratio. synthesis_sections_
+            // have_citations handles citation-count requirements; we don't
+            // also fail this validator for an uncited page.
+            continue;
+        }
+
+        let ratio = primary as f64 / counted as f64;
+        let threshold = match page_type.as_str() {
+            "synthesis" => SYNTHESIS_MIN_RATIO,
+            "wiki" => WIKI_MIN_RATIO,
+            _ => continue,
+        };
+        if ratio < threshold {
+            failed.push((slug, page_type, ratio));
+        }
+    }
+
+    if failed.is_empty() {
+        return Ok(ValidatorResult::pass("primary_source_ratio"));
+    }
+
+    let message = format!(
+        "{} page(s) below primary-source ratio threshold: {}",
+        failed.len(),
+        failed
+            .iter()
+            .take(5)
+            .map(|(s, pt, r)| format!("{s} ({pt}, {:.0}% primary)", r * 100.0))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let affected: Vec<String> = failed.iter().map(|(s, _, _)| s.clone()).collect();
+    Ok(ValidatorResult::fail("primary_source_ratio", message).with_affected(affected))
+}
+
+/// Run the existing `audit_citations` checker against every synthesis/wiki
+/// page and aggregate the result into a single ValidatorResult so
+/// `brain_validate_research_run` covers bibliography hygiene in one call
+/// (otherwise `brain_citation_check` must be invoked per page).
+///
+/// Severity mapping: any ERROR-level audit finding → Fail; only WARN/INFO
+/// → Warn; no findings → Pass.
+pub async fn bibliography_consistency(
+    engine: &crate::engine::Engine,
+    _run_slug: &str,
+) -> Result<ValidatorResult> {
+    let slugs: Vec<String> = sqlx::query_scalar(
+        "SELECT slug FROM pages WHERE page_type IN ('synthesis', 'wiki')",
+    )
+    .fetch_all(engine.get_db())
+    .await
+    .map_err(db_err)?;
+
+    if slugs.is_empty() {
+        return Ok(ValidatorResult::warn(
+            "bibliography_consistency",
+            "no synthesis/wiki pages yet",
+        ));
+    }
+
+    let mut error_pages: Vec<String> = Vec::new();
+    let mut warn_pages: Vec<String> = Vec::new();
+    let mut actions: Vec<SuggestedAction> = Vec::new();
+
+    for slug in &slugs {
+        let report = match engine.audit_citations(slug, false).await {
+            Ok(r) => r,
+            Err(_) => continue, // skip pages that fail to audit (e.g. missing)
+        };
+        let mut had_error = false;
+        let mut had_warn = false;
+        for f in &report.findings {
+            match f.severity {
+                "ERROR" => {
+                    had_error = true;
+                    actions.push(SuggestedAction::AddCitation {
+                        slug: slug.clone(),
+                        chunk_ref: Some(f.message.clone()),
+                    });
+                }
+                "WARN" => had_warn = true,
+                _ => {}
+            }
+        }
+        if had_error {
+            error_pages.push(slug.clone());
+        } else if had_warn {
+            warn_pages.push(slug.clone());
+        }
+    }
+
+    if !error_pages.is_empty() {
+        return Ok(ValidatorResult::fail(
+            "bibliography_consistency",
+            format!(
+                "{} page(s) with citation errors, {} page(s) with warnings",
+                error_pages.len(),
+                warn_pages.len()
+            ),
+        )
+        .with_affected(error_pages)
+        .with_actions(actions));
+    }
+    if !warn_pages.is_empty() {
+        return Ok(ValidatorResult::warn(
+            "bibliography_consistency",
+            format!("{} page(s) with citation warnings", warn_pages.len()),
+        )
+        .with_affected(warn_pages));
+    }
+    Ok(ValidatorResult::pass("bibliography_consistency"))
+}
+
 // ─── Synthesis quality core ───────────────────────────────────────────────────
 //
 // Shared between the pipeline retry gate (engine.rs) and
@@ -640,6 +817,9 @@ struct ChunkRef {
     target_slug: String,
     /// The cited chunk ID.
     chunk_id: i64,
+    /// Sentence containing the citation, surfaced in failure messages so
+    /// ZeroClaw can locate the offending reference without re-grepping.
+    context: Option<String>,
 }
 
 /// Scan all synthesis/wiki pages for `[[slug | chunk:N]]` references.
@@ -662,11 +842,37 @@ async fn collect_chunk_refs(pool: &SqlitePool) -> Result<Vec<ChunkRef>> {
                     host_slug: host_slug.clone(),
                     target_slug: link.target_slug,
                     chunk_id,
+                    context: link.context,
                 });
             }
         }
     }
     Ok(refs)
+}
+
+/// Render up to `take` failing chunk refs as a human-readable list for the
+/// `message` field of a failing ValidatorResult. Sentence is truncated to
+/// the configured char window so messages stay short.
+fn render_chunk_ref_snippets(refs: &[&ChunkRef], take: usize) -> String {
+    const CTX_CHARS: usize = 80;
+    refs.iter()
+        .take(take)
+        .map(|r| {
+            let ctx = r
+                .context
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(CTX_CHARS)
+                .collect::<String>();
+            if ctx.is_empty() {
+                format!("{}@chunk:{}", r.host_slug, r.chunk_id)
+            } else {
+                format!("{}@chunk:{} (\"{}\")", r.host_slug, r.chunk_id, ctx)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 async fn fetch_existing_chunk_ids(

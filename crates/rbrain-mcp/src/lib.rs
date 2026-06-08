@@ -1,10 +1,11 @@
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
-    ValidatorResult, analysis_plan_exists, artifact_hash_present, citation_chunk_matches_slug,
-    citation_chunks_exist, dataset_registered, finding_has_dataset_lineage,
-    finding_has_supporting_artifact, review_links_to_synthesis_pages, run_citation_check,
-    source_count_minimum, synthesis_sections_have_citations,
+    ValidatorResult, analysis_plan_exists, artifact_hash_present, bibliography_consistency,
+    citation_chunk_matches_slug, citation_chunks_exist, dataset_registered,
+    finding_has_dataset_lineage, finding_has_supporting_artifact, primary_source_ratio,
+    review_links_to_synthesis_pages, run_citation_check, source_count_minimum,
+    synthesis_sections_have_citations,
 };
 use rbrain_engine::pipeline::{InputSpec, OutputMode, PipelineStep, PromptSpec, ResponseFormat};
 use rbrain_engine::research::{
@@ -578,9 +579,10 @@ fn push_validator_result<E: std::fmt::Display>(
 }
 
 async fn run_research_validators(
-    pool: &sqlx::SqlitePool,
+    engine: &Engine,
     run: &ResearchRun,
 ) -> Vec<ValidatorResult> {
+    let pool = engine.get_db();
     let mut validators = Vec::new();
     match run.task_type {
         TaskType::DataAnalysis => {
@@ -641,6 +643,16 @@ async fn run_research_validators(
                 &mut validators,
                 review_links_to_synthesis_pages(pool, &run.slug).await,
             );
+            push_validator_result(
+                "primary_source_ratio",
+                &mut validators,
+                primary_source_ratio(pool, &run.slug).await,
+            );
+            push_validator_result(
+                "bibliography_consistency",
+                &mut validators,
+                bibliography_consistency(engine, &run.slug).await,
+            );
         }
     }
     validators
@@ -657,10 +669,10 @@ async fn run_research_validators(
 /// recommend actions ZeroClaw has already completed. Validators are cheap SQL
 /// counts (no LLM), so recomputing is correct and inexpensive.
 async fn validators_for_protocol(
-    pool: &sqlx::SqlitePool,
+    engine: &Engine,
     run: &ResearchRun,
 ) -> Vec<ValidatorResult> {
-    run_research_validators(pool, run).await
+    run_research_validators(engine, run).await
 }
 
 async fn ensure_research_run_slug(
@@ -1341,8 +1353,7 @@ impl RBrainMcpServer {
                 });
             }
         };
-        let pool = self.engine.get_db();
-        let vs = validators_for_protocol(pool, &run).await;
+        let vs = validators_for_protocol(&self.engine, &run).await;
         Json(protocol_to_json(&derive_state(&run, &vs)))
     }
 
@@ -1475,7 +1486,8 @@ impl RBrainMcpServer {
             finding_has_supporting_artifact. \
             literature_review: source_count_minimum, citation_chunks_exist, \
             citation_chunk_matches_slug, synthesis_sections_have_citations, \
-            review_links_to_synthesis_pages. \
+            review_links_to_synthesis_pages, primary_source_ratio, \
+            bibliography_consistency. \
             Returns structured results with controlled suggested_actions enum and the derived \
             protocol state so ZeroClaw knows the next step."
     )]
@@ -1496,8 +1508,7 @@ impl RBrainMcpServer {
                 });
             }
         };
-        let pool = self.engine.get_db();
-        let vs = run_research_validators(pool, &run).await;
+        let vs = run_research_validators(&self.engine, &run).await;
 
         // Empty validator list is **not** "pass" — it means no validators are
         // wired yet for this task_type (currently: literature_review, M3 work).

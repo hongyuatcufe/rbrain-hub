@@ -1,9 +1,10 @@
-//! M3 Slice 1 acceptance — literature-review validators.
+//! M3 Slice 1 + Slice 2 acceptance — literature-review validators.
 //!
-//! Covers the five validators wired into `TaskType::LiteratureReview`:
+//! Covers the seven validators wired into `TaskType::LiteratureReview`:
 //! `source_count_minimum`, `citation_chunks_exist`,
 //! `citation_chunk_matches_slug`, `synthesis_sections_have_citations`,
-//! `review_links_to_synthesis_pages`.
+//! `review_links_to_synthesis_pages`, `primary_source_ratio`,
+//! `bibliography_consistency`.
 
 mod common;
 
@@ -12,8 +13,9 @@ use rbrain_core::embedder::Embedder;
 use rbrain_core::page::Page;
 use rbrain_engine::Engine;
 use rbrain_engine::evidence::{
-    ValidatorStatus, citation_chunk_matches_slug, citation_chunks_exist,
-    review_links_to_synthesis_pages, source_count_minimum, synthesis_sections_have_citations,
+    ValidatorStatus, bibliography_consistency, citation_chunk_matches_slug, citation_chunks_exist,
+    primary_source_ratio, review_links_to_synthesis_pages, source_count_minimum,
+    synthesis_sections_have_citations,
 };
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_search::{LanceStore, TantivyIndex};
@@ -278,4 +280,147 @@ async fn review_links_to_synthesis_passes_when_wiki_cites_synthesis() {
         .await
         .unwrap();
     assert_eq!(r.status, ValidatorStatus::Pass);
+}
+
+// ─── primary_source_ratio (Slice 2) ────────────────────────────────────────
+
+#[tokio::test]
+async fn primary_source_ratio_warns_when_no_pages() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let r = primary_source_ratio(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Warn);
+}
+
+#[tokio::test]
+async fn primary_source_ratio_synthesis_passes_when_all_primary() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "raw/articles/a", "note", "A", "alpha".into()).await;
+    put_typed_page(&engine, "raw/articles/b", "note", "B", "beta".into()).await;
+    let body = "# 综合\n\n## 主题\n\n[[raw/articles/a]] 与 [[raw/articles/b]]\n".to_string();
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", body).await;
+
+    let r = primary_source_ratio(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Pass);
+}
+
+#[tokio::test]
+async fn primary_source_ratio_synthesis_fails_on_any_derived_cite() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "raw/articles/a", "note", "A", "alpha".into()).await;
+    put_typed_page(&engine, "research/synthesis/y", "synthesis", "Y", "# y\n".into()).await;
+    // x cites raw/a AND another synthesis y — synthesis must be 100% primary.
+    let body = "# 综合\n\n## 主题\n\n[[raw/articles/a]] [[research/synthesis/y]]\n".to_string();
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", body).await;
+
+    let r = primary_source_ratio(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+    assert!(r.affected_slugs.contains(&"research/synthesis/x".to_string()));
+}
+
+#[tokio::test]
+async fn primary_source_ratio_wiki_passes_above_threshold() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // wiki cites 2 primary + 1 derived = 67% > 60%
+    put_typed_page(&engine, "raw/a", "note", "A", "a".into()).await;
+    put_typed_page(&engine, "raw/b", "note", "B", "b".into()).await;
+    put_typed_page(&engine, "research/synthesis/s", "synthesis", "S", "# s\n".into()).await;
+    let body = "# Review\n\n[[raw/a]] [[raw/b]] [[research/synthesis/s]]\n".to_string();
+    put_typed_page(&engine, "research/wiki/r", "wiki", "R", body).await;
+
+    let r = primary_source_ratio(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Pass);
+}
+
+#[tokio::test]
+async fn primary_source_ratio_wiki_fails_below_threshold() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // wiki cites 1 primary + 3 derived = 25% < 60%
+    put_typed_page(&engine, "raw/a", "note", "A", "a".into()).await;
+    put_typed_page(&engine, "research/synthesis/s1", "synthesis", "S1", "# s1\n".into()).await;
+    put_typed_page(&engine, "research/synthesis/s2", "synthesis", "S2", "# s2\n".into()).await;
+    put_typed_page(&engine, "research/synthesis/s3", "synthesis", "S3", "# s3\n".into()).await;
+    let body = "# Review\n\n[[raw/a]] [[research/synthesis/s1]] [[research/synthesis/s2]] [[research/synthesis/s3]]\n".to_string();
+    put_typed_page(&engine, "research/wiki/r", "wiki", "R", body).await;
+
+    let r = primary_source_ratio(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+    assert!(r.affected_slugs.contains(&"research/wiki/r".to_string()));
+}
+
+// ─── bibliography_consistency (Slice 2) ────────────────────────────────────
+
+#[tokio::test]
+async fn bibliography_consistency_warns_when_no_pages() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let r = bibliography_consistency(&engine, RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Warn);
+}
+
+#[tokio::test]
+async fn bibliography_consistency_passes_clean_synthesis() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // synthesis cites only a raw page — no audit findings expected.
+    put_typed_page(&engine, "raw/articles/a", "note", "A", "alpha".into()).await;
+    let body = "# 综合\n\n## 主题\n\n[[raw/articles/a]]\n".to_string();
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", body).await;
+
+    let r = bibliography_consistency(&engine, RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Pass);
+}
+
+#[tokio::test]
+async fn bibliography_consistency_fails_when_synthesis_self_cites_derived() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // synthesis x cites synthesis y — audit_citations citation_type ERROR.
+    put_typed_page(&engine, "research/synthesis/y", "synthesis", "Y", "# y\n".into()).await;
+    let body = "# 综合\n\n## 主题\n\n[[research/synthesis/y]]\n".to_string();
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", body).await;
+
+    let r = bibliography_consistency(&engine, RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+    assert!(r.affected_slugs.contains(&"research/synthesis/x".to_string()));
+}
+
+// ─── Snippet enrichment (Slice 2 B1) ───────────────────────────────────────
+
+#[tokio::test]
+async fn citation_chunks_exist_failure_message_includes_snippet() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    put_typed_page(&engine, "raw/articles/a", "note", "A", "alpha".into()).await;
+    let _ = insert_chunk(&engine, "raw/articles/a", 0, "alpha").await;
+
+    let body = "# 综合\n\n## 主题\n\n这里有一处虚假引用 [[raw/articles/a | chunk:9999]] 说明问题。\n"
+        .to_string();
+    put_typed_page(&engine, "research/synthesis/x", "synthesis", "X", body).await;
+
+    let r = citation_chunks_exist(engine.get_db(), RUN_SLUG).await.unwrap();
+    assert_eq!(r.status, ValidatorStatus::Fail);
+    assert!(
+        r.message.contains("examples:"),
+        "message should contain 'examples:' but got: {}",
+        r.message
+    );
+    assert!(
+        r.message.contains("chunk:9999"),
+        "message should reference the bad chunk id but got: {}",
+        r.message
+    );
 }
