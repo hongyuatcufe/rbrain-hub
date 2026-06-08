@@ -9,6 +9,64 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 
 ---
 
+## 2026-06-08 — Compose 超时修复、embedding 去重实验与引用矫正模块设计
+
+### 1. Compose 阶段超时修复
+
+DeepSeek HTTP client timeout 从 120 s 升至 600 s，修复 compose 阶段（完整文献综述生成，单次 LLM 调用）因生成时间较长而超时的问题。
+
+### 2. Synthesize 去重：embedding 实验与回滚
+
+**实验（commit `a71edb6`）**：在 synthesize 阶段引入 embedding-based 概念去重（cosine similarity ≥ 0.90 时合并近义概念，如"自主知识体系" vs "教育学自主知识体系"）。
+
+**结论（commit `2d30f7e`）**：回滚。synthesize 设计为单概念深度综合，embedding 去重将多概念合并后扩大了上下文，反而降低了合成焦点。跨概念整合是 compose 阶段的职责。
+
+**保留的改进**：LinkedSources 锚点列表在 dedup/embedding 步骤之前先按 `min_sources` 过滤。实测将候选从 225 个降至 25 个，减少了不必要的 embedding 计算。
+
+### 3. 引用核校（rbrain-test 测试项目）
+
+对 `research/draft/disciplinary_genealogy_paper.md`（学科谱系论文）进行全量引用核校：
+
+- 逐一比对文中所有引文（作者、年份、期刊）与 `raw/articles/` 原始文件
+- 发现并修正：年份错误、期刊名错误、联合作者缺失等，共 19 处
+- 特殊情况：袁振国（2022）为书序性质，原始文件无出版元数据，标注"出版信息待核"
+
+### 4. 引用矫正模块：完整设计（Tasks #32–#41）
+
+设计三个协作组件，**代码尚未实现**，下次 session 继续：
+
+#### 组件1：PubMetadata 提取
+
+| 来源 | 实现 | confidence |
+|------|------|-----------|
+| CNKI 导出文件（`ref_entry` 页） | `CnkiRefParser`：纯 Rust regex，解析 `EnglishKey-中文Key: value` 格式 | `"high"` |
+| note 文件 header 自动提取 | flash 模型 + `extract_pub_metadata` prompt | `"medium"` |
+
+CNKI 优先策略：两个 stage 共享同一 `output_slug_prefix`，CNKI 先跑，auto 阶段通过 `skip_if_target_exists = true` 看到已有页面则跳过。
+
+#### 组件2：compose 注入
+
+`inject_pub_metadata = true` 在 compose 前查询所有 `pub_metadata` 页，置信度去重后构建元数据表，注入 compose prompt system section，使 LLM 生成文献综述时直接引用正确的作者/年份/期刊。
+
+#### 组件3：post-hoc 引用核校报告
+
+`verify_citations` stage（aggregate 模式）：读取所有 synthesis 页，与 pub_metadata 表逐一比对，输出差异报告页（`citation_report` 类型）。可重跑、可审计，独立于生成流程。
+
+#### 新增 StageConfig 字段
+
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `model_tier` | `Option<String>` | `"none"` 绕过 LLM 用 CnkiRefParser；`"flash"` / `"pro"` 显式指定 |
+| `inject_pub_metadata` | `bool` | compose 阶段注入 pub_metadata 表 |
+| `skip_if_target_exists` | `bool` | 目标 slug 已存在则跳过（实现 CNKI 优先覆盖） |
+
+### 验证
+
+- `cargo test -p rbrain-engine --lib`：通过。
+- `git diff --check`：通过。
+
+---
+
 ## 2026-06-02 — Literature Review Pipeline 质量门禁与干净重建复测
 
 ### 修复问题
