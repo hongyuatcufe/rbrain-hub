@@ -39,7 +39,6 @@ source_type   = "note"
 min_sources   = 2
 use_chunks    = true
 dedup_sources_threshold = 0.8
-dedup_embedding_threshold = 0.90
 # M3 Slice 5: per-anchor token cap. Each synthesize call sees one concept
 # + up to ~30K tokens of source chunks, leaving headroom for prompt + output
 # under DeepSeek's 64K context window. Without this, large source sets in

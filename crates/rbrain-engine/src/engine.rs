@@ -2899,11 +2899,42 @@ impl Engine {
                 }
             }
             InputSpec::LinkedSources {
-                anchor_page_type, ..
+                anchor_page_type,
+                source_page_type,
+                min_sources,
+                ..
             } => {
-                // For LinkedSources, anchor pages drive the loop — fetch them here.
-                self.list_pages(Some(anchor_page_type.as_str()), None, None, None, None)
-                    .await?
+                // Fetch anchor pages that already have at least min_sources linked sources.
+                // Pre-filtering here prevents unnecessary embedding calls and dedup work on
+                // anchors that would be skipped in the per-anchor processing loop anyway.
+                let all_anchors = self
+                    .list_pages(Some(anchor_page_type.as_str()), None, None, None, None)
+                    .await?;
+                if *min_sources == 0 {
+                    all_anchors
+                } else {
+                    let qualifying: std::collections::HashSet<String> = sqlx::query_scalar(
+                        "SELECT p.slug FROM pages p
+                         WHERE p.page_type = ?1
+                         AND (
+                             SELECT COUNT(DISTINCT l.source_slug) FROM links l
+                             JOIN pages src ON src.slug = l.source_slug
+                             WHERE l.target_slug = p.slug AND src.page_type = ?2
+                         ) >= ?3",
+                    )
+                    .bind(anchor_page_type.as_str())
+                    .bind(source_page_type.as_str())
+                    .bind(*min_sources as i64)
+                    .fetch_all(&self.inner.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                    all_anchors
+                        .into_iter()
+                        .filter(|p| qualifying.contains(&p.slug))
+                        .collect()
+                }
             }
             InputSpec::AggregateContent {
                 page_type,
@@ -3095,22 +3126,17 @@ impl Engine {
             None
         };
 
-        // ── 3c. Dedup LinkedSources anchors ──────────────────────────────────────
-        // Primary: embedding cosine similarity on anchor titles (when embedder available).
-        // Fallback: Jaccard similarity on source-article sets.
-        // In both cases the anchor with fewer source articles is skipped.
+        // ── 3c. Dedup LinkedSources anchors by source-set Jaccard similarity ───
+        // When two anchors share ≥ dedup_sources_threshold of their source articles,
+        // the one with fewer sources is skipped to avoid near-identical synthesis pages.
         let pages_to_process: Vec<Page> = if let InputSpec::LinkedSources {
             source_page_type,
             dedup_sources_threshold,
-            dedup_embedding_threshold,
             ..
         } = &step.input
         {
-            let use_embedding = dedup_embedding_threshold.is_some() && self.inner.embedder.is_some();
-            let use_jaccard = *dedup_sources_threshold > 0.0;
-
-            if use_embedding || use_jaccard {
-                // Always build source sets — needed for ranking (keep the anchor with more sources).
+            if *dedup_sources_threshold > 0.0 {
+                let threshold = *dedup_sources_threshold;
                 let mut anchor_sources: Vec<(String, std::collections::HashSet<String>)> =
                     Vec::new();
                 for page in &pages_to_process {
@@ -3130,84 +3156,34 @@ impl Engine {
                 }
 
                 let mut skip: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-                if use_embedding {
-                    let emb_threshold = dedup_embedding_threshold.unwrap();
-                    let embedder = self.inner.embedder.as_ref().unwrap();
-                    let titles: Vec<String> =
-                        pages_to_process.iter().map(|p| p.title.clone()).collect();
-                    match embedder.embed_batch(&titles).await {
-                        Ok(embeddings) if embeddings.len() == titles.len() => {
-                            fn cosine(a: &[f32], b: &[f32]) -> f32 {
-                                let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-                                let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
-                            }
-                            for i in 0..anchor_sources.len() {
-                                if skip.contains(&anchor_sources[i].0) { continue; }
-                                for j in (i + 1)..anchor_sources.len() {
-                                    if skip.contains(&anchor_sources[j].0) { continue; }
-                                    let sim = cosine(&embeddings[i], &embeddings[j]);
-                                    if sim >= emb_threshold {
-                                        if anchor_sources[i].1.len() >= anchor_sources[j].1.len() {
-                                            skip.insert(anchor_sources[j].0.clone());
-                                            println!(
-                                                "  [dedup/emb] skipping '{}' (cos={:.3} with '{}')",
-                                                anchor_sources[j].0, sim, anchor_sources[i].0
-                                            );
-                                        } else {
-                                            skip.insert(anchor_sources[i].0.clone());
-                                            println!(
-                                                "  [dedup/emb] skipping '{}' (cos={:.3} with '{}')",
-                                                anchor_sources[i].0, sim, anchor_sources[j].0
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::warn!("embedding batch size mismatch; skipping embedding dedup");
-                        }
-                        Err(e) => {
-                            tracing::warn!("embedding failed ({}); skipping embedding dedup", e);
-                        }
-                    }
-                } else {
-                    // Jaccard fallback
-                    let threshold = *dedup_sources_threshold;
-                    for i in 0..anchor_sources.len() {
-                        if skip.contains(&anchor_sources[i].0) { continue; }
-                        for j in (i + 1)..anchor_sources.len() {
-                            if skip.contains(&anchor_sources[j].0) { continue; }
-                            let a = &anchor_sources[i].1;
-                            let b = &anchor_sources[j].1;
-                            let intersection = a.intersection(b).count();
-                            let union = a.len() + b.len() - intersection;
-                            if union == 0 { continue; }
-                            let jaccard = intersection as f32 / union as f32;
-                            if jaccard >= threshold {
-                                if a.len() >= b.len() {
-                                    skip.insert(anchor_sources[j].0.clone());
-                                    println!(
-                                        "  [dedup/jac] skipping '{}' (Jaccard={:.2} with '{}')",
-                                        anchor_sources[j].0, jaccard, anchor_sources[i].0
-                                    );
-                                } else {
-                                    skip.insert(anchor_sources[i].0.clone());
-                                    println!(
-                                        "  [dedup/jac] skipping '{}' (Jaccard={:.2} with '{}')",
-                                        anchor_sources[i].0, jaccard, anchor_sources[j].0
-                                    );
-                                    break;
-                                }
+                for i in 0..anchor_sources.len() {
+                    if skip.contains(&anchor_sources[i].0) { continue; }
+                    for j in (i + 1)..anchor_sources.len() {
+                        if skip.contains(&anchor_sources[j].0) { continue; }
+                        let a = &anchor_sources[i].1;
+                        let b = &anchor_sources[j].1;
+                        let intersection = a.intersection(b).count();
+                        let union = a.len() + b.len() - intersection;
+                        if union == 0 { continue; }
+                        let jaccard = intersection as f32 / union as f32;
+                        if jaccard >= threshold {
+                            if a.len() >= b.len() {
+                                skip.insert(anchor_sources[j].0.clone());
+                                println!(
+                                    "  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[j].0, jaccard, anchor_sources[i].0
+                                );
+                            } else {
+                                skip.insert(anchor_sources[i].0.clone());
+                                println!(
+                                    "  [dedup] skipping '{}' (Jaccard={:.2} with '{}')",
+                                    anchor_sources[i].0, jaccard, anchor_sources[j].0
+                                );
+                                break;
                             }
                         }
                     }
                 }
-
                 pages_to_process
                     .into_iter()
                     .filter(|p| !skip.contains(&p.slug))

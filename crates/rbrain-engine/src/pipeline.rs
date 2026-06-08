@@ -37,12 +37,6 @@ pub enum InputSpec {
         /// sources is skipped. 0.0 = disabled (default). Typical useful value: 0.8.
         #[serde(default)]
         dedup_sources_threshold: f32,
-        /// Embedding cosine similarity threshold for semantic deduplication.
-        /// When two anchors have title embeddings with cosine similarity ≥ this value,
-        /// the one with fewer sources is skipped. None = disabled. Typical value: 0.90.
-        /// Takes precedence over dedup_sources_threshold when the engine has an embedder.
-        #[serde(default)]
-        dedup_embedding_threshold: Option<f32>,
         /// M3 Slice 5: cap total prompt context at this many estimated tokens
         /// across all source blocks for one anchor. None = no token cap
         /// (legacy char-only behavior).
@@ -375,8 +369,6 @@ pub struct StageConfig {
     pub use_chunks: bool,
     #[serde(default)]
     pub dedup_sources_threshold: f32,
-    #[serde(default)]
-    pub dedup_embedding_threshold: Option<f32>,
     // aggregate mode
     #[serde(default = "default_aggregate_max")]
     pub max_pages: usize,
@@ -441,7 +433,6 @@ impl StageConfig {
                 min_sources: self.min_sources,
                 use_chunks: self.use_chunks,
                 dedup_sources_threshold: self.dedup_sources_threshold,
-                dedup_embedding_threshold: self.dedup_embedding_threshold,
                 token_budget: self.token_budget,
             },
             "aggregate" => InputSpec::AggregateContent {
