@@ -1061,6 +1061,7 @@ async fn main() -> anyhow::Result<()> {
                     expand,
                     r#type.as_deref(),
                     tag.as_deref(),
+                    rbrain_engine::engine::MAX_POOL_DEFAULT,
                 )
                 .await?;
 

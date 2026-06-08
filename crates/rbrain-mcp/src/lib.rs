@@ -738,7 +738,13 @@ impl RBrainMcpServer {
 
         match self
             .engine
-            .search_with_context(&args.query, &lang, limit, expand)
+            .search_with_context(
+                &args.query,
+                &lang,
+                limit,
+                expand,
+                rbrain_engine::engine::MAX_POOL_DEFAULT,
+            )
             .await
         {
             Ok(chunks) => Json(ChunkList {

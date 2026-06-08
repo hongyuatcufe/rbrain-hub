@@ -104,7 +104,13 @@ async fn call_tool(
             let lang = rbrain_core::page::Language::detect(query);
 
             let chunks = engine
-                .search_with_context(query, &lang, limit, expand)
+                .search_with_context(
+                    query,
+                    &lang,
+                    limit,
+                    expand,
+                    rbrain_engine::engine::MAX_POOL_DEFAULT,
+                )
                 .await
                 .map_err(|e| (-32000, format!("Query failed: {}", e)))?;
 

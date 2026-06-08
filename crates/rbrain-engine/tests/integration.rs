@@ -547,7 +547,7 @@ async fn test_sync_invalidates_searchable_chunks_and_preserves_timeline() {
             .any(|candidate| candidate.slug == "synced-page")
     );
     let obsolete = engine
-        .search_with_context("obsoletekeyword", &Language::En, 5, false)
+        .search_with_context("obsoletekeyword", &Language::En, 5, false, 1)
         .await
         .expect("search obsolete");
     assert!(
@@ -871,4 +871,77 @@ async fn test_academic_meta_deserialize_partial() {
         .as_array()
         .expect("authors array");
     assert_eq!(authors[0].as_str().unwrap(), "张三");
+}
+
+/// M3 Slice 4: page-level max-pooling end-to-end.
+/// Two CJK pages, each with enough text to produce ≥2 chunks. With
+/// `max_chunks_per_page=1`, search_with_context must return at most one
+/// chunk per page even when multiple are scored highly.
+#[tokio::test]
+async fn search_with_context_max_pool_caps_chunks_per_page() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // CJK chunker target = 600 chars; build pages well over that so each
+    // produces multiple chunks. Repeat distinctive sentences containing the
+    // query token so both pages match.
+    let unit = "搜索测试内容,这是关键词命中的句子。";
+    let long = unit.repeat(60); // ~1800 chars > 2 chunks
+
+    let page_a = Page {
+        language: Some(Language::ZhHans),
+        ..Page::new("page/a".into(), "note".into(), long.clone())
+    };
+    let page_b = Page {
+        language: Some(Language::ZhHans),
+        ..Page::new("page/b".into(), "note".into(), long)
+    };
+    engine.put_page(page_a.clone()).await.expect("put a");
+    engine.put_page(page_b.clone()).await.expect("put b");
+    engine
+        .chunk_and_embed_page(&page_a)
+        .await
+        .expect("embed a");
+    engine
+        .chunk_and_embed_page(&page_b)
+        .await
+        .expect("embed b");
+
+    // Sanity check: each page produced ≥2 chunks.
+    let n_a: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_slug = 'page/a'")
+        .fetch_one(engine.get_db())
+        .await
+        .expect("count a");
+    let n_b: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_slug = 'page/b'")
+        .fetch_one(engine.get_db())
+        .await
+        .expect("count b");
+    assert!(n_a >= 2, "page/a chunks: {n_a}");
+    assert!(n_b >= 2, "page/b chunks: {n_b}");
+
+    // Request a high k so the raw ranker would surface multiple chunks per
+    // page if not for the cap.
+    let pooled = engine
+        .search_with_context("搜索测试", &Language::ZhHans, 6, false, 1)
+        .await
+        .expect("search pooled");
+    let mut per_page: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in &pooled {
+        *per_page.entry(c.page_slug.clone()).or_insert(0) += 1;
+    }
+    for (slug, n) in &per_page {
+        assert!(*n <= 1, "pooled result has {n} chunks from {slug}");
+    }
+
+    // With cap=0 (unlimited), expect more results from the same pages.
+    let unlimited = engine
+        .search_with_context("搜索测试", &Language::ZhHans, 6, false, 0)
+        .await
+        .expect("search unlimited");
+    assert!(
+        unlimited.len() >= pooled.len(),
+        "unlimited ({}) should return ≥ pooled ({})",
+        unlimited.len(),
+        pooled.len()
+    );
 }

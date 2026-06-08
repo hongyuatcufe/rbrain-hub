@@ -1171,9 +1171,12 @@ impl Engine {
         expand: bool,
         page_type: Option<&str>,
         tag: Option<&str>,
+        max_chunks_per_page: usize,
     ) -> Result<Vec<ChunkResult>> {
         if page_type.is_none() && tag.is_none() {
-            return self.search_with_context(query, lang, k, expand).await;
+            return self
+                .search_with_context(query, lang, k, expand, max_chunks_per_page)
+                .await;
         }
 
         // Run full hybrid search with extra headroom, then filter
@@ -1253,9 +1256,8 @@ impl Engine {
             .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
             .collect();
 
-        Ok(filtered
-            .into_iter()
-            .filter_map(|(id, score)| {
+        Ok(apply_page_cap(
+            filtered.into_iter().filter_map(|(id, score)| {
                 text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
                     chunk_id: id,
                     score,
@@ -1263,8 +1265,9 @@ impl Engine {
                     page_slug: slug.clone(),
                     page_type: pt.clone(),
                 })
-            })
-            .collect())
+            }),
+            max_chunks_per_page,
+        ))
     }
 
     pub async fn hybrid_search(
@@ -1747,6 +1750,7 @@ impl Engine {
         lang: &rbrain_core::page::Language,
         k: usize,
         expand: bool,
+        max_chunks_per_page: usize,
     ) -> Result<Vec<ChunkResult>> {
         let ranked = if expand {
             self.expanded_search(query, lang, k).await?
@@ -1762,12 +1766,8 @@ impl Engine {
             .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
             .collect();
 
-        // Per-page deduplication: cap at 2 chunks per source page so a single
-        // document cannot dominate the context window and crowd out other sources.
-        let mut page_chunk_count: HashMap<String, usize> = HashMap::new();
-        Ok(ranked
-            .into_iter()
-            .filter_map(|(id, score)| {
+        Ok(apply_page_cap(
+            ranked.into_iter().filter_map(|(id, score)| {
                 text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
                     chunk_id: id,
                     score,
@@ -1775,17 +1775,9 @@ impl Engine {
                     page_slug: slug.clone(),
                     page_type: pt.clone(),
                 })
-            })
-            .filter(|cr| {
-                let count = page_chunk_count.entry(cr.page_slug.clone()).or_insert(0);
-                if *count < 2 {
-                    *count += 1;
-                    true
-                } else {
-                    false
-                }
-            })
-            .collect())
+            }),
+            max_chunks_per_page,
+        ))
     }
 
     pub async fn backlinks(&self, slug: &str) -> Result<Vec<LinkRef>> {
@@ -2202,7 +2194,7 @@ impl Engine {
 
         let candidates = limit.saturating_mul(5).max(limit);
         let chunks: Vec<ChunkResult> = self
-            .search_with_context(topic, lang, candidates, expand)
+            .search_with_context(topic, lang, candidates, expand, MAX_POOL_DEFAULT)
             .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
@@ -2577,7 +2569,7 @@ impl Engine {
 
         let candidates = limit.saturating_mul(5).max(limit);
         let chunks: Vec<ChunkResult> = self
-            .search_with_context(topic, lang, candidates, expand)
+            .search_with_context(topic, lang, candidates, expand, MAX_POOL_DEFAULT)
             .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
@@ -5348,6 +5340,37 @@ pub(crate) fn slugify(s: &str) -> String {
         .join("-")
 }
 
+/// M3 Slice 4: page-level max-pooling. Caps the number of chunks per
+/// `page_slug` in a ranked result list. `max_chunks_per_page = 1` gives
+/// true max-pool semantics — only the highest-scoring chunk per page
+/// survives, maximising source diversity. `0` disables the cap.
+///
+/// The input iterator must already be sorted by descending score; this
+/// function preserves order and only filters.
+pub fn apply_page_cap(
+    iter: impl Iterator<Item = ChunkResult>,
+    max_chunks_per_page: usize,
+) -> Vec<ChunkResult> {
+    if max_chunks_per_page == 0 {
+        return iter.collect();
+    }
+    let mut page_chunk_count: HashMap<String, usize> = HashMap::new();
+    iter.filter(|cr| {
+        let count = page_chunk_count.entry(cr.page_slug.clone()).or_insert(0);
+        if *count < max_chunks_per_page {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    })
+    .collect()
+}
+
+/// Default per-page cap for `search_with_context` callers that want
+/// max-pool diversity (M3 Slice 4 / plan.md gap #3).
+pub const MAX_POOL_DEFAULT: usize = 1;
+
 fn json_value_to_items(value: serde_json::Value) -> Vec<serde_json::Value> {
     match value {
         serde_json::Value::Array(items) => items,
@@ -5490,5 +5513,81 @@ mod event_filter_tests {
 ";
 
         validate_synthesis_quality(content, 2).expect("compact cited synthesis should pass");
+    }
+}
+
+#[cfg(test)]
+mod max_pool_tests {
+    use super::{ChunkResult, apply_page_cap};
+
+    fn cr(chunk_id: i64, page_slug: &str, score: f64) -> ChunkResult {
+        ChunkResult {
+            chunk_id,
+            score,
+            text: String::new(),
+            page_slug: page_slug.to_string(),
+            page_type: "note".to_string(),
+        }
+    }
+
+    #[test]
+    fn max_pool_one_returns_single_chunk_per_page() {
+        let input = vec![
+            cr(1, "page/a", 0.9),
+            cr(2, "page/a", 0.85),
+            cr(3, "page/b", 0.8),
+            cr(4, "page/a", 0.75),
+            cr(5, "page/c", 0.7),
+        ];
+        let out = apply_page_cap(input.into_iter(), 1);
+        assert_eq!(out.len(), 3, "expected one chunk per distinct page");
+        let slugs: Vec<&str> = out.iter().map(|c| c.page_slug.as_str()).collect();
+        assert_eq!(slugs, vec!["page/a", "page/b", "page/c"]);
+        // Highest-score chunk per page survives — id 1 for page/a.
+        assert_eq!(out[0].chunk_id, 1);
+    }
+
+    #[test]
+    fn max_pool_two_keeps_top_two_per_page() {
+        let input = vec![
+            cr(1, "page/a", 0.9),
+            cr(2, "page/a", 0.85),
+            cr(3, "page/a", 0.8),
+            cr(4, "page/b", 0.75),
+        ];
+        let out = apply_page_cap(input.into_iter(), 2);
+        assert_eq!(out.len(), 3);
+        let ids: Vec<i64> = out.iter().map(|c| c.chunk_id).collect();
+        assert_eq!(ids, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn max_pool_zero_means_unlimited() {
+        let input = vec![
+            cr(1, "page/a", 0.9),
+            cr(2, "page/a", 0.85),
+            cr(3, "page/a", 0.8),
+            cr(4, "page/b", 0.75),
+        ];
+        let out = apply_page_cap(input.into_iter(), 0);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn max_pool_preserves_input_score_order() {
+        let input = vec![
+            cr(1, "page/b", 0.9),
+            cr(2, "page/a", 0.85),
+            cr(3, "page/c", 0.8),
+        ];
+        let out = apply_page_cap(input.into_iter(), 1);
+        let slugs: Vec<&str> = out.iter().map(|c| c.page_slug.as_str()).collect();
+        assert_eq!(slugs, vec!["page/b", "page/a", "page/c"]);
+    }
+
+    #[test]
+    fn max_pool_empty_input_yields_empty_output() {
+        let out = apply_page_cap(std::iter::empty(), 1);
+        assert!(out.is_empty());
     }
 }
