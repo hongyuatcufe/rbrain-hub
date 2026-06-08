@@ -5384,16 +5384,32 @@ impl Engine {
                             rc.title_fragment.as_deref().unwrap_or("")
                         );
                         let hits = self
-                            .search_with_context(&query, &lang, 5, false, 3)
+                            .search_with_context(&query, &lang, 10, false, 3)
                             .await
                             .unwrap_or_default();
-                        let top_hit = hits.first().filter(|h| h.score > 0.3);
+                        // RRF max score ≈ 1/61 ≈ 0.016; threshold 0.005 accepts rank ≤ ~200
+                        let top_hit = hits.first().filter(|h| h.score > 0.005);
                         if let Some(hit) = top_hit {
-                            let mv = meta_index
+                            // hit.page_slug may be a raw/articles/ page — try to resolve
+                            // to its pub_metadata via the same basename-matching strategy.
+                            let pm_slug_candidate = {
+                                let basename = hit.page_slug.rsplit('/').next().unwrap_or("");
+                                format!("research/pub_metadata/{}", basename)
+                            };
+                            let (resolved, mv) = if let Some(entry) = meta_index
                                 .iter()
-                                .find(|(_, _, s, _)| s == &hit.page_slug)
-                                .map(|(_, _, _, v)| v.clone());
-                            (Some(hit.page_slug.clone()), 0.5f32, mv)
+                                .find(|(_, _, s, _)| s == &pm_slug_candidate)
+                            {
+                                (pm_slug_candidate, Some(entry.3.clone()))
+                            } else {
+                                // Fallback: check if hit slug itself is in meta_index
+                                let direct = meta_index
+                                    .iter()
+                                    .find(|(_, _, s, _)| s == &hit.page_slug)
+                                    .map(|(_, _, _, v)| v.clone());
+                                (hit.page_slug.clone(), direct)
+                            };
+                            (Some(resolved), 0.5f32, mv)
                         } else {
                             (None, 0.0f32, None)
                         }
@@ -5590,17 +5606,20 @@ impl Engine {
             // Step 1f: content check (optional)
             let (content_status, supporting_chunks) = if check_content {
                 if let Some(ref src_slug) = resolved_slug {
-                    // Search within the resolved source page
+                    // Semantic search with wide k so we reliably catch chunks from
+                    // the target paper (with 55 papers ≈ 550 chunks, k=5 was too
+                    // small — most results got filtered out leaving source_chunks empty).
                     let hits = self
-                        .search_with_context(&claim_sentence, &lang, 5, false, 5)
+                        .search_with_context(&claim_sentence, &lang, 60, false, 8)
                         .await
                         .unwrap_or_default();
 
-                    // Filter hits to the resolved source slug
+                    // Keep only chunks that belong to the resolved source page.
                     let source_chunks: Vec<String> = hits
                         .into_iter()
                         .filter(|h| &h.page_slug == src_slug)
                         .map(|h| h.text)
+                        .take(5)
                         .collect();
 
                     if source_chunks.is_empty() {

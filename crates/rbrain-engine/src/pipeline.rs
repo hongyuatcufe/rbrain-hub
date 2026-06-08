@@ -357,24 +357,59 @@ pub fn sanitize_json_cjk_quotes(s: &str) -> String {
             | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
             | '\u{FF00}'..='\u{FFEF}' // Fullwidth forms
             | '\u{3400}'..='\u{4DBF}' // CJK Extension A
-            | '\u{20000}'..='\u{2A6DF}' // CJK Extension B (surrogate range)
+            | '\u{20000}'..='\u{2A6DF}' // CJK Extension B
         )
     }
 
     for i in 0..len {
         let ch = chars[i];
         if ch == '"' {
-            // Check neighbors
-            let prev_cjk = i > 0 && (is_cjk(chars[i - 1]) || "，。！？、；：）】」』".contains(chars[i - 1]));
-            let next_cjk = i + 1 < len && (is_cjk(chars[i + 1]) || "，。！？、；：（【「『".contains(chars[i + 1]));
-            if prev_cjk || next_cjk {
-                out.push('\'');
-                continue;
+            // Skip JSON-escaped quotes: if preceded by `\`, leave them alone.
+            let is_escaped = i > 0 && chars[i - 1] == '\\';
+            if !is_escaped {
+                let prev_cjk = i > 0
+                    && (is_cjk(chars[i - 1])
+                        || "，。！？、；：）】」』".contains(chars[i - 1]));
+                let next_cjk = i + 1 < len
+                    && (is_cjk(chars[i + 1])
+                        || "，。！？、；：（【「『".contains(chars[i + 1]));
+                if prev_cjk || next_cjk {
+                    out.push('\'');
+                    continue;
+                }
             }
         }
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_json_cjk_quotes;
+
+    #[test]
+    fn bare_quote_between_cjk_chars_replaced() {
+        // Bare " surrounded by CJK chars — the most common LLM failure mode
+        let input = "他说\u{0022}你好\u{0022}";  // 他说"你好"
+        let out = sanitize_json_cjk_quotes(input);
+        assert_eq!(out, "他说'你好'", "bare CJK-flanked quotes should become single quotes: {out}");
+    }
+
+    #[test]
+    fn escaped_quote_before_cjk_preserved() {
+        // \"你好\" is a valid JSON escape sequence — must NOT be touched
+        let input = r#"["他说\"你好\""]"#;
+        let out = sanitize_json_cjk_quotes(input);
+        assert!(out.contains(r#"\""#), "escaped quote before CJK must be preserved: {out}");
+    }
+
+    #[test]
+    fn latin_quotes_untouched() {
+        let input = r#"{"key": "value with \"quoted\" words"}"#;
+        let out = sanitize_json_cjk_quotes(input);
+        assert_eq!(out, input, "non-CJK context must not be modified");
+    }
 }
 
 // ─── Profile / Workflow TOML structures (Phase 4) ─────────────────────────────
