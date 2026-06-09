@@ -2,13 +2,17 @@
 
 This note records the code-review findings and roadmap for evolving rbrain-hub into the research memory and quality layer for a lightweight academic research agent stack.
 
-> **Status (2026-06-08)**: The top-level execution plan has been revised to v2; see `../rbrain-hub-execution-plan.md`. The gap analysis below remains authoritative as the *inventory* of rbrain-hub-side debt, but milestone sequencing now follows v2. The "Gap → Milestone mapping" and "Locked decisions" sections at the bottom are the source of truth for which work belongs in which milestone.
+> **Status (2026-06-10)**: M0–M3 全部上线（commit `8c98000`），105 测试全绿。下一阶段 M4+ 路线图已锁定，详见本文档底部 "M4+ 路线图：多租户 SaaS 学术研究记忆层" 章节。早期 gap analysis 仍作为 inventory 参考，但 milestone 顺序按 M4+ 路线图执行。
 >
 > **M0 + M1 shipped** in commit `0819ae6`: research_runs migration, evidence/research engine modules, 7 consolidated MCP tools, doctor sparse warn, `query --explain` v1, 9-test data_analysis fixture.
 >
-> **M2 shipped** in the follow-up commit: `ResearchEdge` vocabulary (12 edges), real graph-traversal `brain_evidence_check` returning `EvidenceChain`, new `brain_provenance_of(slug)` tool that enumerates one-hop research-edge adjacency only (filters out `references`/`mentions`/etc.), `SuggestedAction::RecordAnalysisPlan`, 8-test m2_provenance fixture.
+> **M2 shipped**: `ResearchEdge` vocabulary (12 edges), real graph-traversal `brain_evidence_check` returning `EvidenceChain`, new `brain_provenance_of(slug)` tool, `SuggestedAction::RecordAnalysisPlan`, 8-test m2_provenance fixture.
 >
-> **M3 in progress (2026-06-08)**: Literature review quality upgrade. Shipped so far: synthesis quality gates (citation coverage, section limit, thin-section rejection), synthesis retry with feedback injection, dual-model routing (flash for extract/simple, pro for synthesis/compose), compose stage timeout fix (600 s), min_sources pre-filter for LinkedSources anchors. Designed (not yet coded): `pub_metadata` extraction pipeline (`CnkiRefParser` + LLM auto-extract), compose-time pub_metadata injection (`inject_pub_metadata`), and post-hoc citation audit stage (`verify_citations`). See Tasks #32–#41.
+> **M3 shipped (commit `8c98000`)**: 5 个 slice 全部完成 — lit-review validators + synthesis quality core (S1)、`primary_source_ratio` + `bibliography_consistency` + snippet enrichment (S2)、`gap_analysis` + `contradiction` pipeline stages 与 validators (S3)、page-level max-pooling (S4)、token-budget aware context packing (S5)。新工具 `brain_verify_citations`（解耦 citation verification + `CnkiRefParser` + `pub_metadata` pipeline + 4 个 verify prompt 文件）。28 个 literature_validators fixture。
+>
+> **M3 后审查修复**（同 commit）：5 个 review-found issue 全部修复（CLAUDE.md 工具表同步、`primary_source_ratio` 的 N+1 SQL 改批量、`bibliography_consistency` SuggestedAction 字段误用、lit-review validator 注释更新、execution plan M3 ✅）。
+>
+> **下一阶段 M4+**：从单租户单语料 brain 演化为 **多用户多项目 SaaS 学术研究记忆层**，配合 ZeroClaw（admin 工作台）+ 新写轻量 agent runtime（用户端），支撑 200+ 期刊监控 + 学术观点推送 + 文献综述协助。详见本文档底部章节。
 
 ## Current assessment
 
@@ -572,3 +576,515 @@ Operational loop:
 7. ZeroClaw revises or reruns work if rbrain reports gaps.
 8. rbrain stores the final research memo and links it to all supporting evidence.
 ```
+
+---
+
+
+---
+
+# M4+ 路线图：多租户 SaaS 学术研究记忆层
+
+本章节是 2026-06-10 批准的新路线图全文。本地工作的 plan 文件副本在 `.claude/plans/zeroclaw-rbrain-hub-codex-fancy-dolphin.md`（不入 git）；以下内容是同一文档的完整版本，托管在仓库里以便跨机器共享、对齐 codex / Claude Code / 团队成员。
+
+## Context
+
+M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator 体系、provenance 图、文献综述质量门、引文验证工具。105 个测试全绿。
+
+**rbrain-hub 当前定位**：单租户单语料的研究记忆层，假设"一个 brain = 一个研究员 = 一个语料"。
+
+**下一个产品形态**：把 rbrain-hub 升级成**多用户多项目的学术研究记忆层**，配合两个 agent 端（ZeroClaw 当 admin 后台、新写的轻量 agent runtime 给 SaaS 用户），支撑一个监控 200+ 期刊、给研究员推送学术观点、协助文献综述的产品。
+
+## 锁定的设计决策（按讨论顺序）
+
+1. **存储不迁 Postgres**：SQLite + WAL 足够支撑 200 期刊 × 几百用户。等真出现并发瓶颈再独立 milestone 评估迁移。
+2. **`projects` 表是一等公民**：一个 project = 多个 research_run（lit_review + data_analysis 可共存）。
+3. **数据分两层 tenancy**：
+   - 源数据 `raw|note`：可以是 `user_id='global'`（期刊）或 `(user_id, project_id)`（用户笔记）。
+   - 派生物 `concept|synthesis|wiki|gap_analysis|contradiction_note|finding|limitation|memo|draft`：**强制 `(user_id, project_id)`**，**没有 global 派生物**（避免英文期刊概念污染中国语境项目）。
+4. **项目源范围 = 主题订阅**：项目声明 topic/keyword。Ingestion 给文章打 topic 标签。dream cycle 只读 "用户自己笔记 + 匹配 topic 的全局期刊"。
+5. **保留项目文件夹模型**：`/users/{user}/{project}/` 仍是 markdown 文件夹，`rbrain sync` / `rbrain export` 在文件夹 ↔ 单 DB 之间双向同步。
+6. **三层 tenant 模型**：
+   - `user_id='global'`：pipeline 写入，所有用户按 topic 订阅可读
+   - `user_id='admin'`：ZeroClaw 管理员写入，admin 自己 + 通过 publish/push 对用户可见
+   - `user_id=<user>`：用户自己写入，互不可见
+7. **ZeroClaw 是 admin/平台运营工作台**，**不是对外的 user agent**：
+   - 跑 pipeline（期刊抓取、topic 标签、定期 topic_digest 生成）
+   - 编辑工作（编辑推荐、topic 分类维护）
+   - 平台数据分析（匿名聚合）
+   - **永远不直写**用户 project 内容，所有对用户的影响走 push/subscribe
+8. **对外 SaaS agent runtime 重新写**（不 fork ZeroClaw 的 gateway）。多租户从 day 1 支持，每个 session 带 `(user_id, project_id)`。
+9. **研究日志层（个人空间）**：加 `daily|meeting|person|idea|reading` page types，**`user_id` 绑定、`project_id=NULL`**，dream cycle 默认不消费（避免污染项目语境），用户可显式挂载到 project（建 `inspired_by` / `discussed_in` 边）。
+10. **学术观点推送 = topic_digest 两层架构**：
+    - **Layer 1（ZeroClaw 跑）**：周期性给每个活跃 topic 生成 `topic_digest`（复用 M3 lit_review profile，迷你配置），落到 global 空间。每 topic 一份，订阅者共享。
+    - **Layer 2（agent runtime 跑）**：用户访问时读 project state + 近期 topic_digest，做轻量个性化排序，写 push_inbox。
+11. **push_inbox 是用户和 admin/pipeline 之间唯一的通道**：所有推送都 opt-in，**永远不直接改用户内容**。
+
+---
+
+## M4 — 多租户基础 + 三层 tenant + 项目文件夹
+
+### 4.1 Schema 改造（migration 0014–0020）
+
+- **0014_tenancy_columns.sql**
+  ```sql
+  ALTER TABLE pages         ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE pages         ADD COLUMN project_id TEXT;
+  -- 同上为 chunks / links / page_stats / jobs
+  ```
+  - `user_id='default'` 是迁移兼容值；新数据强制非空且非 default
+  - 所有索引重建为 `(user_id, ...)` 前缀
+  - 保留 `user_id='global'` / `'admin'` 作为系统专用 tenant
+
+- **0015_projects.sql**
+  ```sql
+  CREATE TABLE projects (
+      id TEXT PRIMARY KEY,
+      slug TEXT NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('active','archived','complete')) DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(owner_user_id, slug)
+  ) STRICT;
+  ```
+
+- **0016_project_topics.sql** — 项目订阅哪些 topic
+  ```sql
+  CREATE TABLE project_topics (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      topic TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1.0,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, topic)
+  ) STRICT;
+  ```
+
+- **0017_page_topics.sql** — 文章被打的 topic 标签
+  ```sql
+  CREATE TABLE page_topics (
+      page_slug TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      confidence REAL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(user_id, page_slug, topic)
+  ) STRICT;
+  CREATE INDEX idx_page_topics_topic ON page_topics(topic, user_id);
+  ```
+
+- **0018_research_runs_project.sql**
+  ```sql
+  ALTER TABLE research_runs ADD COLUMN project_id TEXT NOT NULL DEFAULT 'unassigned';
+  ```
+
+- **0019_push_inbox.sql**
+  ```sql
+  CREATE TABLE push_inbox (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      source_slug TEXT NOT NULL,
+      source_user_id TEXT NOT NULL,
+      push_kind TEXT NOT NULL CHECK(push_kind IN (
+          'subscription','agent_recommendation','editorial','topic_digest'
+      )),
+      reason TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending','accepted','dismissed')) DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      actioned_at TEXT
+  ) STRICT;
+  CREATE INDEX idx_push_inbox_user ON push_inbox(user_id, project_id, status, created_at DESC);
+  ```
+
+- **0020_topic_digests.sql**
+  ```sql
+  CREATE TABLE topic_digests (
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      page_slug TEXT NOT NULL,           -- 对应 global 空间里的 page
+      source_count INTEGER NOT NULL,
+      generated_at TEXT NOT NULL,
+      UNIQUE(topic, period_start, period_end)
+  ) STRICT;
+  ```
+
+### 4.2 Engine — TenantContext
+
+新模块 `crates/rbrain-engine/src/research/tenant.rs`：
+
+```rust
+#[derive(Debug, Clone)]
+pub struct TenantContext {
+    pub user_id: String,
+    pub project_id: Option<String>,
+}
+
+impl TenantContext {
+    pub fn global() -> Self { ... }
+    pub fn admin() -> Self { ... }
+    pub fn for_user(user_id: &str, project_id: Option<&str>) -> Self { ... }
+    /// 检索时可见的 user_id 池：自己 + 'global'（不含 'admin' 除非显式订阅）
+    pub fn readable_user_ids(&self) -> Vec<&str> { ... }
+    pub fn is_admin(&self) -> bool { ... }
+}
+```
+
+所有 Engine query 函数加 `&TenantContext` 参数。主要改造（按文件）：
+
+- `crates/rbrain-engine/src/engine.rs` — `put_page` / `get_page` / `list_pages` / `keyword_search` / `vector_search` / `hybrid_search` / `expanded_search` / `add_link` / `outlinks` / `backlinks` / `graph_query` 全部加 tenant 上下文 + WHERE 子句改写
+- `crates/rbrain-engine/src/evidence/validators.rs` — 所有 lit-review validator 改 `(user_id, project_id)` 切片，去掉现在的全库扫描（关掉 M3 留下的 B3）
+- `crates/rbrain-engine/src/evidence/{provenance,evidence_walk}.rs` — 加 tenant scope
+- `crates/rbrain-engine/src/pipeline.rs` — `InputSpec::SelfContent` / `AggregateContent` / `LinkedSources` 加 tenant filter。dream cycle 绑定到 `(user_id, project_id)`，源集计算：
+  ```sql
+  -- 项目可见源数据 = 自己 + topic 匹配的 global
+  SELECT * FROM pages p
+  WHERE p.page_type IN ('note', 'raw')
+    AND (
+        (p.user_id = :user_id AND p.project_id = :project_id)
+        OR (p.user_id = 'global' AND EXISTS (
+              SELECT 1 FROM page_topics pt
+              JOIN project_topics ppt ON ppt.topic = pt.topic
+              WHERE pt.page_slug = p.slug
+                AND pt.user_id = 'global'
+                AND ppt.project_id = :project_id
+        ))
+    )
+  ```
+
+### 4.3 Research 模块扩展
+
+- 新模块 `crates/rbrain-engine/src/research/projects.rs`：
+  - `Project` struct
+  - `ProjectStore::create / get / find_by_slug / list_by_user / set_status / set_topics`
+- `ResearchRunStore::create` 加 `project_id` 必填参数
+
+### 4.4 MCP 工具改造
+
+**新工具（项目管理）**：
+
+| 工具 | 作用 |
+|---|---|
+| `brain_create_project` | `{ slug, title, description?, topics: [...] }` → `project_id` |
+| `brain_list_projects` | `{}` → 当前 user 的所有 project |
+| `brain_get_project` | `{ project_id }` → 详情 + topics + 关联 run |
+| `brain_archive_project` | `{ project_id }` |
+| `brain_set_project_topics` | `{ project_id, topics: [...] }` |
+
+**新工具（push inbox）**：
+
+| 工具 | 作用 |
+|---|---|
+| `brain_list_inbox` | `{ project_id?, status? }` → 用户的待办推送 |
+| `brain_accept_push` | `{ push_id }` → 在 project 里建引用边，标记 accepted |
+| `brain_dismiss_push` | `{ push_id }` |
+
+**修改既有工具**：
+
+- `brain_create_research_run` 加必填 `project_id` 参数
+- 所有 read 类工具（`brain_query` / `brain_get` / `brain_list` / `brain_graph` / `brain_think` / `brain_citation_check` / `brain_evidence_check` / `brain_provenance_of` / `brain_verify_citations`）从调用上下文取 `user_id` 和 `project_id`（不在参数里暴露，避免客户端伪造）
+
+**Tenant 注入**：M4 阶段先做 dev-mode（环境变量 / config 读默认 user/project）。完整 auth 在 M10 production gateway 做。
+
+### 4.5 CLI 改造
+
+- 新增 `rbrain project create/list/show/archive/set-topics`
+- 既有命令加上下文参数：`rbrain --user-id alice --project-id phd-dissertation <cmd>`
+- 默认 context：`rbrain context set ...` 写到 `.rbrain/context.toml`，后续命令默认读
+
+### 4.6 文件夹 ↔ 单 DB 双向同步
+
+```
+/users/
+└── alice/
+    └── phd-dissertation/
+        ├── research/
+        │   ├── findings/*.md
+        │   ├── synthesis/*.md
+        │   └── runs/*.md
+        ├── notes/*.md
+        ├── .rbrain/
+        │   └── context.toml          ← (user_id, project_id) 绑定
+        └── README.md
+```
+
+- 单 DB 在 `~/.rbrain/global.db`（或服务端的 data 目录）
+- `rbrain sync /users/alice/phd-dissertation` → 读 context → 扫 markdown → 写共享 DB（带 tenant 标签）
+- `rbrain export /users/alice/phd-dissertation` → DB 中筛选该 tenant 行 → 写 markdown
+
+### 4.7 测试 / fixture
+
+- 现有 105 测试改造：默认 `TenantContext::for_user("default", Some("test"))`，向后兼容
+- 新增 `multi_tenant_fixture`：2 user × 2 project × 5 global page，验证：
+  - 用户互相不可见
+  - 同用户跨 project 派生物不可见
+  - global raw 按 topic 订阅对项目可见
+  - dream cycle source set 严格按 topic 过滤
+  - cross-tenant citation 被拒绝
+- 新增 `project_lifecycle_fixture`：create → list → archive → restore
+- 新增 `push_inbox_fixture`：写 push → list → accept（建引用边）/ dismiss
+
+### 4.8 关键文件清单（M4）
+
+| 文件 | 工作 |
+|---|---|
+| `migrations/0014–0020_*.sql` | 7 个新 migration |
+| `crates/rbrain-engine/src/research/tenant.rs` | 新增 |
+| `crates/rbrain-engine/src/research/projects.rs` | 新增 |
+| `crates/rbrain-engine/src/research/push_inbox.rs` | 新增 |
+| `crates/rbrain-engine/src/research/topic_digests.rs` | 新增（store 部分，generator 在 M5） |
+| `crates/rbrain-engine/src/research/mod.rs` | 导出新模块 |
+| `crates/rbrain-engine/src/research/store.rs` | `ResearchRunStore::create` 加 project_id |
+| `crates/rbrain-engine/src/engine.rs` | 所有 query 加 `&TenantContext` |
+| `crates/rbrain-engine/src/evidence/validators.rs` | tenant scope + 删 B3 stale comment |
+| `crates/rbrain-engine/src/evidence/{provenance,evidence_walk}.rs` | tenant scope |
+| `crates/rbrain-engine/src/pipeline.rs` | InputSpec topic-aware source set |
+| `crates/rbrain-mcp/src/lib.rs` | 7 新工具 + 既有工具改写 |
+| `crates/rbrain-cli/src/main.rs` | `project` 子命令 + context 注入 |
+| `crates/rbrain-engine/tests/multi_tenant_fixture.rs` | 新 fixture |
+| `crates/rbrain-engine/tests/project_lifecycle_fixture.rs` | 新 fixture |
+| `crates/rbrain-engine/tests/push_inbox_fixture.rs` | 新 fixture |
+| `CLAUDE.md`（仓库根 + rbrain-hub） | 同步 tenancy 设计、三层模型、push 规则 |
+| `rbrain-hub-execution-plan.md` | M4 ✅ + 后续 milestone 重排 |
+
+**复用（CLAUDE.md §7）**：
+
+- `Engine::add_link` 不动签名，sqlx 加 tenant 检查防跨 tenant 建边
+- `extract_links` / `audit_citations` / `brain_verify_citations` 不动核心算法
+- `ResearchEdge` 12 个边类型不变；M4.5 加新边
+
+---
+
+## M4.5（小） — 研究日志层（简化版 gbrain）
+
+### 4.5.1 新 page types
+
+- `daily` — 日记，slug 模板 `daily/YYYY-MM-DD`
+- `meeting` — 会议笔记
+- `person` — 研究人员/合作者档案
+- `idea` — 想法卡片
+- `reading` — 文献阅读笔记（轻量版，非 finding）
+
+### 4.5.2 新 edge types（个人空间 → 项目桥）
+
+- `inspired_by` — finding/synthesis 指向 idea 或 reading
+- `discussed_in` — finding 指向 meeting
+
+更新 `crates/rbrain-engine/src/research/edges.rs` 的 `ResearchEdge` 枚举从 12 → 14。
+
+### 4.5.3 Tenancy 规则
+
+- 上述 5 个 page types 强制 `user_id` 非空，`project_id` 可空（默认 NULL = 个人空间）
+- Dream cycle **默认不读这层**（避免污染项目语境）
+- `brain_query` / `brain_think` 接受 `include_personal: bool` 参数（默认 false），true 时把个人空间纳入检索结果
+- 用户显式建 `inspired_by` / `discussed_in` 边时，那个 reading/idea/meeting 算作 project 源的一部分（"显式同意纳入"）
+
+### 4.5.4 新 MCP 工具
+
+- `brain_record_personal(kind, slug, title, content)` — 个人空间写入（kind ∈ daily/meeting/person/idea/reading）
+- `brain_link_to_project(personal_slug, project_id, edge_type)` — 显式把个人 page 挂到 project
+
+### 4.5.5 工作量
+
+约相当于 M4 的 1/3。可以跟 M4 合并在一个 sprint。
+
+---
+
+## M5 — 期刊 Ingestion + Topic 标签 + Topic Digest 周报生成
+
+### 5.1 期刊抓取
+
+- 新 crate `crates/rbrain-ingestion/`（或在现有 worker 里加 module）
+- 支持的来源：RSS、CrossRef API、CNKI（如有 API）、GScholar（爬虫，谨慎）
+- 每个期刊配一个 source descriptor（YAML 配置）
+- 输出：`raw` page，slug 形如 `raw/articles/{journal}/{year}/{slug}`，`user_id='global'`
+
+### 5.2 Topic 标签（M5 阶段用关键词规则；后续可升级 LLM）
+
+- 配置文件 `~/.rbrain/topics.yaml`：
+  ```yaml
+  topics:
+    - id: china_basic_education
+      label: "中国基础教育"
+      keywords: ["基础教育", "义务教育", "中小学"]
+      regions: ["china"]
+    - id: education_equity
+      label: "教育公平"
+      keywords: ["教育公平", "教育均衡", "educational equity"]
+  ```
+- Ingestion worker 拉到新文章后跑 topic tagger：
+  - 阶段 1（M5）：关键词匹配，置信度按 keyword 命中数
+  - 阶段 2（后续）：换成 LLM 分类器
+- 输出写入 `page_topics` 表
+
+### 5.3 Topic Digest 周报生成
+
+- ZeroClaw cron job（每周三 03:00）：
+  1. 扫所有有订阅者的 topic（`project_topics` 表的 distinct topic）
+  2. 对每个 topic：调 `brain_generate_topic_digest(topic, period_start, period_end)`
+  3. 该工具内部跑一次 mini lit_review profile（max_pages=20, min_sources=3），输出一个 `topic_digest` 类型的 page 到 global
+  4. 写入 `topic_digests` 表登记
+  5. fan-out：对每个订阅该 topic 的 project 写一条 `push_inbox` 记录（push_kind='topic_digest'）
+
+### 5.4 新 MCP 工具
+
+- `brain_generate_topic_digest(topic, period_start, period_end)` — ZeroClaw 调用
+- `brain_list_topic_digests(topic, limit)` — 列出某 topic 的近期 digest
+- `brain_publish_editorial(topic, content)` — admin 写编辑推荐，自动 push 到订阅者
+
+### 5.5 ZeroClaw 编排
+
+- ZeroClaw 加一个 `rbrain-pipeline` skill / cron 模板
+- 调度任务：每日 ingestion、每周 topic_digest、月度 cleanup
+- 失败重试、监控告警
+
+---
+
+## M6 — Citation Accuracy 强化
+
+- `brain_verify_citations` 误报分析：建一个 fixture（10 篇有人工标注 ground truth 的文档），跑当前 verify，统计 FP/FN
+- 新增非 CNKI bib parser：
+  - APA 7th edition
+  - GB/T 7714（中国国标）
+  - JCR / Vancouver
+- 跨语言匹配（同一作者中英文名变体）
+- Hallucination 检测：cite 了不存在于语料的文章 → 标 `bib_missing` / `bib_fabricated`
+- 增强 `synthesis_sections_have_citations` 的 thin-citation 检测
+
+工作量：~M3 的 1/2。
+
+---
+
+## M7 — Generality 完整化（非 lit_review 研究方法）
+
+- `data_analysis` 做到 M3 深度：
+  - 加 validator：`script_registered_for_result`、`codebook_exists_or_exempted`、`numeric_claim_has_result_reference`（基于 finding frontmatter 的结构化 claims 数组）
+  - 加 fixture `data_analysis_deep_fixture`
+- `mixed_methods` / `theory_building` 实质化：
+  - 它们目前共用 `(analysis_plan, artifact_hash, finding_supports)` 三个 validator —— 太少
+  - 加 method-specific validator
+- 评估是否引入新 TaskType：
+  - `systematic_review`（PRISMA 流程）
+  - `case_study`（个案研究）
+  - `qualitative_coding`（质性编码）
+
+最终交付：所有 4–7 个 TaskType 都有对应深度的 validator + fixture。
+
+---
+
+## M8 — Retrieval Observability（原 M4 计划）
+
+- `rbrain search diagnose "<query>" --target <slug>` — 找出某 slug 为何没被检索到
+- Title / alias boost：题目命中给检索打分加权
+- Query cache 命中报告：`--explain` 输出命中信息
+- Sparse fallback 实现（若 LanceDB Rust SDK 仍无 sparse ANN）
+
+---
+
+## M9 — Durable Run Records（原 M5 计划）
+
+- `artifacts` 表 + `stage_runs` 表
+- Pipeline 每个 stage 的输入/输出指纹
+- Fingerprint 增量：只在 fingerprint 变了的时候重跑
+
+---
+
+## M10 — Lightweight Agent Runtime + Personalization
+
+**新写**一个对外的 SaaS agent runtime（Rust + Axum），不 fork ZeroClaw。
+
+### 10.1 Runtime 形态
+
+- Rust + Axum HTTP/SSE 服务
+- 每个 user session 由 auth token 解出 `(user_id, project_id)`
+- 工具调用：loopback 调 rbrain 的 MCP（不走网络）
+- Session state 存 rbrain DB（新增 `agent_sessions` 表）
+- LLM 调用走 rbrain `jobs` 表的 worker pool
+
+### 10.2 Layer 2 个性化推荐
+
+- 后台 worker：用户打开 project 时触发或周期触发
+- 流程：
+  1. 读 project 的 synthesis + findings 摘要
+  2. 读近期匹配 topic 的 `topic_digest` 列表
+  3. 一次 LLM 调用：基于 project state 排序"哪些 digest / 文章对该 project 最相关"
+  4. 写 push_inbox（push_kind='agent_recommendation'）
+
+### 10.3 ZeroClaw 角色
+
+- 不参与 SaaS 用户的 agent 会话
+- 留作：admin 工作台、个人 agent（团队成员自用）
+- ZeroClaw 通过 `user_id='admin'` context 调 rbrain MCP
+
+### 10.4 Auth / 部署
+
+- 简单 token-based auth（M10 v1）
+- Postgres 迁移评估（若 SQLite 真的撞天花板）
+- pgbouncer / 连池
+- Postgres + pgvector + `pg_search`（保留 Tantivy 质量）的 spike
+
+---
+
+## 验证 / 出 M4+M4.5 的判定标准
+
+1. `cargo test -p rbrain-engine --lib` 全绿（≥ 59 + 新加的 tenant/project/push/personal 单测）
+2. `cargo test -p rbrain-engine --test multi_tenant_fixture` 全绿
+3. `cargo test -p rbrain-engine --test project_lifecycle_fixture` 全绿
+4. `cargo test -p rbrain-engine --test push_inbox_fixture` 全绿
+5. 既有 `data_analysis_fixture` / `m2_provenance_fixture` / `literature_validators_fixture` 改造后**仍全绿**
+6. 手动端到端：
+   - 建 2 user × 2 project，跑 `rbrain sync` 各自 markdown
+   - 在 project A 跑 `dream --profile literature_review`，确认产出 concept/synthesis 只用 project A 的源 + 匹配 topic 的 global
+   - 在 project B 看不到 project A 的派生物
+   - 用 admin 身份调 `brain_publish_editorial`，验证推送到订阅 topic 的所有 project 的 inbox
+   - 用户 accept push，验证在 user project 里建了 `cites` 边
+   - `brain_provenance_of` 不跨 tenant 返回边
+7. `cargo check --workspace` 无 error
+8. CLAUDE.md 三处同步：MCP 工具表、tenancy 规约、push 规则、个人空间规约
+
+## 输出 M4 + M4.5 后仓库长什么样
+
+- ~130 个测试全绿（59 lib + 4 fixture × 平均 12 测试）
+- ~32 个 MCP 工具（原 22 + 10 新）
+- 20 条 migration（原 13 + 7 新）
+- 一个新文档：`docs/tenancy-model.md` 解释三层 tenant、源集计算、push 机制
+- 一个新文档：`docs/personal-space.md` 解释研究日志层和与项目的交互规则
+
+## 不在 M4 / M4.5 范围（避免范围爆炸）
+
+- Postgres 迁移（M10 视情况）
+- 期刊抓取流水线（M5）
+- ZeroClaw 编排集成（M5）
+- LLM-based topic 打标签（M5，先用关键词规则）
+- HTTP/SSE gateway + auth（M10）
+- 轻量 agent runtime（M10）
+- 个性化推荐 Layer 2（M10）
+- 跨项目 admin 视图 / 分析（暂不需要）
+- `brain_verify_citations` 精度优化（M6）
+
+## 路线图全景
+
+| Milestone | 范围 | 依赖 | 工作量估算 |
+|---|---|---|---|
+| **M4** | 多租户基础 + projects + push_inbox + topic_digests schema | M3 | 3-4 周 |
+| **M4.5** | 研究日志层（daily/meeting/person/idea/reading） | M4 | 1 周 |
+| **M5** | 期刊 ingestion + topic 标签 + topic_digest 周报生成 + ZeroClaw 编排 | M4 | 3-4 周 |
+| **M6** | Citation accuracy 强化 | M3, M4 | 2 周 |
+| **M7** | 非 lit_review TaskType 完整化 | M4 | 3 周 |
+| **M8** | Retrieval observability | M0 | 2 周 |
+| **M9** | Durable run records / fingerprint 增量 | M4, M7 | 2 周 |
+| **M10** | Lightweight agent runtime + personalization + production deployment | M4–M9 | 4-6 周 |
+
+总估算：**5-6 个月**到产品 MVP 上线（含基础 SaaS 多租户 + 期刊监控 + 文献综述 + 推送 + 个性化推荐）。
+
+## Non-goals（贯穿所有 milestone）
+
+1. rbrain 不执行任意生成的 Python/R/SQL
+2. rbrain 不复制 ZeroClaw 的 shell/browser/file/审批/sandbox
+3. ZeroClaw 永远不直写用户 project 内容
+4. rbrain 生成的草稿默认不是终稿（用户主动 publish 才算）
+5. 个人空间内容默认不进 dream cycle（避免污染项目语境）
+6. 跨用户 / 跨项目内容隔离严格，任何 leak 是 hard fail

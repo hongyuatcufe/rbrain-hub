@@ -7,6 +7,68 @@
 
 rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服务端和可编程 LLM pipeline。
 
+当前定位正在从 **单租户单语料的学术研究记忆层** 演进为 **多用户多项目的 SaaS 学术研究记忆层**，目标产品是 200+ 期刊监控 + 智能体推送学术观点 + 协助文献综述。详见 `plan.md` 的 M4+ 路线图。
+
+---
+
+## 2026-06-10 — M3 收尾 + M4+ 多租户路线图锁定
+
+### M0–M3 全部上线（截至 commit `8c98000`）
+
+- **M0**：sparse 降级 doctor 告警、`query --explain` v1、`brain_citation_check` 复用 `rbrain audit`。
+- **M1**：`research_runs` 表（migration `0013`）+ 5 个核心 MCP 工具 + 3 个 validator + protocol state machine。9 个 data_analysis fixture。
+- **M2**：`ResearchEdge` 词表（12 edges）+ 真实图遍历 `brain_evidence_check`（返回 `EvidenceChain`）+ 新工具 `brain_provenance_of`。8 个 m2_provenance fixture。
+- **M3**：5 个 slice 全部完成 — lit-review validators、synthesis quality core、`primary_source_ratio` / `bibliography_consistency` / snippet enrichment、`gap_analysis` + `contradiction` pipeline stages、page-level max-pooling、token-budget-aware context packing。新工具 `brain_verify_citations`（解耦 citation verification + CnkiRefParser + pub_metadata pipeline）。28 个 literature_validators fixture。
+- **M3 后审查修复（commit `8c98000`）**：5 个 review-found issue
+  - B1 CLAUDE.md 加 `brain_verify_citations` 同步条目
+  - B2 `primary_source_ratio` N+1 SQL → 批量 IN-clause
+  - B3 lit-review validator 全库扫的注释从 "M3 Slice 3 will do" 改为 "M5 deferred"
+  - B4 `bibliography_consistency` 不再把错误消息塞进 `chunk_ref` 字段
+  - B5 执行计划 M3 标 ✅ + 列出 5 个 slice
+
+**测试状态**：105 个测试全绿
+- `rbrain-engine --lib`：59/59
+- `data_analysis_fixture`：10/10
+- `m2_provenance_fixture`：8/8
+- `literature_validators_fixture`：28/28
+- 仅 2 个 pre-existing `integration::test_dream_cycle_flow` 类 failure（与 M0–M3 无关，依赖真实 DeepSeek API）
+
+### M4+ 路线图（新批准 — 见 plan.md "M4+ 路线图" 章节）
+
+产品形态升级：从单租户 brain 升级到多租户 SaaS 学术研究记忆层。
+
+**11 条锁定决策**：
+1. 不迁 Postgres，SQLite + tenant_id 列足够支撑 200 期刊 × 几百用户
+2. `projects` 表是一等公民（一个 project = 多个 research_run）
+3. 数据分两层 tenancy：源数据可 global / 派生物强制 per-project（避免英文期刊概念污染中国语境）
+4. 项目源范围 = topic 订阅（ingestion 给文章打 topic 标签，dream cycle 按订阅过滤）
+5. 保留项目文件夹模型，markdown 是 source of truth，单 DB 是派生索引
+6. 三层 tenant：`global`（pipeline 写）/ `admin`（ZeroClaw 写）/ `<user>`（用户写）
+7. ZeroClaw 是 admin/平台工作台，**不是对外 user agent**，永远不直写用户内容
+8. 对外 SaaS agent runtime **新写**（不 fork ZeroClaw gateway）
+9. 研究日志层（`daily/meeting/person/idea/reading`）个人空间，默认不进 dream cycle
+10. 学术观点推送 = 两层架构：Layer 1 topic_digest（ZeroClaw 周期生成，每 topic 一份共享）+ Layer 2 个性化排序（agent runtime 用户态跑）
+11. `push_inbox` 是 admin/pipeline → 用户的唯一通道，opt-in，绝不直接改用户内容
+
+**8 个 milestone 规划**：
+
+| Milestone | 范围 | 工作量 |
+|---|---|---|
+| M4 | 多租户基础 + projects + push_inbox + topic_digests schema | 3-4 周 |
+| M4.5 | 研究日志层（个人空间 5 个 page type + 2 个 edge） | 1 周 |
+| M5 | 期刊 ingestion + topic 标签 + topic_digest 周报生成 + ZeroClaw 编排 | 3-4 周 |
+| M6 | Citation accuracy 强化（多 bib parser、跨语言匹配、hallucination 检测） | 2 周 |
+| M7 | 非 lit_review TaskType 完整化（data_analysis 做深、mixed_methods/theory_building 实质化） | 3 周 |
+| M8 | Retrieval observability（`search diagnose`、title boost、cache 命中报告、sparse fallback） | 2 周 |
+| M9 | Durable run records（artifacts 表、stage_runs 表、fingerprint 增量） | 2 周 |
+| M10 | Lightweight agent runtime + Layer 2 个性化 + production deployment | 4-6 周 |
+
+总估算 5-6 个月到 MVP。
+
+### 下一步：M4 启动
+
+M4 涉及 7 个新 migration、新增 4 个 research 模块（tenant/projects/push_inbox/topic_digests）、所有 Engine query 加 `&TenantContext`、所有 lit-review validator 改 tenant scope、7 个新 MCP 工具、3 个新 fixture。文档同步包括 CLAUDE.md（仓库根 + rbrain-hub）和 `rbrain-hub-execution-plan.md`。
+
 ---
 
 ## 2026-06-08 — Compose 超时修复、embedding 去重实验与引用矫正模块设计
