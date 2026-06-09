@@ -27,7 +27,7 @@
 
 ## 2. 当前 milestone
 
-**已完成**：M0 + M1 + M2。**下一步**：M3 文献综述质量升级。详见 `rbrain-hub-execution-plan.md` 的"实施顺序"章节。
+**已完成**：M0 + M1 + M2 + M3。**下一步**：M4 检索可解释/可诊断（`search diagnose`、title/alias boost、query cache 命中报告）。详见 `rbrain-hub-execution-plan.md` 的"实施顺序"章节。
 
 提交代码前请确认你的改动归属于哪个 milestone；偏离 milestone 的工作请先开 issue 或更新计划。
 
@@ -47,12 +47,15 @@ M1 工具表已锁定为 5–6 个合并工具，**禁止**新增独立的 `brai
 | `brain_citation_check` | — |
 | `brain_evidence_check` | — |
 | `brain_provenance_of` | — (M2) |
+| `brain_verify_citations` | — (M3) |
 
 新工具采用 `kind` 判别 union + oneOf payload schema。新增 kind 优先于新增工具。
 
 `brain_evidence_check` 返回 `EvidenceChain { direct_support, datasets, scripts, literature_sources }`，支持 data_analysis (supports → artifact → derived_from → dataset) 与 literature_review (cites/supports → note|raw) 两种 finding 形态。
 
 `brain_provenance_of(slug)` 一跳枚举研究图邻接边（受白名单约束的 12 个 research edge：derived_from / computed_by / uses_dataset / uses_method / uses_variable / supports / contradicts / produces / cites / tests_hypothesis / validates / limits），返回 `{ page_type, edges: [{ edge_type, neighbour_slug, neighbour_page_type, incoming }] }`。非研究边（references/mentions/related 等）被过滤；完整 finding 证据链由 `brain_evidence_check` 返回。
+
+`brain_verify_citations(slug, content?, check_content?, hints?)` 给定文档 slug（或直接传 `content` 字符串）+ 可选的 `CitationHint[]`（author/year/title_fragment），抽取每条引用、按 `pub_metadata` 或语义检索解析出原文 slug、并核对作者/年份/期刊。`check_content=true` 还会让 LLM 判定原文是否实际支持该 claim。返回 `DocCitationReport { citations[], summary { total, resolved, bib_error, bib_warn, ... } }`。
 
 ---
 

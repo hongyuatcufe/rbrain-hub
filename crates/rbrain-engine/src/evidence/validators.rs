@@ -308,13 +308,18 @@ pub async fn finding_has_dataset_lineage(
     Ok(ValidatorResult::pass("finding_has_dataset_lineage"))
 }
 
-// ─── Literature-review validators (M3 Slice 1) ────────────────────────────────
+// ─── Literature-review validators (M3) ────────────────────────────────────────
 //
-// These scan globally because the literature_review pipeline does not yet
-// link its outputs (synthesis / wiki) back to the originating research_run
-// via `produces` edges. The `_run_slug` parameter is kept for API symmetry
-// with the data-analysis validators and will be honored once Slice 3 wires
-// the pipeline to emit `produces` edges.
+// These scan globally rather than per-run because the literature_review
+// pipeline does not emit `research_run --produces--> synthesis|wiki|gap_analysis`
+// edges. Per-run scoping is deferred to M5 (durable run records + stage_runs);
+// the `_run_slug` parameter is kept for API symmetry with the data-analysis
+// validators so the MCP dispatcher can call all validators with one signature.
+//
+// Implication for tests / repeat runs: in a brain that has run multiple
+// literature_review profiles, these validators see the union of all
+// synthesis/wiki/gap_analysis pages. That's acceptable today (one brain =
+// one corpus = one review topic) but will need per-run scoping before M5.
 
 const LITERATURE_MIN_SOURCE_COUNT: i64 = 3;
 const SYNTHESIS_VALIDATOR_MIN_CITATIONS: usize = 2;
@@ -640,23 +645,63 @@ pub async fn primary_source_ratio(
         ));
     }
 
-    let mut failed: Vec<(String, String, f64)> = Vec::new(); // (slug, page_type, ratio)
+    // Collect all (host_slug, host_page_type, target_slug) tuples up front so
+    // we can batch-resolve target page types in one IN-clause query rather
+    // than O(host_pages × wikilinks) round-trips.
+    struct PendingHost {
+        slug: String,
+        page_type: String,
+        link_targets: Vec<String>,
+    }
+    let mut hosts: Vec<PendingHost> = Vec::with_capacity(rows.len());
+    let mut all_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in &rows {
         let slug: String = row.try_get("slug").map_err(db_err)?;
         let page_type: String = row.try_get("page_type").map_err(db_err)?;
         let content: String = row.try_get("compiled_truth").map_err(db_err)?;
+        let link_targets: Vec<String> = extract_links(&content)
+            .into_iter()
+            .map(|l| l.target_slug)
+            .collect();
+        for t in &link_targets {
+            all_targets.insert(t.clone());
+        }
+        hosts.push(PendingHost {
+            slug,
+            page_type,
+            link_targets,
+        });
+    }
 
+    // Batch-resolve all unique target slugs → page_type.
+    let type_lookup: std::collections::HashMap<String, String> = if all_targets.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let target_list: Vec<String> = all_targets.into_iter().collect();
+        let placeholders = vec!["?"; target_list.len()].join(",");
+        let sql = format!("SELECT slug, page_type FROM pages WHERE slug IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for t in &target_list {
+            q = q.bind(t);
+        }
+        let rows = q.fetch_all(pool).await.map_err(db_err)?;
+        let mut map = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let s: String = row.try_get("slug").map_err(db_err)?;
+            let pt: String = row.try_get("page_type").map_err(db_err)?;
+            map.insert(s, pt);
+        }
+        map
+    };
+
+    let mut failed: Vec<(String, String, f64)> = Vec::new(); // (slug, page_type, ratio)
+    for host in &hosts {
         let mut primary = 0usize;
         let mut counted = 0usize;
-        for link in extract_links(&content) {
-            let target_type: Option<String> = sqlx::query_scalar(
-                "SELECT page_type FROM pages WHERE slug = ?",
-            )
-            .bind(&link.target_slug)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_err)?;
-            let Some(pt) = target_type else { continue };
+        for target_slug in &host.link_targets {
+            let Some(pt) = type_lookup.get(target_slug) else {
+                continue;
+            };
             counted += 1;
             if matches!(pt.as_str(), "raw" | "note") {
                 primary += 1;
@@ -669,6 +714,8 @@ pub async fn primary_source_ratio(
             // also fail this validator for an uncited page.
             continue;
         }
+        let slug = host.slug.clone();
+        let page_type = host.page_type.clone();
 
         let ratio = primary as f64 / counted as f64;
         let threshold = match page_type.as_str() {
@@ -726,7 +773,13 @@ pub async fn bibliography_consistency(
 
     let mut error_pages: Vec<String> = Vec::new();
     let mut warn_pages: Vec<String> = Vec::new();
-    let mut actions: Vec<SuggestedAction> = Vec::new();
+    // One AddCitation action per failing page (not per finding) — the schema
+    // of `chunk_ref` is "<slug>|chunk:<N>" or None, not free-form error text.
+    // Audit messages stay in the validator's `message`/`affected_slugs` so
+    // ZeroClaw can still surface them; auto-fix consumes the action.
+    let mut action_pages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // First 3 ERROR finding messages, for the validator message preview.
+    let mut error_examples: Vec<String> = Vec::new();
 
     for slug in &slugs {
         let report = match engine.audit_citations(slug, false).await {
@@ -739,10 +792,9 @@ pub async fn bibliography_consistency(
             match f.severity {
                 "ERROR" => {
                     had_error = true;
-                    actions.push(SuggestedAction::AddCitation {
-                        slug: slug.clone(),
-                        chunk_ref: Some(f.message.clone()),
-                    });
+                    if error_examples.len() < 3 {
+                        error_examples.push(format!("{slug}: {}", f.message));
+                    }
                 }
                 "WARN" => had_warn = true,
                 _ => {}
@@ -750,18 +802,27 @@ pub async fn bibliography_consistency(
         }
         if had_error {
             error_pages.push(slug.clone());
+            action_pages.insert(slug.clone());
         } else if had_warn {
             warn_pages.push(slug.clone());
         }
     }
 
     if !error_pages.is_empty() {
+        let actions: Vec<SuggestedAction> = action_pages
+            .into_iter()
+            .map(|slug| SuggestedAction::AddCitation {
+                slug,
+                chunk_ref: None,
+            })
+            .collect();
         return Ok(ValidatorResult::fail(
             "bibliography_consistency",
             format!(
-                "{} page(s) with citation errors, {} page(s) with warnings",
+                "{} page(s) with citation errors, {} page(s) with warnings; examples: {}",
                 error_pages.len(),
-                warn_pages.len()
+                warn_pages.len(),
+                error_examples.join("; ")
             ),
         )
         .with_affected(error_pages)
