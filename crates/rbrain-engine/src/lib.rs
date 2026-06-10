@@ -24,5 +24,5 @@ pub use rbrain_search::TantivyIndex;
 pub use research::{
     ADMIN_USER, DEFAULT_PROJECT, DEFAULT_USER, GLOBAL_USER, NextAction, Project, ProjectStatus,
     ProjectStore, ProtocolState, ResearchEdge, ResearchRun, ResearchRunStore, RunStatus, TaskType,
-    TenantContext, is_research_edge,
+    TenantContext, TenantView, is_research_edge,
 };

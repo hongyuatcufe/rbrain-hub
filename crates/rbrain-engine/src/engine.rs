@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 use crate::links::{LinkRef, extract_links};
 use crate::pipeline::clean_json;
+use crate::research::{TenantContext, TenantView};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -162,12 +163,38 @@ impl Engine {
         })
     }
 
+    /// Bind this engine to a specific [`TenantContext`], returning a
+    /// [`TenantView`] facade. All read/write methods on the view
+    /// automatically scope by tenant. See `plan.md` §M4 / decision #6.
+    ///
+    /// ```ignore
+    /// let view = engine.with_tenant(TenantContext::for_user("alice", Some("phd")));
+    /// view.put_page(page).await?;
+    /// ```
+    pub fn with_tenant(&self, ctx: TenantContext) -> TenantView<'_> {
+        TenantView::new(self, ctx)
+    }
+
     pub async fn put_page(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, false, true).await
+        self.put_page_inner(page, false, true, &TenantContext::default_tenant())
+            .await
     }
 
     pub async fn put_page_force(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, true, true).await
+        self.put_page_inner(page, true, true, &TenantContext::default_tenant())
+            .await
+    }
+
+    /// Tenant-aware variant of [`Engine::put_page`]. Embeds
+    /// `(ctx.user_id, ctx.project_id)` into the pages row and into any
+    /// extracted wikilink rows. Markdown payload is unchanged. See
+    /// `plan.md` §M4 for the multi-tenant design.
+    pub async fn put_page_with_ctx(&self, page: Page, ctx: &TenantContext) -> Result<()> {
+        self.put_page_inner(page, false, true, ctx).await
+    }
+
+    pub async fn put_page_force_with_ctx(&self, page: Page, ctx: &TenantContext) -> Result<()> {
+        self.put_page_inner(page, true, true, ctx).await
     }
 
     fn validated_slug(slug: &str) -> Result<String> {
@@ -204,7 +231,13 @@ impl Engine {
         repo_path.with_file_name(format!(".{file_name}.{}.deleted", uuid::Uuid::new_v4()))
     }
 
-    async fn put_page_inner(&self, page: Page, force: bool, enqueue_embed: bool) -> Result<()> {
+    async fn put_page_inner(
+        &self,
+        page: Page,
+        force: bool,
+        enqueue_embed: bool,
+        ctx: &TenantContext,
+    ) -> Result<()> {
         let (normalized_slug, repo_path) = self.page_path(&page.slug)?;
 
         if !force && repo_path.exists() {
@@ -274,13 +307,15 @@ impl Engine {
 
         sqlx::query(
             "INSERT INTO pages \
-             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now')) \
+             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, user_id, project_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now')) \
              ON CONFLICT(slug) DO UPDATE SET \
              page_type = excluded.page_type, title = excluded.title, tags = excluded.tags, \
              frontmatter = excluded.frontmatter, compiled_truth = excluded.compiled_truth, \
              timeline = excluded.timeline, language = excluded.language, \
-             content_hash = excluded.content_hash, updated_at = datetime('now')",
+             content_hash = excluded.content_hash, \
+             user_id = excluded.user_id, project_id = excluded.project_id, \
+             updated_at = datetime('now')",
         )
         .bind(&normalized_slug)
         .bind(&page.page_type)
@@ -291,6 +326,8 @@ impl Engine {
         .bind(&page.timeline)
         .bind(&language_str)
         .bind(&content_hash)
+        .bind(&ctx.user_id)
+        .bind(ctx.project_id.as_deref())
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -321,8 +358,8 @@ impl Engine {
                 .unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx, is_generated) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, 1)",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx, is_generated, user_id, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, 1, ?7, ?8)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
@@ -330,6 +367,8 @@ impl Engine {
             .bind(&link.context)
             .bind(cid)
             .bind(src_idx)
+            .bind(&ctx.user_id)
+            .bind(ctx.project_id.as_deref())
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -544,17 +583,31 @@ impl Engine {
     }
 
     pub async fn get_page(&self, slug: &str) -> Result<Page> {
-        let normalized = MarkdownParser::normalize_slug(slug);
+        // Backwards-compat default — sees default + global tenants.
+        self.get_page_with_ctx(slug, &TenantContext::default_tenant())
+            .await
+    }
 
-        let row = sqlx::query(
+    /// Tenant-aware variant of [`Engine::get_page`]. Filters by
+    /// `ctx.readable_user_ids()`, so a user can see their own pages plus
+    /// `'global'` pages but never another user's content.
+    pub async fn get_page_with_ctx(&self, slug: &str, ctx: &TenantContext) -> Result<Page> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let readable = ctx.readable_user_ids();
+        let placeholders = vec!["?"; readable.len()].join(",");
+        let sql = format!(
             "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at \
-             FROM pages WHERE slug = ?1",
-        )
-        .bind(&normalized)
-        .fetch_optional(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-        .ok_or_else(|| BrainError::Conflict(format!("page not found: {}", normalized)))?;
+             FROM pages WHERE slug = ? AND user_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(&normalized);
+        for u in &readable {
+            q = q.bind(*u);
+        }
+        let row = q
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .ok_or_else(|| BrainError::Conflict(format!("page not found: {}", normalized)))?;
 
         let tags: Vec<String> = serde_json::from_str(row.get::<String, _>("tags").as_str())?;
         let frontmatter: serde_json::Value =
@@ -583,6 +636,34 @@ impl Engine {
     }
 
     pub async fn delete_page(&self, slug: &str) -> Result<()> {
+        // Backwards-compat default.
+        self.delete_page_with_ctx(slug, &TenantContext::default_tenant())
+            .await
+    }
+
+    /// Tenant-aware variant of [`Engine::delete_page`]. Refuses to delete if
+    /// the slug exists but is owned by a tenant the caller cannot read.
+    pub async fn delete_page_with_ctx(&self, slug: &str, ctx: &TenantContext) -> Result<()> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        // Tenant guard: confirm the page is one the caller may touch.
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM pages WHERE slug = ?1",
+        )
+        .bind(&normalized)
+        .fetch_optional(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(owner) = owner {
+            if !ctx.readable_user_ids().contains(&owner.as_str()) {
+                return Err(BrainError::Conflict(format!(
+                    "delete denied: {slug} belongs to a different tenant"
+                )));
+            }
+        }
+        self.delete_page_inner(slug).await
+    }
+
+    async fn delete_page_inner(&self, slug: &str) -> Result<()> {
         let (normalized, repo_path) = self.page_path(slug)?;
 
         if repo_path.exists() && !repo_path.is_file() {
@@ -694,11 +775,44 @@ impl Engine {
         limit: Option<i64>,
         sort_by: Option<&str>,
     ) -> Result<Vec<Page>> {
+        self.list_pages_with_ctx(
+            page_type,
+            tag,
+            language,
+            limit,
+            sort_by,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    /// Tenant-aware variant of [`Engine::list_pages`]. Adds
+    /// `AND user_id IN (...)` from `ctx.readable_user_ids()`.
+    pub async fn list_pages_with_ctx(
+        &self,
+        page_type: Option<&str>,
+        tag: Option<&str>,
+        language: Option<&str>,
+        limit: Option<i64>,
+        sort_by: Option<&str>,
+        ctx: &TenantContext,
+    ) -> Result<Vec<Page>> {
         const BASE: &str = "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, \
             timeline, language, content_hash, created_at, updated_at FROM pages";
 
         let mut conditions: Vec<String> = Vec::new();
         let mut binds: Vec<String> = Vec::new();
+
+        // Tenant scope always present.
+        let readable = ctx.readable_user_ids();
+        let placeholders = (binds.len() + 1..binds.len() + 1 + readable.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conditions.push(format!("user_id IN ({placeholders})"));
+        for u in &readable {
+            binds.push(u.to_string());
+        }
 
         if let Some(pt) = page_type {
             conditions.push(format!("page_type = ?{}", binds.len() + 1));
@@ -1084,7 +1198,9 @@ impl Engine {
             let full_text = format!("{} {}", page.compiled_truth, page.timeline);
             page.language = Some(rbrain_core::page::Language::detect(&full_text));
 
-            self.put_page_inner(page.clone(), false, false).await?;
+            // Default tenant for CLI sync — PR-5 will thread (user_id, project_id) here.
+            self.put_page_inner(page.clone(), false, false, &TenantContext::default_tenant())
+                .await?;
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&page).await {
                     tracing::warn!("embed failed for {}; queueing retry job: {}", page.slug, e);
@@ -1797,15 +1913,32 @@ impl Engine {
     }
 
     pub async fn backlinks(&self, slug: &str) -> Result<Vec<LinkRef>> {
-        let normalized = MarkdownParser::normalize_slug(slug);
+        self.backlinks_with_ctx(slug, &TenantContext::default_tenant())
+            .await
+    }
 
-        let rows = sqlx::query(
-            "SELECT source_slug, edge_type, context, chunk_id FROM links WHERE target_slug = ?1",
-        )
-        .bind(&normalized)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    /// Tenant-aware variant of [`Engine::backlinks`]. Only returns links
+    /// whose `user_id` is in `ctx.readable_user_ids()`.
+    pub async fn backlinks_with_ctx(
+        &self,
+        slug: &str,
+        ctx: &TenantContext,
+    ) -> Result<Vec<LinkRef>> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let readable = ctx.readable_user_ids();
+        let placeholders = vec!["?"; readable.len()].join(",");
+        let sql = format!(
+            "SELECT source_slug, edge_type, context, chunk_id FROM links \
+             WHERE target_slug = ? AND user_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(&normalized);
+        for u in &readable {
+            q = q.bind(*u);
+        }
+        let rows = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut links = Vec::new();
         for row in rows {
@@ -1824,15 +1957,33 @@ impl Engine {
 
     /// List outgoing links from a page (with type and evidence context).
     pub async fn outlinks(&self, slug: &str) -> Result<Vec<LinkRef>> {
-        let normalized = MarkdownParser::normalize_slug(slug);
+        self.outlinks_with_ctx(slug, &TenantContext::default_tenant())
+            .await
+    }
 
-        let rows = sqlx::query(
-            "SELECT target_slug, edge_type, context, chunk_id FROM links WHERE source_slug = ?1 ORDER BY edge_type, target_slug",
-        )
-        .bind(&normalized)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    /// Tenant-aware variant of [`Engine::outlinks`]. Only returns links
+    /// whose `user_id` is in `ctx.readable_user_ids()`.
+    pub async fn outlinks_with_ctx(
+        &self,
+        slug: &str,
+        ctx: &TenantContext,
+    ) -> Result<Vec<LinkRef>> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let readable = ctx.readable_user_ids();
+        let placeholders = vec!["?"; readable.len()].join(",");
+        let sql = format!(
+            "SELECT target_slug, edge_type, context, chunk_id FROM links \
+             WHERE source_slug = ? AND user_id IN ({placeholders}) \
+             ORDER BY edge_type, target_slug"
+        );
+        let mut q = sqlx::query(&sql).bind(&normalized);
+        for u in &readable {
+            q = q.bind(*u);
+        }
+        let rows = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut links = Vec::new();
         for row in rows {
@@ -1845,7 +1996,6 @@ impl Engine {
                 chunk_id,
             });
         }
-
         Ok(links)
     }
 
@@ -1860,9 +2010,52 @@ impl Engine {
         context: Option<&str>,
         chunk_id: Option<i64>,
     ) -> Result<()> {
+        self.add_link_with_ctx(
+            source_slug,
+            target_slug,
+            edge_type,
+            context,
+            chunk_id,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    /// Tenant-aware variant of [`Engine::add_link`]. The link row inherits
+    /// `(ctx.user_id, ctx.project_id)`. Returns a `Conflict` error if
+    /// `source_slug` belongs to a different tenant than `ctx`.
+    pub async fn add_link_with_ctx(
+        &self,
+        source_slug: &str,
+        target_slug: &str,
+        edge_type: &str,
+        context: Option<&str>,
+        chunk_id: Option<i64>,
+        ctx: &TenantContext,
+    ) -> Result<()> {
         let source = MarkdownParser::normalize_slug(source_slug);
         let target = MarkdownParser::normalize_slug(target_slug);
         let cid = chunk_id.unwrap_or(-1);
+
+        // Tenant guard: source page must be one the caller may write under.
+        let source_user_id: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM pages WHERE slug = ?1",
+        )
+        .bind(&source)
+        .fetch_optional(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(owner) = source_user_id {
+            // Writes target the caller's user_id exactly — readable_user_ids
+            // is for reads. Source must match ctx.user_id (or be the caller's
+            // own page).
+            if owner != ctx.user_id && owner != "global" {
+                return Err(BrainError::Conflict(format!(
+                    "add_link denied: source {source_slug} belongs to tenant {owner}, not {}",
+                    ctx.user_id
+                )));
+            }
+        }
 
         // Promote an extracted edge to an explicit edge when the keys collide.
         sqlx::query(
@@ -1897,8 +2090,8 @@ impl Engine {
         };
 
         sqlx::query(
-            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, -1) \
+            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx, user_id, project_id) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, -1, ?6, ?7) \
              ON CONFLICT(source_slug, target_slug, edge_type, chunk_id, source_chunk_idx) DO UPDATE SET context = ?4",
         )
         .bind(&source)
@@ -1906,6 +2099,8 @@ impl Engine {
         .bind(edge_type)
         .bind(merged_context.as_deref())
         .bind(cid)
+        .bind(&ctx.user_id)
+        .bind(ctx.project_id.as_deref())
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
