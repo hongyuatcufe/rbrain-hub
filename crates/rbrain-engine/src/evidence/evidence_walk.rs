@@ -23,12 +23,27 @@ use sqlx::{Row, SqlitePool};
 
 use super::actions::SuggestedAction;
 use super::result::ValidatorResult;
+use crate::research::TenantContext;
 
 fn db_err<E: std::fmt::Display>(e: E) -> BrainError {
     BrainError::Io(std::io::Error::new(
         std::io::ErrorKind::Other,
         e.to_string(),
     ))
+}
+
+fn user_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn readable_users(ctx: &TenantContext) -> Vec<String> {
+    ctx.readable_user_ids()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,7 +79,22 @@ fn is_source_tier(page_type: &str) -> bool {
 }
 
 pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result<EvidenceReport> {
-    let page_type: String = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?")
+    run_evidence_check_with_ctx(pool, finding_slug, &TenantContext::default_tenant()).await
+}
+
+pub async fn run_evidence_check_with_ctx(
+    pool: &SqlitePool,
+    finding_slug: &str,
+    ctx: &TenantContext,
+) -> Result<EvidenceReport> {
+    let readable = readable_users(ctx);
+    let ph = user_placeholders(readable.len());
+    let sql = format!("SELECT page_type FROM pages WHERE slug = ?{} AND user_id IN ({ph})", readable.len() + 1);
+    let mut q = sqlx::query_scalar(&sql);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let page_type: String = q
         .bind(finding_slug)
         .fetch_optional(pool)
         .await
@@ -77,11 +107,18 @@ pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result
     }
 
     // ── 1. supports edges (data-analysis finding shape) ────────────────────
-    let supports_rows = sqlx::query(
+    let ph = user_placeholders(readable.len());
+    let supports_sql = format!(
         "SELECT p.slug, p.page_type FROM links l
          JOIN pages p ON p.slug = l.target_slug
-         WHERE l.source_slug = ? AND l.edge_type = 'supports'",
-    )
+         WHERE l.user_id IN ({ph}) AND l.source_slug = ?{} AND l.edge_type = 'supports'",
+        readable.len() + 1
+    );
+    let mut q = sqlx::query(&supports_sql);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let supports_rows = q
     .bind(finding_slug)
     .fetch_all(pool)
     .await
@@ -97,12 +134,19 @@ pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result
     }
 
     // ── 2. cites edges (literature finding shape) ──────────────────────────
-    let cites_rows = sqlx::query(
+    let ph = user_placeholders(readable.len());
+    let cites_sql = format!(
         "SELECT p.slug, p.page_type FROM links l
          JOIN pages p ON p.slug = l.target_slug
-         WHERE l.source_slug = ? AND l.edge_type = 'cites'
+         WHERE l.user_id IN ({ph}) AND l.source_slug = ?{} AND l.edge_type = 'cites'
                AND p.page_type IN ('note','raw')",
-    )
+        readable.len() + 1
+    );
+    let mut q = sqlx::query(&cites_sql);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let cites_rows = q
     .bind(finding_slug)
     .fetch_all(pool)
     .await
@@ -130,17 +174,24 @@ pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result
     }
 
     // ── 3. 2-hop: supports → derived_from → dataset ────────────────────────
-    let dataset_rows = sqlx::query(
+    let ph = user_placeholders(readable.len());
+    let dataset_sql = format!(
         "SELECT DISTINCT dataset.slug FROM links l1
          JOIN pages artifact ON artifact.slug = l1.target_slug
          JOIN links l2 ON l2.source_slug = artifact.slug
          JOIN pages dataset ON dataset.slug = l2.target_slug
-         WHERE l1.source_slug = ?
+         WHERE l1.user_id IN ({ph}) AND l2.user_id IN ({ph}) AND l1.source_slug = ?{}
            AND l1.edge_type = 'supports'
            AND artifact.page_type = 'artifact'
            AND l2.edge_type = 'derived_from'
            AND dataset.page_type = 'dataset'",
-    )
+        readable.len() + 1
+    );
+    let mut q = sqlx::query(&dataset_sql);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let dataset_rows = q
     .bind(finding_slug)
     .fetch_all(pool)
     .await
@@ -151,17 +202,24 @@ pub async fn run_evidence_check(pool: &SqlitePool, finding_slug: &str) -> Result
         .collect::<Result<Vec<_>>>()?;
 
     // ── 4. 2-hop: supports → computed_by → script ──────────────────────────
-    let script_rows = sqlx::query(
+    let ph = user_placeholders(readable.len());
+    let script_sql = format!(
         "SELECT DISTINCT script.slug FROM links l1
          JOIN pages artifact ON artifact.slug = l1.target_slug
          JOIN links l2 ON l2.source_slug = artifact.slug
          JOIN pages script ON script.slug = l2.target_slug
-         WHERE l1.source_slug = ?
+         WHERE l1.user_id IN ({ph}) AND l2.user_id IN ({ph}) AND l1.source_slug = ?{}
            AND l1.edge_type = 'supports'
            AND artifact.page_type = 'artifact'
            AND l2.edge_type = 'computed_by'
            AND script.page_type IN ('script','artifact')",
-    )
+        readable.len() + 1
+    );
+    let mut q = sqlx::query(&script_sql);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let script_rows = q
     .bind(finding_slug)
     .fetch_all(pool)
     .await

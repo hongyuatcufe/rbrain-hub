@@ -17,8 +17,9 @@ This note records the code-review findings and roadmap for evolving rbrain-hub i
 > **M4 PR-1 进行中（2026-06-10）**：
 > - **PR-1a shipped (`2e024df`)**：migration 0014 (tenancy columns) + 0015 (projects 表) + `TenantContext` / `ProjectStore` 模块 + 9-test `project_lifecycle_fixture`。
 > - **PR-1b shipped (`3065389`)**：Engine 8 个核心方法 (`put_page` / `get_page` / `delete_page` / `list_pages` / `add_link` / `outlinks` / `backlinks` / `put_page_force`) 新增 `_with_ctx` tenant-aware 变体；新增 `TenantView<'a>` 包装器 + `Engine::with_tenant()` 入口；8-test `tenant_view_fixture` 覆盖 read/write isolation、global 可见、跨 tenant 拒绝、delete guard 等不变式。
-> - **测试**：128/128 ✅（65 lib + 10 + 8 + 28 + 9 + 8 fixtures）。既有 105 测试零修改，完全 backwards-compat。
-> - **PR-1c 推迟**：validator / provenance / evidence_walk tenant scope、105 测试 wrapper 迁移、MCP / CLI 调用站迁移。这些是机械收尾，不阻塞 PR-2。
+> - **PR-1c security hardening shipped (2026-06-11)**：核心检索/graph/stats/chunk 回取新增 `_with_ctx`；MCP stdio + HTTP 核心工具支持可选 `user_id` / `project_id`；worker embed job 继承 tenant；`brain_evidence_check` / `brain_provenance_of` 切 scoped 版本；新增 migration 0016 修复 tenant-aware `page_stats` trigger；`tenant_view_fixture` 扩到 11 测试。
+> - **测试**：131/131 ✅（65 lib + 10 data_analysis + 8 m2 + 28 literature + 9 project + 11 tenant_view）。`cargo check --workspace` / `rbrain-mcp --no-default-features --lib` / `rbrain-worker --lib` / `git diff --check` 均通过。
+> - **PR-1c 剩余后置**：lit-review validators tenant scope、pipeline/dream cycle tenant 注入、CLI 显式 tenant/project context、维护命令（remove_link/orphan/stale/fix）tenant 收口。这些继续后置，不阻塞 PR-2。
 
 ## Current assessment
 
@@ -635,7 +636,8 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
 |---|---|---|
 | PR-1a | migration 0014/0015 + TenantContext/ProjectStore modules + project_lifecycle_fixture | ✅ shipped `2e024df` |
 | PR-1b | Engine 8 个 `_with_ctx` 变体 + `TenantView` wrapper + tenant_view_fixture | ✅ shipped `3065389` |
-| PR-1c | Validators/provenance/evidence_walk tenant scope + 既有 105 测试迁 wrapper + MCP/CLI 调用站迁 | ⏸️ 推迟（机械收尾、不阻塞 PR-2） |
+| PR-1c | Tenant safety hardening：search/graph/stats/chunk 回取、MCP stdio+HTTP、worker embed job、provenance/evidence_walk、page_stats trigger | ✅ partial shipped 2026-06-11 |
+| PR-1c-remain | Lit-review validators tenant scope + pipeline/dream cycle tenant 注入 + CLI context + 维护命令收口 + 既有测试 wrapper 迁移 | ⏸️ 后置（不阻塞 PR-2） |
 | PR-2 | migration 0016–0020 (project_topics / page_topics / push_inbox / topic_digests / research_runs.project_id) + store 模块 | 🚧 下一步 |
 | PR-3 | 7 新 MCP 工具（5 project 管理 + 3 push inbox）+ `brain_create_research_run` 加 project_id | 待办 |
 | PR-4 | CLI `rbrain project` 子命令 + context 注入 + `.rbrain/context.toml` | 待办 |

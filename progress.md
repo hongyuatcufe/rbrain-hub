@@ -11,6 +11,45 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 
 ---
 
+## 2026-06-11 — M4 PR-1c 安全收口：tenant scope 贯穿检索/MCP/worker/evidence
+
+Claude M4 PR-1a/1b 后的系统审查发现：新增 tenancy columns 和 `TenantView` 只覆盖了部分 page/link API，`brain_query`、worker embed job、evidence/provenance、`page_stats` trigger 等路径仍可能全库读取或混用 tenant 排序信号。已完成一轮安全收口，目标是让当前远端多用户底座不会在核心检索和图谱路径泄漏其他用户内容。
+
+### 已修复
+
+- **检索 tenant scope**：`keyword_search` / `vector_search` / `sparse_search` / `hybrid_search` / `expanded_search` / `search_with_context` / `fetch_chunks_text` / `fetch_chunk_by_id` 新增 `_with_ctx` 路径，默认 API 继续走 `TenantContext::default_tenant()` 保持兼容。
+- **MCP tenant 参数**：stdio MCP 与 HTTP MCP 的核心工具增加可选 `user_id` / `project_id`，`brain_query`、`brain_get`、`brain_put`、`brain_delete`、`brain_list`、`brain_graph`、`brain_backlinks`、`brain_outlinks`、`brain_link`、`brain_think`、`brain_generate`、timeline/tag 工具改走 scoped Engine 方法。
+- **写权限硬化**：`put_page_with_ctx` 拒绝跨 tenant slug takeover；`delete_page_with_ctx`、`add_link_with_ctx`、timeline/tag 写入不再把 global 可读权限误当成可写权限，普通用户不能删除或修改 global 页面/边。
+- **worker / embedding tenant 继承**：`submit_embed_job` 写入 `user_id` / `project_id`；`EmbedPageHandler` 从 job params 构造 `TenantContext`；`chunk_and_embed_page_with_ctx` 写入 chunks 的 tenant metadata。
+- **evidence/provenance tenant scope**：`run_evidence_check_with_ctx` 与 `provenance_of_with_ctx` 已落地，MCP `brain_evidence_check` / `brain_provenance_of` 已切到 scoped 版本。
+- **page_stats trigger 修复**：新增 migration `0016_tenant_page_stats_triggers.sql`，按目标页面 owner tenant 维护 indegree，避免其他 tenant 的 links 污染检索 boost。
+- **TenantView 扩展**：新增 scoped `search_with_context`、`graph_query`、`get_stats` wrapper。
+- **测试扩展**：`tenant_view_fixture` 从 8 测试扩展到 11 测试，新增跨 tenant 搜索不泄漏、global 不可写、同 slug takeover 拒绝、同用户不同 project 隔离。
+
+### 测试状态
+
+- `cargo check --workspace` ✅
+- `cargo test -p rbrain-engine --lib`：65/65 ✅
+- `cargo test -p rbrain-engine --test tenant_view_fixture`：11/11 ✅
+- `cargo test -p rbrain-engine --test m2_provenance_fixture`：8/8 ✅
+- `cargo test -p rbrain-engine --test project_lifecycle_fixture`：9/9 ✅
+- `cargo test -p rbrain-engine --test data_analysis_fixture`：10/10 ✅
+- `cargo test -p rbrain-engine --test literature_validators_fixture`：28/28 ✅
+- `cargo test -p rbrain-mcp --no-default-features --lib` ✅
+- `cargo test -p rbrain-worker --lib`：1/1 ✅
+- `git diff --check` ✅
+
+未运行 `cargo fmt`。
+
+### 仍后置到后续 PR
+
+- Lit-review validators 中仍有全库扫描 SQL，需要单独做 tenant scope。
+- Pipeline / dream cycle / CLI 的显式 tenant 注入仍未完成，当前默认兼容路径继续走 `default` tenant。
+- `remove_link` / orphan / stale / fix 类维护命令仍是默认兼容语义，远端多用户产品化前需要继续收口。
+- SQLite schema 仍保留 `pages.slug` 全局主键；本轮通过写入 guard 阻止跨 tenant takeover，但长期 SaaS 若要求同 slug 多租户并存，需要 schema 级复合键或 slug namespace 策略。
+
+---
+
 ## 2026-06-10 — M4 PR-1 启动：Tenancy 基础 + TenantView 包装器
 
 ### M4 PR-1a（commit `2e024df`）：Schema + 模块基础
@@ -41,7 +80,7 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 - add_link 跨 tenant 被拒绝
 - outlinks / backlinks 按 readable set 过滤
 - delete_page 跨 tenant 被拒绝
-- 同 slug 不同 tenant 的写入行为（PK 仍是 slug，记录了刻意的设计选择）
+- 同 slug 跨 tenant takeover 被拒绝（PK 仍是 slug，安全策略改为写入 guard）
 
 ### 测试状态
 
@@ -52,8 +91,8 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 | `m2_provenance_fixture` | 8/8 | 8/8 ✅ |
 | `literature_validators_fixture` | 28/28 | 28/28 ✅ |
 | `project_lifecycle_fixture` | — | **9/9** ✅（新） |
-| `tenant_view_fixture` | — | **8/8** ✅（新） |
-| **总计** | 105 | **128** |
+| `tenant_view_fixture` | — | **11/11** ✅（新 + 安全回归） |
+| **总计** | 105 | **131** |
 
 `cargo check --workspace` 全绿，无 error。既有 105 测试一行未改，pre-M4 代码路径完整保留。
 
@@ -61,13 +100,13 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 
 下列工作转入 PR-1c：
 
-- **Validators / provenance / evidence_walk 的 tenant scope**：目前 lit-review validator 仍是全库扫（M3 留下的 B3 issue）。M4 schema 提供了 user_id 列，但 14 个 validator 的 SQL 还没改。
+- **Lit-review validators 的 tenant scope**：目前 lit-review validator 仍是全库扫（M3 留下的 B3 issue）。M4 schema 提供了 user_id 列，但 14 个 validator 的 SQL 还没改。`provenance` / `evidence_walk` 已在 2026-06-11 安全收口中补上 scoped 版本。
 - **既有 105 测试的 wrapper 迁移**：当前依赖 backwards-compat，未来要把所有 `engine.put_page(p)` 改成 `view.put_page(p)`。机械工作，约 113 个 call site。
-- **MCP / CLI 调用站迁移**：23 + 36 = 59 个调用站，需要解耦出 tenant 注入逻辑（auth → TenantContext）。
+- **Pipeline / CLI 调用站迁移**：MCP 核心工具已支持可选 `user_id` / `project_id` 并走 scoped Engine；CLI 与 pipeline/dream cycle 仍需解耦 tenant 注入逻辑（auth/project context → TenantContext）。
 
 ### 路线图更新
 
-- **M4 PR-1**：core tenancy 进行中（PR-1a + PR-1b 完成，PR-1c 推迟）
+- **M4 PR-1**：core tenancy 进行中（PR-1a + PR-1b 完成；PR-1c 安全收口完成，lit-review validators / pipeline / CLI 等剩余项后置）
 - **M4 PR-2**：剩余 schema（migration 0016–0020：project_topics / page_topics / push_inbox / topic_digests + research_runs.project_id）+ 对应 store 模块
 - **M4 PR-3–PR-5**：见 plan.md M4+ 章节
 

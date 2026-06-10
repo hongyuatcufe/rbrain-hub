@@ -22,7 +22,81 @@ use walkdir::WalkDir;
 
 use crate::links::{LinkRef, extract_links};
 use crate::pipeline::clean_json;
-use crate::research::{TenantContext, TenantView};
+use crate::research::{DEFAULT_PROJECT, DEFAULT_USER, GLOBAL_USER, TenantContext, TenantView};
+
+#[derive(Debug, Clone)]
+struct SqlScope {
+    clause: String,
+    binds: Vec<String>,
+}
+
+fn col(alias: &str, name: &str) -> String {
+    if alias.is_empty() {
+        name.to_string()
+    } else {
+        format!("{alias}.{name}")
+    }
+}
+
+fn project_clause(alias: &str, project_id: Option<&str>, start: usize) -> (String, Vec<String>) {
+    let project_col = col(alias, "project_id");
+    match project_id {
+        Some(project_id) => {
+            if project_id == DEFAULT_PROJECT {
+                (
+                    format!("({project_col} = ?{start} OR {project_col} IS NULL)"),
+                    vec![project_id.to_string()],
+                )
+            } else {
+                (format!("{project_col} = ?{start}"), vec![project_id.to_string()])
+            }
+        }
+        None => (format!("{project_col} IS NULL"), vec![]),
+    }
+}
+
+fn tenant_read_scope(alias: &str, ctx: &TenantContext, start: usize) -> SqlScope {
+    let user_col = col(alias, "user_id");
+    if ctx.is_admin() || ctx.is_global() {
+        let (project_sql, project_binds) =
+            project_clause(alias, ctx.project_id.as_deref(), start + 1);
+        let mut binds = vec![ctx.user_id.clone()];
+        binds.extend(project_binds);
+        return SqlScope {
+            clause: format!("({user_col} = ?{start} AND {project_sql})"),
+            binds,
+        };
+    }
+
+    let (project_sql, project_binds) =
+        project_clause(alias, ctx.project_id.as_deref(), start + 1);
+    let global_idx = start + 1 + project_binds.len();
+    let mut binds = vec![ctx.user_id.clone()];
+    binds.extend(project_binds);
+    binds.push(GLOBAL_USER.to_string());
+    SqlScope {
+        clause: format!(
+            "(({user_col} = ?{start} AND {project_sql}) OR {user_col} = ?{global_idx})"
+        ),
+        binds,
+    }
+}
+
+fn owner_matches_write_scope(
+    owner_user: &str,
+    owner_project: Option<&str>,
+    ctx: &TenantContext,
+) -> bool {
+    if owner_user != ctx.user_id {
+        return false;
+    }
+    match (owner_project, ctx.project_id.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        (None, Some(project)) => ctx.user_id == DEFAULT_USER && project == DEFAULT_PROJECT,
+        (Some(project), None) => ctx.user_id == DEFAULT_USER && project == DEFAULT_PROJECT,
+    }
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -240,6 +314,27 @@ impl Engine {
     ) -> Result<()> {
         let (normalized_slug, repo_path) = self.page_path(&page.slug)?;
 
+        let owner = sqlx::query("SELECT user_id, project_id FROM pages WHERE slug = ?1")
+            .bind(&normalized_slug)
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(row) = owner {
+            let owner_user: String = row.get("user_id");
+            let owner_project: Option<String> = row.get("project_id");
+            if !owner_matches_write_scope(&owner_user, owner_project.as_deref(), ctx) {
+                return Err(BrainError::Conflict(format!(
+                    "put_page denied: {} belongs to tenant {}{}",
+                    normalized_slug,
+                    owner_user,
+                    owner_project
+                        .as_deref()
+                        .map(|p| format!("/{p}"))
+                        .unwrap_or_default()
+                )));
+            }
+        }
+
         if !force && repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
             let existing_hash = MarkdownParser::content_hash(&existing_content);
@@ -375,14 +470,18 @@ impl Engine {
         }
 
         if enqueue_embed && self.inner.embedder.is_some() && self.inner.vector_store.is_some() {
-            self.submit_embed_job(&page.slug).await?;
+            self.submit_embed_job(&page.slug, ctx).await?;
         }
 
         Ok(())
     }
 
-    async fn submit_embed_job(&self, slug: &str) -> Result<()> {
-        let params = serde_json::json!({ "slug": slug });
+    async fn submit_embed_job(&self, slug: &str, ctx: &TenantContext) -> Result<()> {
+        let params = serde_json::json!({
+            "slug": slug,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+        });
         let params_str = serde_json::to_string(&params)?;
 
         // Dedup: skip insert if a pending or running embed job already targets
@@ -404,10 +503,12 @@ impl Engine {
         }
 
         sqlx::query(
-            "INSERT INTO jobs (queue, name, params, status, priority, depth, created_at) \
-             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))",
+            "INSERT INTO jobs (queue, name, params, status, priority, depth, user_id, project_id, created_at) \
+             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, ?2, ?3, datetime('now'))",
         )
         .bind(&params_str)
+        .bind(&ctx.user_id)
+        .bind(ctx.project_id.as_deref())
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -421,6 +522,15 @@ impl Engine {
     }
 
     pub async fn chunk_and_embed_page(&self, page: &Page) -> Result<()> {
+        self.chunk_and_embed_page_with_ctx(page, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn chunk_and_embed_page_with_ctx(
+        &self,
+        page: &Page,
+        ctx: &TenantContext,
+    ) -> Result<()> {
         let embedder = self
             .inner
             .embedder
@@ -526,8 +636,8 @@ impl Engine {
 
             let chunk_id: i64 = sqlx::query_scalar(
                 "INSERT INTO chunks \
-                 (page_slug, chunk_idx, text, is_compiled_truth, language, has_embedding, indexed_in_vectors, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, datetime('now')) \
+                 (page_slug, chunk_idx, text, is_compiled_truth, language, has_embedding, indexed_in_vectors, user_id, project_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, datetime('now')) \
                  RETURNING id",
             )
             .bind(&chunk.page_slug)
@@ -535,6 +645,8 @@ impl Engine {
             .bind(&chunk.text)
             .bind(is_compiled_truth)
             .bind(&language_str)
+            .bind(&ctx.user_id)
+            .bind(ctx.project_id.as_deref())
             .fetch_one(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -593,15 +705,15 @@ impl Engine {
     /// `'global'` pages but never another user's content.
     pub async fn get_page_with_ctx(&self, slug: &str, ctx: &TenantContext) -> Result<Page> {
         let normalized = MarkdownParser::normalize_slug(slug);
-        let readable = ctx.readable_user_ids();
-        let placeholders = vec!["?"; readable.len()].join(",");
+        let tenant_scope = tenant_read_scope("", ctx, 2);
         let sql = format!(
             "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at \
-             FROM pages WHERE slug = ? AND user_id IN ({placeholders})"
+             FROM pages WHERE slug = ?1 AND {}",
+            tenant_scope.clause
         );
         let mut q = sqlx::query(&sql).bind(&normalized);
-        for u in &readable {
-            q = q.bind(*u);
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
         }
         let row = q
             .fetch_optional(&self.inner.db)
@@ -646,15 +758,17 @@ impl Engine {
     pub async fn delete_page_with_ctx(&self, slug: &str, ctx: &TenantContext) -> Result<()> {
         let normalized = MarkdownParser::normalize_slug(slug);
         // Tenant guard: confirm the page is one the caller may touch.
-        let owner: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM pages WHERE slug = ?1",
+        let owner = sqlx::query(
+            "SELECT user_id, project_id FROM pages WHERE slug = ?1",
         )
         .bind(&normalized)
         .fetch_optional(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        if let Some(owner) = owner {
-            if !ctx.readable_user_ids().contains(&owner.as_str()) {
+        if let Some(row) = owner {
+            let owner_user: String = row.get("user_id");
+            let owner_project: Option<String> = row.get("project_id");
+            if !owner_matches_write_scope(&owner_user, owner_project.as_deref(), ctx) {
                 return Err(BrainError::Conflict(format!(
                     "delete denied: {slug} belongs to a different tenant"
                 )));
@@ -804,15 +918,9 @@ impl Engine {
         let mut binds: Vec<String> = Vec::new();
 
         // Tenant scope always present.
-        let readable = ctx.readable_user_ids();
-        let placeholders = (binds.len() + 1..binds.len() + 1 + readable.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("user_id IN ({placeholders})"));
-        for u in &readable {
-            binds.push(u.to_string());
-        }
+        let tenant_scope = tenant_read_scope("", ctx, binds.len() + 1);
+        conditions.push(tenant_scope.clause);
+        binds.extend(tenant_scope.binds);
 
         if let Some(pt) = page_type {
             conditions.push(format!("page_type = ?{}", binds.len() + 1));
@@ -1204,7 +1312,8 @@ impl Engine {
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&page).await {
                     tracing::warn!("embed failed for {}; queueing retry job: {}", page.slug, e);
-                    self.submit_embed_job(&page.slug).await?;
+                    self.submit_embed_job(&page.slug, &TenantContext::default_tenant())
+                        .await?;
                 }
             }
             imported.push(slug);
@@ -1219,7 +1328,14 @@ impl Engine {
         lang: &rbrain_core::page::Language,
         k: usize,
     ) -> Result<Vec<(i64, f32)>> {
-        self.keyword_search_filtered(query, lang, k, None, None)
+        self.keyword_search_filtered_with_ctx(
+            query,
+            lang,
+            k,
+            None,
+            None,
+            &TenantContext::default_tenant(),
+        )
             .await
     }
 
@@ -1231,6 +1347,26 @@ impl Engine {
         k: usize,
         page_type: Option<&str>,
         tag: Option<&str>,
+    ) -> Result<Vec<(i64, f32)>> {
+        self.keyword_search_filtered_with_ctx(
+            query,
+            lang,
+            k,
+            page_type,
+            tag,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn keyword_search_filtered_with_ctx(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        page_type: Option<&str>,
+        tag: Option<&str>,
+        ctx: &TenantContext,
     ) -> Result<Vec<(i64, f32)>> {
         let keyword_index =
             self.inner
@@ -1250,27 +1386,36 @@ impl Engine {
         // Tantivy entries can outlive DB chunks after a plain filesystem sync.
         // Always intersect with live chunks before exposing search results.
         let ids: Vec<i64> = raw.iter().map(|(id, _)| *id).collect();
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
 
         let mut sql = format!(
             "SELECT c.id FROM chunks c JOIN pages p ON c.page_slug = p.slug WHERE c.id IN ({})",
             placeholders
         );
         let mut conditions = Vec::new();
+        let tenant_scope = tenant_read_scope("c", ctx, ids.len() + 1);
+        conditions.push(tenant_scope.clause);
         if page_type.is_some() {
-            conditions.push("p.page_type = ?");
+            conditions.push(format!("p.page_type = ?{}", ids.len() + tenant_scope.binds.len() + 1));
         }
         if tag.is_some() {
-            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?{})",
+                ids.len() + tenant_scope.binds.len() + usize::from(page_type.is_some()) + 1
+            ));
         }
-        if !conditions.is_empty() {
-            sql.push_str(" AND ");
-            sql.push_str(&conditions.join(" AND "));
-        }
+        sql.push_str(" AND ");
+        sql.push_str(&conditions.join(" AND "));
 
         let mut q = sqlx::query(&sql);
         for id in &ids {
             q = q.bind(id);
+        }
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
         }
         if let Some(pt) = page_type {
             q = q.bind(pt);
@@ -1305,24 +1450,48 @@ impl Engine {
         tag: Option<&str>,
         max_chunks_per_page: usize,
     ) -> Result<Vec<ChunkResult>> {
+        self.search_with_context_filtered_with_ctx(
+            query,
+            lang,
+            k,
+            expand,
+            page_type,
+            tag,
+            max_chunks_per_page,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn search_with_context_filtered_with_ctx(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        expand: bool,
+        page_type: Option<&str>,
+        tag: Option<&str>,
+        max_chunks_per_page: usize,
+        ctx: &TenantContext,
+    ) -> Result<Vec<ChunkResult>> {
         if page_type.is_none() && tag.is_none() {
             return self
-                .search_with_context(query, lang, k, expand, max_chunks_per_page)
+                .search_with_context_with_ctx(query, lang, k, expand, max_chunks_per_page, ctx)
                 .await;
         }
 
         // Run full hybrid search with extra headroom, then filter
         let mut ranked = if expand {
-            self.expanded_search(query, lang, k * 5).await?
+            self.expanded_search_with_ctx(query, lang, k * 5, ctx).await?
         } else {
-            self.hybrid_search(query, lang, k * 5).await?
+            self.hybrid_search_with_ctx(query, lang, k * 5, ctx).await?
         };
 
         // Also run keyword search with the type/tag filter directly, to guarantee
         // that filtered pages aren't crowded out of the global hybrid ranking by
         // many high-scoring pages of other types.
         let filtered_kw = self
-            .keyword_search_filtered(query, lang, k * 5, page_type, tag)
+            .keyword_search_filtered_with_ctx(query, lang, k * 5, page_type, tag, ctx)
             .await?;
         if !filtered_kw.is_empty() {
             let existing_ids: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
@@ -1339,26 +1508,35 @@ impl Engine {
             return Ok(vec![]);
         }
 
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let mut sql = format!(
             "SELECT c.id FROM chunks c JOIN pages p ON c.page_slug = p.slug WHERE c.id IN ({})",
             placeholders
         );
         let mut conditions = Vec::new();
+        let tenant_scope = tenant_read_scope("c", ctx, ids.len() + 1);
+        conditions.push(tenant_scope.clause);
         if page_type.is_some() {
-            conditions.push("p.page_type = ?");
+            conditions.push(format!("p.page_type = ?{}", ids.len() + tenant_scope.binds.len() + 1));
         }
         if tag.is_some() {
-            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?{})",
+                ids.len() + tenant_scope.binds.len() + usize::from(page_type.is_some()) + 1
+            ));
         }
-        if !conditions.is_empty() {
-            sql.push_str(" AND ");
-            sql.push_str(&conditions.join(" AND "));
-        }
+        sql.push_str(" AND ");
+        sql.push_str(&conditions.join(" AND "));
 
         let mut q = sqlx::query(&sql);
         for id in &ids {
             q = q.bind(id);
+        }
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
         }
         if let Some(pt) = page_type {
             q = q.bind(pt);
@@ -1382,7 +1560,7 @@ impl Engine {
             .collect();
 
         let fetch_ids: Vec<i64> = filtered.iter().map(|(id, _)| *id).collect();
-        let texts = self.fetch_chunks_text(&fetch_ids).await?;
+        let texts = self.fetch_chunks_text_with_ctx(&fetch_ids, ctx).await?;
         let text_map: HashMap<i64, (String, String, String)> = texts
             .into_iter()
             .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
@@ -1408,11 +1586,22 @@ impl Engine {
         lang: &rbrain_core::page::Language,
         k: usize,
     ) -> Result<Vec<(i64, f64)>> {
+        self.hybrid_search_with_ctx(query, lang, k, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn hybrid_search_with_ctx(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        ctx: &TenantContext,
+    ) -> Result<Vec<(i64, f64)>> {
         // Get dense results and sparse results in parallel with keyword search.
         let (dense_results, sparse_results, keyword_results) = tokio::join!(
-            self.vector_search(query, k),
-            self.sparse_search(query, k),
-            self.keyword_search(query, lang, k),
+            self.vector_search_with_ctx(query, k, ctx),
+            self.sparse_search_with_ctx(query, k, ctx),
+            self.keyword_search_filtered_with_ctx(query, lang, k, None, None, ctx),
         );
 
         let mut ranked_lists: Vec<Vec<(i64, usize)>> = Vec::new();
@@ -1534,6 +1723,16 @@ impl Engine {
 
     /// Sparse vector search — returns empty when backend doesn't support it yet.
     async fn sparse_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        self.sparse_search_with_ctx(query, k, &TenantContext::default_tenant())
+            .await
+    }
+
+    async fn sparse_search_with_ctx(
+        &self,
+        query: &str,
+        k: usize,
+        ctx: &TenantContext,
+    ) -> Result<Vec<(i64, f32)>> {
         let embedder = match &self.inner.embedder {
             Some(e) => e,
             None => return Ok(vec![]),
@@ -1549,7 +1748,8 @@ impl Engine {
             return Ok(vec![]);
         }
 
-        vector_store.search_sparse(&sparse, k).await
+        let results = vector_store.search_sparse(&sparse, k).await?;
+        self.filter_ranked_chunks_f32(results, ctx).await
     }
 
     pub async fn expanded_search(
@@ -1557,6 +1757,17 @@ impl Engine {
         query: &str,
         lang: &rbrain_core::page::Language,
         k: usize,
+    ) -> Result<Vec<(i64, f64)>> {
+        self.expanded_search_with_ctx(query, lang, k, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn expanded_search_with_ctx(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        ctx: &TenantContext,
     ) -> Result<Vec<(i64, f64)>> {
         let deepseek = self.inner.deepseek.as_ref().cloned();
 
@@ -1591,10 +1802,10 @@ impl Engine {
         let _query_embeddings = if let Some(embedder) = &self.inner.embedder {
             match embedder.embed_batch(&all_queries).await {
                 Ok(embs) => embs,
-                Err(_) => return self.hybrid_search(query, lang, k).await,
+                Err(_) => return self.hybrid_search_with_ctx(query, lang, k, ctx).await,
             }
         } else {
-            return self.hybrid_search(query, lang, k).await;
+            return self.hybrid_search_with_ctx(query, lang, k, ctx).await;
         };
 
         let mut all_results: Vec<Vec<(i64, usize)>> = Vec::new();
@@ -1602,9 +1813,12 @@ impl Engine {
         for (idx, _) in all_queries.iter().enumerate() {
             let variant = &all_queries[idx];
 
-            let vector_results = self.vector_search(variant, k).await.unwrap_or_default();
+            let vector_results = self
+                .vector_search_with_ctx(variant, k, ctx)
+                .await
+                .unwrap_or_default();
             let keyword_results = self
-                .keyword_search(variant, lang, k)
+                .keyword_search_filtered_with_ctx(variant, lang, k, None, None, ctx)
                 .await
                 .unwrap_or_default();
 
@@ -1641,7 +1855,7 @@ impl Engine {
             _ => 0.0,
         };
         let boosted = if boost_weight > 0.0 {
-            self.apply_backlink_boost_weighted(&fused, boost_weight)
+            self.apply_backlink_boost_weighted(&fused, boost_weight, ctx)
                 .await?
         } else {
             fused
@@ -1654,21 +1868,29 @@ impl Engine {
         &self,
         results: &[(i64, f64)],
         weight: f64,
+        ctx: &TenantContext,
     ) -> Result<Vec<(i64, f64)>> {
         if results.is_empty() {
             return Ok(results.to_vec());
         }
 
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
-        let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders: String = (1..=chunk_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
 
+        let tenant_scope = tenant_read_scope("", ctx, chunk_ids.len() + 1);
         let query = format!(
-            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
-            placeholders
+            "SELECT id, page_slug FROM chunks WHERE id IN ({}) AND {}",
+            placeholders, tenant_scope.clause
         );
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
             sql_query = sql_query.bind(chunk_id);
+        }
+        for b in &tenant_scope.binds {
+            sql_query = sql_query.bind(b);
         }
 
         let rows = sql_query
@@ -1686,19 +1908,22 @@ impl Engine {
             return Ok(results.to_vec());
         }
 
-        let slug_placeholders: String = unique_slugs
-            .iter()
-            .map(|_| "?")
+        let slug_placeholders: String = (1..=unique_slugs.len())
+            .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
+        let tenant_scope = tenant_read_scope("", ctx, unique_slugs.len() + 1);
         let indegree_query = format!(
-            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
-            slug_placeholders
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({}) AND {}",
+            slug_placeholders, tenant_scope.clause
         );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
             indegree_sql = indegree_sql.bind(slug);
+        }
+        for b in &tenant_scope.binds {
+            indegree_sql = indegree_sql.bind(b);
         }
 
         let indegree_rows = indegree_sql
@@ -1726,7 +1951,55 @@ impl Engine {
         Ok(boosted_results)
     }
 
+    async fn filter_ranked_chunks_f32(
+        &self,
+        results: Vec<(i64, f32)>,
+        ctx: &TenantContext,
+    ) -> Result<Vec<(i64, f32)>> {
+        if results.is_empty() {
+            return Ok(results);
+        }
+        let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
+        let placeholders: String = (1..=chunk_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tenant_scope = tenant_read_scope("", ctx, chunk_ids.len() + 1);
+        let sql = format!(
+            "SELECT id FROM chunks WHERE id IN ({}) AND {}",
+            placeholders, tenant_scope.clause
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &chunk_ids {
+            q = q.bind(id);
+        }
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
+        }
+        let allowed: HashSet<i64> = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .iter()
+            .map(|r| r.get::<i64, _>("id"))
+            .collect();
+        Ok(results
+            .into_iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .collect())
+    }
+
     pub async fn vector_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        self.vector_search_with_ctx(query, k, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn vector_search_with_ctx(
+        &self,
+        query: &str,
+        k: usize,
+        ctx: &TenantContext,
+    ) -> Result<Vec<(i64, f32)>> {
         let embedder = self
             .inner
             .embedder
@@ -1752,15 +2025,22 @@ impl Engine {
         }
 
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
-        let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders: String = (1..=chunk_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tenant_scope = tenant_read_scope("", ctx, chunk_ids.len() + 1);
         let query = format!(
-            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
-            placeholders
+            "SELECT id, page_slug FROM chunks WHERE id IN ({}) AND {}",
+            placeholders, tenant_scope.clause
         );
 
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
             sql_query = sql_query.bind(chunk_id);
+        }
+        for b in &tenant_scope.binds {
+            sql_query = sql_query.bind(b);
         }
 
         let rows = sql_query
@@ -1781,19 +2061,22 @@ impl Engine {
             return Ok(vec![]);
         }
 
-        let slug_placeholders: String = unique_slugs
-            .iter()
-            .map(|_| "?")
+        let slug_placeholders: String = (1..=unique_slugs.len())
+            .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
+        let tenant_scope = tenant_read_scope("", ctx, unique_slugs.len() + 1);
         let indegree_query = format!(
-            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
-            slug_placeholders
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({}) AND {}",
+            slug_placeholders, tenant_scope.clause
         );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
             indegree_sql = indegree_sql.bind(slug);
+        }
+        for b in &tenant_scope.binds {
+            indegree_sql = indegree_sql.bind(b);
         }
 
         let indegree_rows = indegree_sql
@@ -1826,19 +2109,35 @@ impl Engine {
         &self,
         ids: &[i64],
     ) -> Result<Vec<(i64, String, String, String)>> {
+        self.fetch_chunks_text_with_ctx(ids, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn fetch_chunks_text_with_ctx(
+        &self,
+        ids: &[i64],
+        ctx: &TenantContext,
+    ) -> Result<Vec<(i64, String, String, String)>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders: String = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tenant_scope = tenant_read_scope("c", ctx, ids.len() + 1);
         let query = format!(
             "SELECT c.id, c.text, c.page_slug, COALESCE(p.page_type, 'note') as page_type \
              FROM chunks c LEFT JOIN pages p ON c.page_slug = p.slug \
-             WHERE c.id IN ({})",
-            placeholders
+             WHERE c.id IN ({}) AND {}",
+            placeholders, tenant_scope.clause
         );
         let mut sql = sqlx::query(&query);
         for id in ids {
             sql = sql.bind(id);
+        }
+        for b in &tenant_scope.binds {
+            sql = sql.bind(b);
         }
         let rows = sql
             .fetch_all(&self.inner.db)
@@ -1867,8 +2166,25 @@ impl Engine {
 
     /// Fetch a single chunk by id. Returns (text, page_slug) or None if not found.
     pub async fn fetch_chunk_by_id(&self, chunk_id: i64) -> Result<Option<(String, String)>> {
-        let row = sqlx::query("SELECT text, page_slug FROM chunks WHERE id = ?1")
-            .bind(chunk_id)
+        self.fetch_chunk_by_id_with_ctx(chunk_id, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn fetch_chunk_by_id_with_ctx(
+        &self,
+        chunk_id: i64,
+        ctx: &TenantContext,
+    ) -> Result<Option<(String, String)>> {
+        let tenant_scope = tenant_read_scope("", ctx, 2);
+        let sql = format!(
+            "SELECT text, page_slug FROM chunks WHERE id = ?1 AND {}",
+            tenant_scope.clause
+        );
+        let mut q = sqlx::query(&sql).bind(chunk_id);
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
+        }
+        let row = q
             .fetch_optional(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -1884,14 +2200,34 @@ impl Engine {
         expand: bool,
         max_chunks_per_page: usize,
     ) -> Result<Vec<ChunkResult>> {
+        self.search_with_context_with_ctx(
+            query,
+            lang,
+            k,
+            expand,
+            max_chunks_per_page,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn search_with_context_with_ctx(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        expand: bool,
+        max_chunks_per_page: usize,
+        ctx: &TenantContext,
+    ) -> Result<Vec<ChunkResult>> {
         let ranked = if expand {
-            self.expanded_search(query, lang, k).await?
+            self.expanded_search_with_ctx(query, lang, k, ctx).await?
         } else {
-            self.hybrid_search(query, lang, k).await?
+            self.hybrid_search_with_ctx(query, lang, k, ctx).await?
         };
 
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
-        let texts = self.fetch_chunks_text(&ids).await?;
+        let texts = self.fetch_chunks_text_with_ctx(&ids, ctx).await?;
 
         let text_map: HashMap<i64, (String, String, String)> = texts
             .into_iter()
@@ -1925,15 +2261,15 @@ impl Engine {
         ctx: &TenantContext,
     ) -> Result<Vec<LinkRef>> {
         let normalized = MarkdownParser::normalize_slug(slug);
-        let readable = ctx.readable_user_ids();
-        let placeholders = vec!["?"; readable.len()].join(",");
+        let tenant_scope = tenant_read_scope("", ctx, 2);
         let sql = format!(
             "SELECT source_slug, edge_type, context, chunk_id FROM links \
-             WHERE target_slug = ? AND user_id IN ({placeholders})"
+             WHERE target_slug = ?1 AND {}",
+            tenant_scope.clause
         );
         let mut q = sqlx::query(&sql).bind(&normalized);
-        for u in &readable {
-            q = q.bind(*u);
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
         }
         let rows = q
             .fetch_all(&self.inner.db)
@@ -1969,16 +2305,16 @@ impl Engine {
         ctx: &TenantContext,
     ) -> Result<Vec<LinkRef>> {
         let normalized = MarkdownParser::normalize_slug(slug);
-        let readable = ctx.readable_user_ids();
-        let placeholders = vec!["?"; readable.len()].join(",");
+        let tenant_scope = tenant_read_scope("", ctx, 2);
         let sql = format!(
             "SELECT target_slug, edge_type, context, chunk_id FROM links \
-             WHERE source_slug = ? AND user_id IN ({placeholders}) \
-             ORDER BY edge_type, target_slug"
+             WHERE source_slug = ?1 AND {} \
+             ORDER BY edge_type, target_slug",
+            tenant_scope.clause
         );
         let mut q = sqlx::query(&sql).bind(&normalized);
-        for u in &readable {
-            q = q.bind(*u);
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
         }
         let rows = q
             .fetch_all(&self.inner.db)
@@ -2038,20 +2374,19 @@ impl Engine {
         let cid = chunk_id.unwrap_or(-1);
 
         // Tenant guard: source page must be one the caller may write under.
-        let source_user_id: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM pages WHERE slug = ?1",
+        let source_owner = sqlx::query(
+            "SELECT user_id, project_id FROM pages WHERE slug = ?1",
         )
         .bind(&source)
         .fetch_optional(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        if let Some(owner) = source_user_id {
-            // Writes target the caller's user_id exactly — readable_user_ids
-            // is for reads. Source must match ctx.user_id (or be the caller's
-            // own page).
-            if owner != ctx.user_id && owner != "global" {
+        if let Some(row) = source_owner {
+            let owner_user: String = row.get("user_id");
+            let owner_project: Option<String> = row.get("project_id");
+            if !owner_matches_write_scope(&owner_user, owner_project.as_deref(), ctx) {
                 return Err(BrainError::Conflict(format!(
-                    "add_link denied: source {source_slug} belongs to tenant {owner}, not {}",
+                    "add_link denied: source {source_slug} belongs to tenant {owner_user}, not {}",
                     ctx.user_id
                 )));
             }
@@ -2207,8 +2542,40 @@ impl Engine {
         text: &str,
         source: Option<&str>,
     ) -> Result<()> {
+        self.add_timeline_entry_with_ctx(
+            slug,
+            date,
+            text,
+            source,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn add_timeline_entry_with_ctx(
+        &self,
+        slug: &str,
+        date: &str,
+        text: &str,
+        source: Option<&str>,
+        ctx: &TenantContext,
+    ) -> Result<()> {
         let (normalized, repo_path) = self.page_path(slug)?;
-        let page = self.get_page(&normalized).await?;
+        let page = self.get_page_with_ctx(&normalized, ctx).await?;
+        let owner = sqlx::query("SELECT user_id, project_id FROM pages WHERE slug = ?1")
+            .bind(&normalized)
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(row) = owner {
+            let owner_user: String = row.get("user_id");
+            let owner_project: Option<String> = row.get("project_id");
+            if !owner_matches_write_scope(&owner_user, owner_project.as_deref(), ctx) {
+                return Err(BrainError::Conflict(format!(
+                    "timeline update denied: {slug} belongs to a different tenant"
+                )));
+            }
+        }
         let entry = if let Some(src) = source {
             format!("- {}: {} [Source: {}]", date, text, src)
         } else {
@@ -2394,6 +2761,26 @@ impl Engine {
         expand: bool,
         response_schema: Option<&str>,
     ) -> Result<String> {
+        self.think_with_ctx(
+            topic,
+            lang,
+            limit,
+            expand,
+            response_schema,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn think_with_ctx(
+        &self,
+        topic: &str,
+        lang: &rbrain_core::page::Language,
+        limit: usize,
+        expand: bool,
+        response_schema: Option<&str>,
+        ctx: &TenantContext,
+    ) -> Result<String> {
         let deepseek = self
             .inner
             .deepseek
@@ -2405,7 +2792,7 @@ impl Engine {
 
         let candidates = limit.saturating_mul(5).max(limit);
         let chunks: Vec<ChunkResult> = self
-            .search_with_context(topic, lang, candidates, expand, MAX_POOL_DEFAULT)
+            .search_with_context_with_ctx(topic, lang, candidates, expand, MAX_POOL_DEFAULT, ctx)
             .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
@@ -2476,65 +2863,100 @@ impl Engine {
         depth: usize,
         direction: &str,
     ) -> Result<Vec<GraphEdge>> {
+        self.graph_query_with_ctx(
+            slug,
+            edge_type,
+            depth,
+            direction,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn graph_query_with_ctx(
+        &self,
+        slug: &str,
+        edge_type: Option<&str>,
+        depth: usize,
+        direction: &str,
+        ctx: &TenantContext,
+    ) -> Result<Vec<GraphEdge>> {
         let normalized = MarkdownParser::normalize_slug(slug);
 
         let mut edges = Vec::new();
+        let tenant_scope = tenant_read_scope("l", ctx, 4);
 
         let query = match direction {
             "out" => {
-                "WITH RECURSIVE graph AS (
-                    SELECT target_slug, edge_type, 1 AS depth, 'out' AS dir
-                    FROM links
-                    WHERE source_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
+                format!(
+                    "WITH RECURSIVE graph AS (
+                    SELECT l.target_slug, l.edge_type, 1 AS depth, 'out' AS dir
+                    FROM links l
+                    WHERE l.source_slug = ?1 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                     UNION ALL
                     SELECT l.target_slug, l.edge_type, g.depth + 1, 'out'
                     FROM links l
                     JOIN graph g ON l.source_slug = g.target_slug
-                    WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
+                    WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                 )
-                SELECT DISTINCT target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
+                SELECT DISTINCT target_slug, edge_type, depth, dir FROM graph ORDER BY depth",
+                    tenant_scope.clause, tenant_scope.clause
+                )
             }
             "in" => {
-                "WITH RECURSIVE graph AS (
-                    SELECT source_slug, edge_type, 1 AS depth, 'in' AS dir
-                    FROM links
-                    WHERE target_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
+                format!(
+                    "WITH RECURSIVE graph AS (
+                    SELECT l.source_slug, l.edge_type, 1 AS depth, 'in' AS dir
+                    FROM links l
+                    WHERE l.target_slug = ?1 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                     UNION ALL
                     SELECT l.source_slug, l.edge_type, g.depth + 1, 'in'
                     FROM links l
                     JOIN graph g ON l.target_slug = g.source_slug
-                    WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
+                    WHERE g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                 )
-                SELECT DISTINCT source_slug AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
+                SELECT DISTINCT source_slug AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth",
+                    tenant_scope.clause, tenant_scope.clause
+                )
             }
             "both" | _ => {
-                "WITH RECURSIVE graph AS (
-                    SELECT target_slug AS node, edge_type, 'out' AS dir, 1 AS depth
-                    FROM links
-                    WHERE source_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
+                format!(
+                    "WITH RECURSIVE graph AS (
+                    SELECT l.target_slug AS node, l.edge_type, 'out' AS dir, 1 AS depth
+                    FROM links l
+                    WHERE l.source_slug = ?1 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                     UNION ALL
-                    SELECT source_slug AS node, edge_type, 'in' AS dir, 1 AS depth
-                    FROM links
-                    WHERE target_slug = ?1 AND (?2 IS NULL OR edge_type = ?2)
+                    SELECT l.source_slug AS node, l.edge_type, 'in' AS dir, 1 AS depth
+                    FROM links l
+                    WHERE l.target_slug = ?1 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                     UNION ALL
                     SELECT l.target_slug, l.edge_type, 'out', g.depth + 1
                     FROM links l
                     JOIN graph g ON l.source_slug = g.node
-                    WHERE g.dir = 'out' AND g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
+                    WHERE g.dir = 'out' AND g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                     UNION ALL
                     SELECT l.source_slug, l.edge_type, 'in', g.depth + 1
                     FROM links l
                     JOIN graph g ON l.target_slug = g.node
-                    WHERE g.dir = 'in' AND g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2)
+                    WHERE g.dir = 'in' AND g.depth < ?3 AND (?2 IS NULL OR l.edge_type = ?2) AND {}
                 )
-                SELECT DISTINCT node AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth"
+                SELECT DISTINCT node AS target_slug, edge_type, depth, dir FROM graph ORDER BY depth",
+                    tenant_scope.clause,
+                    tenant_scope.clause,
+                    tenant_scope.clause,
+                    tenant_scope.clause
+                )
             }
         };
 
-        let rows = sqlx::query(query)
+        let mut q = sqlx::query(&query)
             .bind(&normalized)
             .bind(edge_type)
-            .bind(depth as i64)
+            .bind(depth as i64);
+        for b in &tenant_scope.binds {
+            q = q.bind(b);
+        }
+        let rows = q
             .fetch_all(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -2559,15 +2981,22 @@ impl Engine {
             } else {
                 (normalized.as_str(), edge.target.as_str())
             };
-            edge.context = sqlx::query_scalar(
+            let tenant_scope = tenant_read_scope("", ctx, 4);
+            let sql = format!(
                 "SELECT context FROM links \
-                 WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 \
+                 WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND {} \
                  ORDER BY id LIMIT 1",
-            )
-            .bind(source)
-            .bind(target)
-            .bind(&edge.edge_type)
-            .fetch_optional(&self.inner.db)
+                tenant_scope.clause
+            );
+            let mut q = sqlx::query_scalar(&sql)
+                .bind(source)
+                .bind(target)
+                .bind(&edge.edge_type);
+            for b in &tenant_scope.binds {
+                q = q.bind(b);
+            }
+            edge.context = q
+                .fetch_optional(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
             .flatten();
@@ -2642,7 +3071,20 @@ impl Engine {
 
     /// Get statistics about the knowledge base
     pub async fn get_stats(&self) -> Result<BrainStats> {
-        let rows = sqlx::query("SELECT page_type, COUNT(*) as cnt FROM pages GROUP BY page_type")
+        self.get_stats_with_ctx(&TenantContext::default_tenant()).await
+    }
+
+    pub async fn get_stats_with_ctx(&self, ctx: &TenantContext) -> Result<BrainStats> {
+        let page_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!(
+            "SELECT page_type, COUNT(*) as cnt FROM pages WHERE {} GROUP BY page_type",
+            page_scope.clause
+        );
+        let mut q = sqlx::query(&sql);
+        for b in &page_scope.binds {
+            q = q.bind(b);
+        }
+        let rows = q
             .fetch_all(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -2654,11 +3096,19 @@ impl Engine {
             pages_by_type.insert(page_type, count);
         }
 
-        let lang_rows =
-            sqlx::query("SELECT language, COUNT(*) as cnt FROM pages GROUP BY language")
-                .fetch_all(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let page_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!(
+            "SELECT language, COUNT(*) as cnt FROM pages WHERE {} GROUP BY language",
+            page_scope.clause
+        );
+        let mut q = sqlx::query(&sql);
+        for b in &page_scope.binds {
+            q = q.bind(b);
+        }
+        let lang_rows = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages_by_language: HashMap<String, i64> = HashMap::new();
         for row in lang_rows {
@@ -2667,16 +3117,27 @@ impl Engine {
             pages_by_language.insert(lang.unwrap_or("unknown".to_string()), count);
         }
 
-        let total_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        let chunk_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!("SELECT COUNT(*) FROM chunks WHERE {}", chunk_scope.clause);
+        let mut q = sqlx::query_scalar(&sql);
+        for b in &chunk_scope.binds {
+            q = q.bind(b);
+        }
+        let total_chunks: i64 = q
             .fetch_one(&self.inner.db)
             .await
             .unwrap_or(0);
 
-        let with_embedding: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE has_embedding = 1")
-                .fetch_one(&self.inner.db)
-                .await
-                .unwrap_or(0);
+        let chunk_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!(
+            "SELECT COUNT(*) FROM chunks WHERE has_embedding = 1 AND {}",
+            chunk_scope.clause
+        );
+        let mut q = sqlx::query_scalar(&sql);
+        for b in &chunk_scope.binds {
+            q = q.bind(b);
+        }
+        let with_embedding: i64 = q.fetch_one(&self.inner.db).await.unwrap_or(0);
 
         let embedding_coverage = if total_chunks > 0 {
             (with_embedding as f64 / total_chunks as f64) * 100.0
@@ -2684,12 +3145,24 @@ impl Engine {
             0.0
         };
 
-        let page_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pages")
+        let page_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!("SELECT COUNT(*) FROM pages WHERE {}", page_scope.clause);
+        let mut q = sqlx::query_scalar(&sql);
+        for b in &page_scope.binds {
+            q = q.bind(b);
+        }
+        let page_count: i64 = q
             .fetch_one(&self.inner.db)
             .await
             .unwrap_or(0);
 
-        let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links")
+        let link_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!("SELECT COUNT(*) FROM links WHERE {}", link_scope.clause);
+        let mut q = sqlx::query_scalar(&sql);
+        for b in &link_scope.binds {
+            q = q.bind(b);
+        }
+        let link_count: i64 = q
             .fetch_one(&self.inner.db)
             .await
             .unwrap_or(0);
@@ -2700,9 +3173,16 @@ impl Engine {
             0.0
         };
 
-        let recent_activity: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pages WHERE updated_at > datetime('now', '-7 days')",
-        )
+        let page_scope = tenant_read_scope("", ctx, 1);
+        let sql = format!(
+            "SELECT COUNT(*) FROM pages WHERE {} AND updated_at > datetime('now', '-7 days')",
+            page_scope.clause
+        );
+        let mut q = sqlx::query_scalar(&sql);
+        for b in &page_scope.binds {
+            q = q.bind(b);
+        }
+        let recent_activity: i64 = q
         .fetch_one(&self.inner.db)
         .await
         .unwrap_or(0);
@@ -2729,7 +3209,8 @@ impl Engine {
         let count = stale_slugs.len();
 
         for slug in stale_slugs {
-            self.submit_embed_job(&slug).await?;
+            self.submit_embed_job(&slug, &TenantContext::default_tenant())
+                .await?;
         }
 
         Ok(count)
@@ -2776,6 +3257,26 @@ impl Engine {
         expand: bool,
         template: Option<&str>,
     ) -> Result<String> {
+        self.generate_wiki_with_ctx(
+            topic,
+            lang,
+            limit,
+            expand,
+            template,
+            &TenantContext::default_tenant(),
+        )
+        .await
+    }
+
+    pub async fn generate_wiki_with_ctx(
+        &self,
+        topic: &str,
+        lang: &rbrain_core::page::Language,
+        limit: usize,
+        expand: bool,
+        template: Option<&str>,
+        ctx: &TenantContext,
+    ) -> Result<String> {
         let deepseek = self
             .inner
             .deepseek
@@ -2788,7 +3289,7 @@ impl Engine {
 
         let candidates = limit.saturating_mul(5).max(limit);
         let chunks: Vec<ChunkResult> = self
-            .search_with_context(topic, lang, candidates, expand, MAX_POOL_DEFAULT)
+            .search_with_context_with_ctx(topic, lang, candidates, expand, MAX_POOL_DEFAULT, ctx)
             .await?
             .into_iter()
             .filter(|c| !is_derived_research_context(&c.page_type))
@@ -2824,26 +3325,62 @@ impl Engine {
 
     /// Add a tag to a page (no-op if already present).
     pub async fn add_tag(&self, slug: &str, tag: &str) -> Result<()> {
-        let mut page = self.get_page(slug).await?;
+        self.add_tag_with_ctx(slug, tag, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn add_tag_with_ctx(
+        &self,
+        slug: &str,
+        tag: &str,
+        ctx: &TenantContext,
+    ) -> Result<()> {
+        let mut page = self.get_page_with_ctx(slug, ctx).await?;
         if !page.tags.contains(&tag.to_string()) {
             page.tags.push(tag.to_string());
-            self.write_tags_to_file_and_db(&page).await?;
+            self.write_tags_to_file_and_db(&page, ctx).await?;
         }
         Ok(())
     }
 
     /// Remove a tag from a page (no-op if not present).
     pub async fn remove_tag(&self, slug: &str, tag: &str) -> Result<()> {
-        let mut page = self.get_page(slug).await?;
+        self.remove_tag_with_ctx(slug, tag, &TenantContext::default_tenant())
+            .await
+    }
+
+    pub async fn remove_tag_with_ctx(
+        &self,
+        slug: &str,
+        tag: &str,
+        ctx: &TenantContext,
+    ) -> Result<()> {
+        let mut page = self.get_page_with_ctx(slug, ctx).await?;
         let before = page.tags.len();
         page.tags.retain(|t| t != tag);
         if page.tags.len() != before {
-            self.write_tags_to_file_and_db(&page).await?;
+            self.write_tags_to_file_and_db(&page, ctx).await?;
         }
         Ok(())
     }
 
-    async fn write_tags_to_file_and_db(&self, page: &Page) -> Result<()> {
+    async fn write_tags_to_file_and_db(&self, page: &Page, ctx: &TenantContext) -> Result<()> {
+        let owner = sqlx::query("SELECT user_id, project_id FROM pages WHERE slug = ?1")
+            .bind(&page.slug)
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(row) = owner {
+            let owner_user: String = row.get("user_id");
+            let owner_project: Option<String> = row.get("project_id");
+            if !owner_matches_write_scope(&owner_user, owner_project.as_deref(), ctx) {
+                return Err(BrainError::Conflict(format!(
+                    "tag update denied: {} belongs to a different tenant",
+                    page.slug
+                )));
+            }
+        }
+
         let tags_json = serde_json::to_string(&page.tags)?;
         let mut frontmatter = match &page.frontmatter {
             serde_json::Value::Object(map) => map.clone(),

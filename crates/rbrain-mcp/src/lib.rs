@@ -1,6 +1,6 @@
 use rbrain_core::page::Page;
 use rbrain_engine::engine::CitationHint;
-use rbrain_engine::Engine;
+use rbrain_engine::{Engine, TenantContext};
 use rbrain_engine::evidence::{
     ValidatorResult, analysis_plan_exists, artifact_hash_present, bibliography_consistency,
     citation_chunk_matches_slug, citation_chunks_exist, contradictions_recorded,
@@ -33,8 +33,27 @@ impl RBrainMcpServer {
 
 // ── Argument types ─────────────────────────────────────────────────────────
 
+#[derive(Deserialize, JsonSchema, Default, Clone)]
+pub struct TenantArgs {
+    /// Tenant user id. Omit for backwards-compatible default tenant.
+    pub user_id: Option<String>,
+    /// Tenant project id. Omit for the user's personal/default project scope.
+    pub project_id: Option<String>,
+}
+
+fn tenant_context(args: &TenantArgs) -> TenantContext {
+    match args.user_id.as_deref() {
+        Some("global") => TenantContext::global(),
+        Some("admin") => TenantContext::admin(),
+        Some("default") | None => TenantContext::default_tenant(),
+        Some(user_id) => TenantContext::for_user(user_id, args.project_id.clone()),
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct QueryArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Search query (any language)
     pub query: String,
     /// Max results to return (default 10, max 50)
@@ -45,12 +64,16 @@ pub struct QueryArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GetArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Page slug (URL-style identifier)
     pub slug: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct PutArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Page slug
     pub slug: String,
     /// Markdown content
@@ -61,12 +84,16 @@ pub struct PutArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DeleteArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Page slug to delete
     pub slug: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Filter by page type (e.g. "wiki", "note", "book")
     pub page_type: Option<String>,
     /// Filter by tag
@@ -81,6 +108,8 @@ pub struct ListArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GraphArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Starting page slug
     pub slug: String,
     /// Edge type filter (e.g. "references", "mentions")
@@ -93,12 +122,16 @@ pub struct GraphArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct BacklinksArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Target page slug — find all pages linking to this page
     pub slug: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct LinkArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Source page slug (the page making the claim or reference)
     pub from: String,
     /// Target page slug (the source being cited or related page)
@@ -121,6 +154,8 @@ pub struct UnlinkArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ThinkArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Topic to reason about
     pub topic: String,
     /// Number of context chunks (default 12, max 20)
@@ -135,6 +170,8 @@ pub struct ThinkArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TimelineArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Page slug to append the timeline entry to
     pub slug: String,
     /// Text description of the event or finding
@@ -147,6 +184,8 @@ pub struct TimelineArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TagArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Page slug
     pub slug: String,
     /// Tag to add or remove
@@ -155,6 +194,8 @@ pub struct TagArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct OutlinksArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Source page slug — find all pages this page links to
     pub slug: String,
 }
@@ -245,6 +286,8 @@ pub struct PageList {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GenerateArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     /// Topic to generate a page about
     pub topic: String,
     /// Number of context chunks to use (default 8, max 20)
@@ -462,6 +505,8 @@ pub struct CitationCheckResultJson {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct EvidenceCheckArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     pub finding_slug: String,
 }
 
@@ -477,6 +522,8 @@ pub struct EvidenceCheckResultJson {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ProvenanceArgs {
+    #[serde(flatten)]
+    pub tenant: TenantArgs,
     pub slug: String,
 }
 
@@ -765,15 +812,17 @@ impl RBrainMcpServer {
         let limit = args.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(10);
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.query);
+        let ctx = tenant_context(&args.tenant);
 
         match self
             .engine
-            .search_with_context(
+            .search_with_context_with_ctx(
                 &args.query,
                 &lang,
                 limit,
                 expand,
                 rbrain_engine::engine::MAX_POOL_DEFAULT,
+                &ctx,
             )
             .await
         {
@@ -801,7 +850,8 @@ impl RBrainMcpServer {
         description = "Retrieve a page by its slug. Returns the full Markdown content, tags, and metadata."
     )]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> Json<GetResult> {
-        match self.engine.get_page(&args.slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match self.engine.get_page_with_ctx(&args.slug, &ctx).await {
             Ok(page) => Json(GetResult {
                 found: true,
                 page: Some(PageResult {
@@ -829,12 +879,13 @@ impl RBrainMcpServer {
             'note' for raw notes, 'book' for imported books."
     )]
     async fn put(&self, Parameters(args): Parameters<PutArgs>) -> Json<MutationResult> {
+        let ctx = tenant_context(&args.tenant);
         let page = Page::new(
             args.slug,
             args.page_type.unwrap_or_else(|| "note".to_string()),
             args.content,
         );
-        match self.engine.put_page(page).await {
+        match self.engine.put_page_with_ctx(page, &ctx).await {
             Ok(_) => Json(MutationResult::ok("Page saved")),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
@@ -846,7 +897,8 @@ impl RBrainMcpServer {
         description = "Delete a page and all its associated chunks and embeddings."
     )]
     async fn delete(&self, Parameters(args): Parameters<DeleteArgs>) -> Json<MutationResult> {
-        match self.engine.delete_page(&args.slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match self.engine.delete_page_with_ctx(&args.slug, &ctx).await {
             Ok(_) => Json(MutationResult::ok("Page deleted")),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
@@ -860,14 +912,16 @@ impl RBrainMcpServer {
             Returns summaries with 160-char snippet."
     )]
     async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Json<PageList> {
+        let ctx = tenant_context(&args.tenant);
         match self
             .engine
-            .list_pages(
+            .list_pages_with_ctx(
                 args.page_type.as_deref(),
                 args.tag.as_deref(),
                 args.language.as_deref(),
                 args.limit,
                 args.sort_by.as_deref(),
+                &ctx,
             )
             .await
         {
@@ -900,10 +954,11 @@ impl RBrainMcpServer {
     async fn graph(&self, Parameters(args): Parameters<GraphArgs>) -> Json<GraphList> {
         let depth = args.depth.map(|d| d.clamp(1, 5) as usize).unwrap_or(2);
         let direction = args.direction.as_deref().unwrap_or("out");
+        let ctx = tenant_context(&args.tenant);
 
         match self
             .engine
-            .graph_query(&args.slug, args.edge_type.as_deref(), depth, direction)
+            .graph_query_with_ctx(&args.slug, args.edge_type.as_deref(), depth, direction, &ctx)
             .await
         {
             Ok(edges) => Json(GraphList {
@@ -926,7 +981,8 @@ impl RBrainMcpServer {
         description = "Find all pages that link to the given page. Useful for discovering related content and context."
     )]
     async fn backlinks(&self, Parameters(args): Parameters<BacklinksArgs>) -> Json<LinkList> {
-        match self.engine.backlinks(&args.slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match self.engine.backlinks_with_ctx(&args.slug, &ctx).await {
             Ok(links) => Json(LinkList {
                 results: links
                     .into_iter()
@@ -984,10 +1040,18 @@ impl RBrainMcpServer {
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(8);
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.topic);
+        let ctx = tenant_context(&args.tenant);
 
         match self
             .engine
-            .generate_wiki(&args.topic, &lang, limit, expand, args.template.as_deref())
+            .generate_wiki_with_ctx(
+                &args.topic,
+                &lang,
+                limit,
+                expand,
+                args.template.as_deref(),
+                &ctx,
+            )
             .await
         {
             Ok(wiki) => {
@@ -998,7 +1062,7 @@ impl RBrainMcpServer {
                         .replace(' ', "-")
                         .replace(['/', '\\', '.'], "-");
                     let page = Page::new(slug.clone(), "wiki".to_string(), wiki.clone());
-                    match self.engine.put_page(page).await {
+                    match self.engine.put_page_with_ctx(page, &ctx).await {
                         Ok(_) => Some(slug),
                         Err(e) => {
                             tracing::error!("brain_generate: failed to save page: {}", e);
@@ -1035,10 +1099,11 @@ impl RBrainMcpServer {
     )]
     async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> Json<MutationResult> {
         let link_type = args.link_type.as_deref().unwrap_or("related");
+        let ctx = tenant_context(&args.tenant);
 
         // Resolve context from chunk_id if provided
         let context: Option<String> = if let Some(chunk_id) = args.chunk_id {
-            match self.engine.fetch_chunk_by_id(chunk_id).await {
+            match self.engine.fetch_chunk_by_id_with_ctx(chunk_id, &ctx).await {
                 Ok(Some((text, _page_slug))) => Some(text),
                 Ok(None) => {
                     return Json(MutationResult::err(format!(
@@ -1056,12 +1121,13 @@ impl RBrainMcpServer {
 
         match self
             .engine
-            .add_link(
+            .add_link_with_ctx(
                 &args.from,
                 &args.to,
                 link_type,
                 context.as_deref(),
                 args.chunk_id,
+                &ctx,
             )
             .await
         {
@@ -1128,14 +1194,16 @@ impl RBrainMcpServer {
         let lang = rbrain_core::page::Language::detect(&args.topic);
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
         let expand = args.expand.unwrap_or(false);
+        let ctx = tenant_context(&args.tenant);
         match self
             .engine
-            .think(
+            .think_with_ctx(
                 &args.topic,
                 &lang,
                 limit,
                 expand,
                 args.response_schema.as_deref(),
+                &ctx,
             )
             .await
         {
@@ -1157,12 +1225,13 @@ impl RBrainMcpServer {
         &self,
         Parameters(args): Parameters<TimelineArgs>,
     ) -> Json<MutationResult> {
+        let ctx = tenant_context(&args.tenant);
         let date = args
             .date
             .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
         match self
             .engine
-            .add_timeline_entry(&args.slug, &date, &args.text, args.source.as_deref())
+            .add_timeline_entry_with_ctx(&args.slug, &date, &args.text, args.source.as_deref(), &ctx)
             .await
         {
             Ok(_) => Json(MutationResult::ok(format!(
@@ -1179,7 +1248,8 @@ impl RBrainMcpServer {
         description = "Add a tag to a page. Tags enable filtering with brain_list and brain_query."
     )]
     async fn add_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
-        match self.engine.add_tag(&args.slug, &args.tag).await {
+        let ctx = tenant_context(&args.tenant);
+        match self.engine.add_tag_with_ctx(&args.slug, &args.tag, &ctx).await {
             Ok(_) => Json(MutationResult::ok(format!(
                 "Tag '{}' added to '{}'",
                 args.tag, args.slug
@@ -1191,7 +1261,12 @@ impl RBrainMcpServer {
     /// Remove a tag from a page.
     #[tool(name = "brain_remove_tag", description = "Remove a tag from a page.")]
     async fn remove_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
-        match self.engine.remove_tag(&args.slug, &args.tag).await {
+        let ctx = tenant_context(&args.tenant);
+        match self
+            .engine
+            .remove_tag_with_ctx(&args.slug, &args.tag, &ctx)
+            .await
+        {
             Ok(_) => Json(MutationResult::ok(format!(
                 "Tag '{}' removed from '{}'",
                 args.tag, args.slug
@@ -1207,7 +1282,8 @@ impl RBrainMcpServer {
             Complement to brain_backlinks. Shows what a page references or cites."
     )]
     async fn outlinks(&self, Parameters(args): Parameters<OutlinksArgs>) -> Json<LinkList> {
-        match self.engine.outlinks(&args.slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match self.engine.outlinks_with_ctx(&args.slug, &ctx).await {
             Ok(links) => Json(LinkList {
                 results: links
                     .into_iter()
@@ -1663,7 +1739,10 @@ impl RBrainMcpServer {
         Parameters(args): Parameters<EvidenceCheckArgs>,
     ) -> Json<EvidenceCheckResultJson> {
         let pool = self.engine.get_db();
-        match rbrain_engine::evidence::run_evidence_check(pool, &args.finding_slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match rbrain_engine::evidence::run_evidence_check_with_ctx(pool, &args.finding_slug, &ctx)
+            .await
+        {
             Ok(report) => {
                 let chain_json =
                     serde_json::to_value(&report.chain).unwrap_or(serde_json::Value::Null);
@@ -1702,7 +1781,8 @@ impl RBrainMcpServer {
         Parameters(args): Parameters<ProvenanceArgs>,
     ) -> Json<ProvenanceResultJson> {
         let pool = self.engine.get_db();
-        match rbrain_engine::evidence::provenance_of(pool, &args.slug).await {
+        let ctx = tenant_context(&args.tenant);
+        match rbrain_engine::evidence::provenance_of_with_ctx(pool, &args.slug, &ctx).await {
             Ok(report) => {
                 let edges_json =
                     serde_json::to_value(&report.edges).unwrap_or(serde_json::Value::Array(vec![]));

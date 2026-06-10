@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use rbrain_core::page::Page;
-use rbrain_engine::Engine;
+use rbrain_engine::{Engine, TenantContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -81,6 +81,23 @@ fn calculate_relevance(query: &str, page: &Page) -> f32 {
     score
 }
 
+fn tenant_context(arguments: &serde_json::Value) -> TenantContext {
+    let user_id = arguments
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let project_id = arguments
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match user_id {
+        "global" => TenantContext::global(),
+        "admin" => TenantContext::admin(),
+        "default" => TenantContext::default_tenant(),
+        _ => TenantContext::for_user(user_id, project_id),
+    }
+}
+
 async fn call_tool(
     engine: &Engine,
     name: &str,
@@ -102,14 +119,16 @@ async fn call_tool(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let lang = rbrain_core::page::Language::detect(query);
+            let ctx = tenant_context(&arguments);
 
             let chunks = engine
-                .search_with_context(
+                .search_with_context_with_ctx(
                     query,
                     &lang,
                     limit,
                     expand,
                     rbrain_engine::engine::MAX_POOL_DEFAULT,
+                    &ctx,
                 )
                 .await
                 .map_err(|e| (-32000, format!("Query failed: {}", e)))?;
@@ -143,8 +162,9 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
+            let ctx = tenant_context(&arguments);
             let pages = engine
-                .list_pages(None, None, None, None, None)
+                .list_pages_with_ctx(None, None, None, None, None, &ctx)
                 .await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
@@ -190,7 +210,7 @@ async fn call_tool(
                 .map_or_else(|| "", |s| s);
 
             let page = engine
-                .get_page(slug)
+                .get_page_with_ctx(slug, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Page not found: {}", e)))?;
 
@@ -226,7 +246,7 @@ async fn call_tool(
 
             let page = Page::new(slug, page_type, content);
             engine
-                .put_page(page)
+                .put_page_with_ctx(page, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Failed to save page: {}", e)))?;
 
@@ -239,7 +259,14 @@ async fn call_tool(
                 .map(|s| s.to_string());
 
             let pages = engine
-                .list_pages(None, filter.as_deref(), None, None, None)
+                .list_pages_with_ctx(
+                    None,
+                    filter.as_deref(),
+                    None,
+                    None,
+                    None,
+                    &tenant_context(&arguments),
+                )
                 .await
                 .map_err(|e| (-32000, format!("Failed to list pages: {}", e)))?;
 
@@ -277,7 +304,13 @@ async fn call_tool(
                 .map_or_else(|| "out", |s| s);
 
             let edges = engine
-                .graph_query(slug, edge_type.as_deref(), depth, direction)
+                .graph_query_with_ctx(
+                    slug,
+                    edge_type.as_deref(),
+                    depth,
+                    direction,
+                    &tenant_context(&arguments),
+                )
                 .await
                 .map_err(|e| (-32000, format!("Graph query failed: {}", e)))?;
 
@@ -301,7 +334,7 @@ async fn call_tool(
                 .map_or_else(|| "", |s| s);
 
             let links = engine
-                .backlinks(slug)
+                .backlinks_with_ctx(slug, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Failed to get backlinks: {}", e)))?;
 
@@ -320,7 +353,7 @@ async fn call_tool(
         }
         "brain_stats" => {
             let pages = engine
-                .list_pages(None, None, None, None, None)
+                .list_pages_with_ctx(None, None, None, None, None, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Failed to get stats: {}", e)))?;
 
@@ -357,7 +390,7 @@ async fn call_tool(
                 .unwrap_or(false);
             let lang = rbrain_core::page::Language::detect(&topic);
             engine
-                .think(&topic, &lang, limit, expand, None)
+                .think_with_ctx(&topic, &lang, limit, expand, None, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Think failed: {}", e)))
         }
@@ -382,7 +415,13 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             engine
-                .add_timeline_entry(&slug, &date, &text, source.as_deref())
+                .add_timeline_entry_with_ctx(
+                    &slug,
+                    &date,
+                    &text,
+                    source.as_deref(),
+                    &tenant_context(&arguments),
+                )
                 .await
                 .map(|_| format!("Timeline entry added to '{}'", slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
@@ -399,7 +438,7 @@ async fn call_tool(
                 .unwrap_or("")
                 .to_string();
             engine
-                .add_tag(&slug, &tag)
+                .add_tag_with_ctx(&slug, &tag, &tenant_context(&arguments))
                 .await
                 .map(|_| format!("Tag '{}' added to '{}'", tag, slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
@@ -416,7 +455,7 @@ async fn call_tool(
                 .unwrap_or("")
                 .to_string();
             engine
-                .remove_tag(&slug, &tag)
+                .remove_tag_with_ctx(&slug, &tag, &tenant_context(&arguments))
                 .await
                 .map(|_| format!("Tag '{}' removed from '{}'", tag, slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
@@ -424,7 +463,7 @@ async fn call_tool(
         "brain_outlinks" => {
             let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
             let links = engine
-                .outlinks(slug)
+                .outlinks_with_ctx(slug, &tenant_context(&arguments))
                 .await
                 .map_err(|e| (-32000, format!("Failed: {}", e)))?;
             let results: Vec<_> = links
@@ -442,7 +481,7 @@ async fn call_tool(
         "brain_delete" => {
             let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
             engine
-                .delete_page(slug)
+                .delete_page_with_ctx(slug, &tenant_context(&arguments))
                 .await
                 .map(|_| format!("Page '{}' deleted", slug))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
@@ -465,7 +504,10 @@ async fn call_tool(
                 .to_string();
             let chunk_id = arguments.get("chunk_id").and_then(|v| v.as_i64());
             let context = if let Some(id) = chunk_id {
-                match engine.fetch_chunk_by_id(id).await {
+                match engine
+                    .fetch_chunk_by_id_with_ctx(id, &tenant_context(&arguments))
+                    .await
+                {
                     Ok(Some((text, _page_slug))) => Some(text),
                     Ok(None) => {
                         return Err((
@@ -487,7 +529,14 @@ async fn call_tool(
                     .map(|s| s.to_string())
             };
             engine
-                .add_link(&from, &to, &link_type, context.as_deref(), chunk_id)
+                .add_link_with_ctx(
+                    &from,
+                    &to,
+                    &link_type,
+                    context.as_deref(),
+                    chunk_id,
+                    &tenant_context(&arguments),
+                )
                 .await
                 .map(|_| {
                     if let Some(id) = chunk_id {

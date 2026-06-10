@@ -237,13 +237,7 @@ async fn delete_page_refuses_cross_tenant_slug() {
 }
 
 #[tokio::test]
-async fn put_page_overwrite_changes_owner_only_within_tenant() {
-    // Two-step: user alice writes notes/x; if bob writes notes/x, it would
-    // succeed because slug is the PK and ON CONFLICT updates user_id to bob.
-    // This is a deliberate design choice — slug is globally unique. We
-    // verify the actual behaviour matches the design: after bob's write,
-    // the page belongs to bob, and alice can no longer read it through her
-    // view.
+async fn put_page_refuses_cross_tenant_slug_takeover() {
     let tb = TestBrain::new().await;
     let engine = open_mock_engine(&tb).await;
 
@@ -254,15 +248,142 @@ async fn put_page_overwrite_changes_owner_only_within_tenant() {
         .put_page(page("notes/contested", "note", "Alice v1"))
         .await
         .unwrap();
-    // Bob writes the same slug — succeeds because PK is the slug, not (user, slug).
-    // The page now belongs to bob. If we later need slug-scope-per-user we'll
-    // change the PK; for M4 we accept this and rely on slug-namespacing
-    // conventions (research/<user>/<project>/...) to prevent collisions.
-    bob.put_page(page("notes/contested", "note", "Bob v1"))
+    let takeover = bob.put_page(page("notes/contested", "note", "Bob v1")).await;
+    assert!(
+        takeover.is_err(),
+        "cross-tenant put_page must not overwrite an existing slug"
+    );
+
+    assert!(alice.get_page("notes/contested").await.is_ok());
+    assert!(bob.get_page("notes/contested").await.is_err());
+}
+
+#[tokio::test]
+async fn user_cannot_delete_or_link_from_global_page() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let global = engine.with_tenant(TenantContext::global());
+    let alice = engine.with_tenant(TenantContext::for_user("alice", Some("phd")));
+
+    global
+        .put_page(page("raw/articles/global-source", "raw", "Global source"))
+        .await
+        .unwrap();
+    alice
+        .put_page(page("notes/alice-target", "note", "Alice target"))
         .await
         .unwrap();
 
-    // After Bob's write, alice cannot read the page; bob can.
-    assert!(alice.get_page("notes/contested").await.is_err());
-    assert!(bob.get_page("notes/contested").await.is_ok());
+    assert!(
+        alice.delete_page("raw/articles/global-source").await.is_err(),
+        "readable global page must not be writable by user tenant"
+    );
+    assert!(global.get_page("raw/articles/global-source").await.is_ok());
+
+    assert!(
+        alice
+            .add_link(
+                "raw/articles/global-source",
+                "notes/alice-target",
+                "supports",
+                None,
+                None
+            )
+            .await
+            .is_err(),
+        "user tenant must not create outgoing links from a global-owned page"
+    );
+}
+
+#[tokio::test]
+async fn search_with_context_does_not_return_other_tenant_chunks() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let alice_ctx = TenantContext::for_user("alice", Some("phd"));
+    let bob_ctx = TenantContext::for_user("bob", Some("thesis"));
+    let alice = engine.with_tenant(alice_ctx.clone());
+    let bob = engine.with_tenant(bob_ctx.clone());
+
+    alice
+        .put_page(Page::new(
+            "notes/alice-search".to_string(),
+            "note".to_string(),
+            "# Alice\n\nalice-only-token\n".to_string(),
+        ))
+        .await
+        .unwrap();
+    bob.put_page(Page::new(
+        "notes/bob-search".to_string(),
+        "note".to_string(),
+        "# Bob\n\nbob-only-token\n".to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let alice_page = alice.get_page("notes/alice-search").await.unwrap();
+    let bob_page = bob.get_page("notes/bob-search").await.unwrap();
+    engine
+        .chunk_and_embed_page_with_ctx(&alice_page, &alice_ctx)
+        .await
+        .unwrap();
+    engine
+        .chunk_and_embed_page_with_ctx(&bob_page, &bob_ctx)
+        .await
+        .unwrap();
+
+    let lang = rbrain_core::page::Language::En;
+    let alice_hits = alice
+        .search_with_context("bob-only-token", &lang, 10, false, 1)
+        .await
+        .unwrap();
+    assert!(
+        alice_hits
+            .iter()
+            .all(|hit| hit.page_slug != "notes/bob-search" && !hit.text.contains("bob-only-token")),
+        "alice search must not return bob's private chunk"
+    );
+
+    let bob_hits = bob
+        .search_with_context("bob-only-token", &lang, 10, false, 1)
+        .await
+        .unwrap();
+    assert_eq!(bob_hits.len(), 1);
+    assert_eq!(bob_hits[0].page_slug, "notes/bob-search");
+}
+
+#[tokio::test]
+async fn same_user_projects_are_scoped_separately() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let phd = engine.with_tenant(TenantContext::for_user("alice", Some("phd")));
+    let grant = engine.with_tenant(TenantContext::for_user("alice", Some("grant")));
+
+    phd.put_page(page("notes/phd-only", "note", "PhD")).await.unwrap();
+    grant
+        .put_page(page("notes/grant-only", "note", "Grant"))
+        .await
+        .unwrap();
+
+    let phd_slugs: Vec<String> = phd
+        .list_pages(Some("note"), None, None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    assert!(phd_slugs.contains(&"notes/phd-only".to_string()));
+    assert!(!phd_slugs.contains(&"notes/grant-only".to_string()));
+
+    let grant_slugs: Vec<String> = grant
+        .list_pages(Some("note"), None, None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    assert!(grant_slugs.contains(&"notes/grant-only".to_string()));
+    assert!(!grant_slugs.contains(&"notes/phd-only".to_string()));
 }

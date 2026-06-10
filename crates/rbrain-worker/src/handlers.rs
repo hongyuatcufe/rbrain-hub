@@ -1,7 +1,7 @@
 use crate::{Job, JobHandler};
 use async_trait::async_trait;
 use rbrain_core::error::Result;
-use rbrain_engine::Engine;
+use rbrain_engine::{Engine, TenantContext};
 use tracing::info;
 
 pub struct EmbedPageHandler {
@@ -40,13 +40,31 @@ impl JobHandler for EmbedPageHandler {
 
         info!("Processing embed_page job for slug: {}", slug);
 
-        let page = self.engine.get_page(slug).await?;
+        let ctx = tenant_from_params(&params);
+        let page = self.engine.get_page_with_ctx(slug, &ctx).await?;
 
-        self.engine.chunk_and_embed_page(&page).await?;
+        self.engine.chunk_and_embed_page_with_ctx(&page, &ctx).await?;
 
         info!("Successfully embedded page: {}", slug);
 
         Ok(Some(serde_json::json!({ "slug": slug, "status": "embedded" })))
+    }
+}
+
+fn tenant_from_params(params: &serde_json::Value) -> TenantContext {
+    let user_id = params
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let project_id = params
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match user_id {
+        "global" => TenantContext::global(),
+        "admin" => TenantContext::admin(),
+        "default" => TenantContext::default_tenant(),
+        _ => TenantContext::for_user(user_id, project_id),
     }
 }
 

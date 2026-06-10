@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
 use crate::research::edges::ALL as RESEARCH_EDGES;
+use crate::research::TenantContext;
 
 fn db_err<E: std::fmt::Display>(e: E) -> BrainError {
     BrainError::Io(std::io::Error::new(
@@ -47,34 +48,61 @@ pub struct ProvenanceReport {
     pub edges: Vec<ProvenanceEdge>,
 }
 
-/// Build an SQL `IN (?,?,...)` placeholder for the edge whitelist.
-fn placeholders(n: usize) -> String {
-    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+fn numbered_placeholders(start: usize, n: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn readable_users(ctx: &TenantContext) -> Vec<String> {
+    ctx.readable_user_ids()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub async fn provenance_of(pool: &SqlitePool, slug: &str) -> Result<ProvenanceReport> {
+    provenance_of_with_ctx(pool, slug, &TenantContext::default_tenant()).await
+}
+
+pub async fn provenance_of_with_ctx(
+    pool: &SqlitePool,
+    slug: &str,
+    ctx: &TenantContext,
+) -> Result<ProvenanceReport> {
     // Resolve the page type once so callers can render headings without a
     // second round-trip.
-    let page_type: String = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?")
-        .bind(slug)
+    let readable = readable_users(ctx);
+    let user_ph = numbered_placeholders(2, readable.len());
+    let sql = format!("SELECT page_type FROM pages WHERE slug = ?1 AND user_id IN ({user_ph})");
+    let mut q = sqlx::query_scalar(&sql).bind(slug);
+    for user_id in &readable {
+        q = q.bind(user_id);
+    }
+    let page_type: String = q
         .fetch_optional(pool)
         .await
         .map_err(db_err)?
         .ok_or_else(|| BrainError::Conflict(format!("page not found: {slug}")))?;
 
     let edge_names: Vec<&str> = RESEARCH_EDGES.iter().map(|e| e.as_str()).collect();
-    let ph = placeholders(edge_names.len());
+    let ph = numbered_placeholders(2, edge_names.len());
+    let user_ph = numbered_placeholders(2 + edge_names.len(), readable.len());
 
     // Outgoing edges: slug --edge--> neighbour
     let out_sql = format!(
         "SELECT l.edge_type, p.slug AS neighbour_slug, p.page_type AS neighbour_page_type
          FROM links l JOIN pages p ON p.slug = l.target_slug
-         WHERE l.source_slug = ? AND l.edge_type IN ({ph})
+         WHERE l.source_slug = ?1 AND l.edge_type IN ({ph}) AND l.user_id IN ({user_ph})
          ORDER BY l.edge_type, p.slug"
     );
     let mut q = sqlx::query(&out_sql).bind(slug);
     for e in &edge_names {
         q = q.bind(*e);
+    }
+    for user_id in &readable {
+        q = q.bind(user_id);
     }
     let out_rows = q.fetch_all(pool).await.map_err(db_err)?;
 
@@ -82,12 +110,15 @@ pub async fn provenance_of(pool: &SqlitePool, slug: &str) -> Result<ProvenanceRe
     let in_sql = format!(
         "SELECT l.edge_type, p.slug AS neighbour_slug, p.page_type AS neighbour_page_type
          FROM links l JOIN pages p ON p.slug = l.source_slug
-         WHERE l.target_slug = ? AND l.edge_type IN ({ph})
+         WHERE l.target_slug = ?1 AND l.edge_type IN ({ph}) AND l.user_id IN ({user_ph})
          ORDER BY l.edge_type, p.slug"
     );
     let mut q = sqlx::query(&in_sql).bind(slug);
     for e in &edge_names {
         q = q.bind(*e);
+    }
+    for user_id in &readable {
+        q = q.bind(user_id);
     }
     let in_rows = q.fetch_all(pool).await.map_err(db_err)?;
 
@@ -122,8 +153,8 @@ mod tests {
 
     #[test]
     fn placeholders_one_per_edge() {
-        assert_eq!(placeholders(3), "?,?,?");
-        assert_eq!(placeholders(1), "?");
+        assert_eq!(numbered_placeholders(1, 3), "?1,?2,?3");
+        assert_eq!(numbered_placeholders(4, 1), "?4");
     }
 
     #[test]

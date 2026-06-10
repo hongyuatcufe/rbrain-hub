@@ -17,8 +17,10 @@ pub mod validators;
 
 pub use actions::SuggestedAction;
 pub use citation::{CitationCheckReport, run_citation_check};
-pub use evidence_walk::{EvidenceChain, EvidenceNode, EvidenceReport, run_evidence_check};
-pub use provenance::{ProvenanceEdge, ProvenanceReport, provenance_of};
+pub use evidence_walk::{
+    EvidenceChain, EvidenceNode, EvidenceReport, run_evidence_check, run_evidence_check_with_ctx,
+};
+pub use provenance::{ProvenanceEdge, ProvenanceReport, provenance_of, provenance_of_with_ctx};
 pub use result::{ValidatorResult, ValidatorStatus};
 pub use validators::{
     analysis_plan_exists, artifact_hash_present, bibliography_consistency, check_synthesis_quality,

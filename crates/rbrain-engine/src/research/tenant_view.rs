@@ -17,7 +17,7 @@
 use rbrain_core::error::Result;
 use rbrain_core::page::Page;
 
-use crate::engine::Engine;
+use crate::engine::{BrainStats, ChunkResult, Engine, GraphEdge};
 use crate::links::LinkRef;
 
 use super::tenant::TenantContext;
@@ -101,5 +101,34 @@ impl<'a> TenantView<'a> {
 
     pub async fn backlinks(&self, slug: &str) -> Result<Vec<LinkRef>> {
         self.engine.backlinks_with_ctx(slug, &self.ctx).await
+    }
+
+    pub async fn graph_query(
+        &self,
+        slug: &str,
+        edge_type: Option<&str>,
+        depth: usize,
+        direction: &str,
+    ) -> Result<Vec<GraphEdge>> {
+        self.engine
+            .graph_query_with_ctx(slug, edge_type, depth, direction, &self.ctx)
+            .await
+    }
+
+    pub async fn search_with_context(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        expand: bool,
+        max_chunks_per_page: usize,
+    ) -> Result<Vec<ChunkResult>> {
+        self.engine
+            .search_with_context_with_ctx(query, lang, k, expand, max_chunks_per_page, &self.ctx)
+            .await
+    }
+
+    pub async fn get_stats(&self) -> Result<BrainStats> {
+        self.engine.get_stats_with_ctx(&self.ctx).await
     }
 }
