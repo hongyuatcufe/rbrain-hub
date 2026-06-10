@@ -13,6 +13,12 @@ This note records the code-review findings and roadmap for evolving rbrain-hub i
 > **M3 后审查修复**（同 commit）：5 个 review-found issue 全部修复（CLAUDE.md 工具表同步、`primary_source_ratio` 的 N+1 SQL 改批量、`bibliography_consistency` SuggestedAction 字段误用、lit-review validator 注释更新、execution plan M3 ✅）。
 >
 > **下一阶段 M4+**：从单租户单语料 brain 演化为 **多用户多项目 SaaS 学术研究记忆层**，配合 ZeroClaw（admin 工作台）+ 新写轻量 agent runtime（用户端），支撑 200+ 期刊监控 + 学术观点推送 + 文献综述协助。详见本文档底部章节。
+>
+> **M4 PR-1 进行中（2026-06-10）**：
+> - **PR-1a shipped (`2e024df`)**：migration 0014 (tenancy columns) + 0015 (projects 表) + `TenantContext` / `ProjectStore` 模块 + 9-test `project_lifecycle_fixture`。
+> - **PR-1b shipped (`3065389`)**：Engine 8 个核心方法 (`put_page` / `get_page` / `delete_page` / `list_pages` / `add_link` / `outlinks` / `backlinks` / `put_page_force`) 新增 `_with_ctx` tenant-aware 变体；新增 `TenantView<'a>` 包装器 + `Engine::with_tenant()` 入口；8-test `tenant_view_fixture` 覆盖 read/write isolation、global 可见、跨 tenant 拒绝、delete guard 等不变式。
+> - **测试**：128/128 ✅（65 lib + 10 + 8 + 28 + 9 + 8 fixtures）。既有 105 测试零修改，完全 backwards-compat。
+> - **PR-1c 推迟**：validator / provenance / evidence_walk tenant scope、105 测试 wrapper 迁移、MCP / CLI 调用站迁移。这些是机械收尾，不阻塞 PR-2。
 
 ## Current assessment
 
@@ -623,9 +629,21 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
 
 ## M4 — 多租户基础 + 三层 tenant + 项目文件夹
 
+**进度**（2026-06-10）：
+
+| Sub-PR | 内容 | 状态 |
+|---|---|---|
+| PR-1a | migration 0014/0015 + TenantContext/ProjectStore modules + project_lifecycle_fixture | ✅ shipped `2e024df` |
+| PR-1b | Engine 8 个 `_with_ctx` 变体 + `TenantView` wrapper + tenant_view_fixture | ✅ shipped `3065389` |
+| PR-1c | Validators/provenance/evidence_walk tenant scope + 既有 105 测试迁 wrapper + MCP/CLI 调用站迁 | ⏸️ 推迟（机械收尾、不阻塞 PR-2） |
+| PR-2 | migration 0016–0020 (project_topics / page_topics / push_inbox / topic_digests / research_runs.project_id) + store 模块 | 🚧 下一步 |
+| PR-3 | 7 新 MCP 工具（5 project 管理 + 3 push inbox）+ `brain_create_research_run` 加 project_id | 待办 |
+| PR-4 | CLI `rbrain project` 子命令 + context 注入 + `.rbrain/context.toml` | 待办 |
+| PR-5 | `rbrain sync` / `rbrain export` 文件夹 ↔ 单 DB 双向同步改造 | 待办 |
+
 ### 4.1 Schema 改造（migration 0014–0020）
 
-- **0014_tenancy_columns.sql**
+- **0014_tenancy_columns.sql** ✅ shipped (PR-1a)
   ```sql
   ALTER TABLE pages         ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default';
   ALTER TABLE pages         ADD COLUMN project_id TEXT;
@@ -635,7 +653,7 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
   - 所有索引重建为 `(user_id, ...)` 前缀
   - 保留 `user_id='global'` / `'admin'` 作为系统专用 tenant
 
-- **0015_projects.sql**
+- **0015_projects.sql** ✅ shipped (PR-1a)
   ```sql
   CREATE TABLE projects (
       id TEXT PRIMARY KEY,

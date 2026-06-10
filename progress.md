@@ -11,6 +11,68 @@ rbrain-hub 是面向学术研究的 Rust 知识库系统，包含 CLI、MCP 服�
 
 ---
 
+## 2026-06-10 — M4 PR-1 启动：Tenancy 基础 + TenantView 包装器
+
+### M4 PR-1a（commit `2e024df`）：Schema + 模块基础
+
+- Migration `0014_tenancy_columns.sql`：`pages` / `chunks` / `links` / `page_stats` / `jobs` 加 `user_id` + `project_id` 列（默认 `'default'`），重建索引为 `(user_id, ...)` 前缀。保留 `'global'` / `'admin'` / `'default'` 三个系统 tenant 值。
+- Migration `0015_projects.sql`：`projects(id, slug, owner_user_id, title, description, status, ...)`，`UNIQUE(owner_user_id, slug)`，status ∈ active/archived/complete。
+- 新模块 `crates/rbrain-engine/src/research/tenant.rs`：`TenantContext` 类型 + 4 个构造函数（`global()` / `admin()` / `for_user(user, project)` / `default_tenant()`）+ `readable_user_ids()`（用户 = 自己 + global；admin = 仅自己；global = 仅自己）。5 个单测覆盖三层语义。
+- 新模块 `crates/rbrain-engine/src/research/projects.rs`：`Project` / `ProjectStatus` / `ProjectStore` CRUD（create / get / find_by_slug / list_by_user / set_status / archive / update_metadata）+ 1 个单测。
+- 新 fixture `project_lifecycle_fixture`：9 测试覆盖 create-get-find/duplicate-rejection/cross-user-slug-reuse/status-filter/archive-restore/metadata-update/error 路径。
+
+### M4 PR-1b（commit `3065389`）：Engine 核心 tenant-aware + TenantView 包装器
+
+新增 8 个 `_with_ctx` Engine 方法变体（put_page / put_page_force / get_page / delete_page / list_pages / add_link / outlinks / backlinks），既有方法签名不变，内部走 `TenantContext::default_tenant()` 保持完全向后兼容。
+
+- `put_page_with_ctx`：INSERT pages 行带 `(user_id, project_id)`，自动提取的 wikilinks 同步携带 tenant。
+- `get_page_with_ctx` / `list_pages_with_ctx`：`WHERE user_id IN (...)` 过滤（从 `ctx.readable_user_ids()`）。
+- `delete_page_with_ctx`：tenant guard，跨 tenant 的 slug 删除被拒绝。
+- `add_link_with_ctx`：tenant guard 检查 source_slug 是否属于 caller；INSERT links 行带 `(user_id, project_id)`。
+- `outlinks_with_ctx` / `backlinks_with_ctx`：边的 user_id 必须在 readable set 里。
+
+新增 `crates/rbrain-engine/src/research/tenant_view.rs`：`TenantView<'a>` 包装器，让 caller 写 `engine.with_tenant(ctx).put_page(page)` 替代显式 `&TenantContext` 参数。`Engine::with_tenant(ctx)` 入口已暴露。
+
+新 fixture `tenant_view_fixture`：8 测试覆盖：
+- user A 看不到 user B 的页面
+- global 页面对所有用户可见
+- list_pages 按 caller 切片
+- list 中合并 caller + global 内容
+- add_link 跨 tenant 被拒绝
+- outlinks / backlinks 按 readable set 过滤
+- delete_page 跨 tenant 被拒绝
+- 同 slug 不同 tenant 的写入行为（PK 仍是 slug，记录了刻意的设计选择）
+
+### 测试状态
+
+| Suite | 之前 | 现在 |
+|---|---|---|
+| `rbrain-engine --lib` | 59/59 | **65/65** ✅（+6 tenant/project 单测） |
+| `data_analysis_fixture` | 10/10 | 10/10 ✅ |
+| `m2_provenance_fixture` | 8/8 | 8/8 ✅ |
+| `literature_validators_fixture` | 28/28 | 28/28 ✅ |
+| `project_lifecycle_fixture` | — | **9/9** ✅（新） |
+| `tenant_view_fixture` | — | **8/8** ✅（新） |
+| **总计** | 105 | **128** |
+
+`cargo check --workspace` 全绿，无 error。既有 105 测试一行未改，pre-M4 代码路径完整保留。
+
+### PR-1 推迟部分（PR-1c）
+
+下列工作转入 PR-1c：
+
+- **Validators / provenance / evidence_walk 的 tenant scope**：目前 lit-review validator 仍是全库扫（M3 留下的 B3 issue）。M4 schema 提供了 user_id 列，但 14 个 validator 的 SQL 还没改。
+- **既有 105 测试的 wrapper 迁移**：当前依赖 backwards-compat，未来要把所有 `engine.put_page(p)` 改成 `view.put_page(p)`。机械工作，约 113 个 call site。
+- **MCP / CLI 调用站迁移**：23 + 36 = 59 个调用站，需要解耦出 tenant 注入逻辑（auth → TenantContext）。
+
+### 路线图更新
+
+- **M4 PR-1**：core tenancy 进行中（PR-1a + PR-1b 完成，PR-1c 推迟）
+- **M4 PR-2**：剩余 schema（migration 0016–0020：project_topics / page_topics / push_inbox / topic_digests + research_runs.project_id）+ 对应 store 模块
+- **M4 PR-3–PR-5**：见 plan.md M4+ 章节
+
+---
+
 ## 2026-06-10 — M3 收尾 + M4+ 多租户路线图锁定
 
 ### M0–M3 全部上线（截至 commit `8c98000`）
