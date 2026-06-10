@@ -57,6 +57,18 @@ M1 工具表已锁定为 5–6 个合并工具，**禁止**新增独立的 `brai
 
 `brain_verify_citations(slug, content?, check_content?, hints?)` 给定文档 slug（或直接传 `content` 字符串）+ 可选的 `CitationHint[]`（author/year/title_fragment），抽取每条引用、按 `pub_metadata` 或语义检索解析出原文 slug、并核对作者/年份/期刊。`check_content=true` 还会让 LLM 判定原文是否实际支持该 claim。返回 `DocCitationReport { citations[], summary { total, resolved, bib_error, bib_warn, ... } }`。
 
+### ⚠ MCP `TenantArgs` 是 M4 → M10 的过渡设计
+
+M4 PR-1c（2026-06-11）在 MCP 核心工具（query / get / put / delete / list / graph / backlinks / outlinks / think / generate / link / timeline / tag …）的参数 schema 里通过 `#[serde(flatten)] tenant: TenantArgs { user_id, project_id }` 暴露了 tenant 字段。**这与本文档 §4.4 "不在参数里暴露——避免客户端伪造身份"原则冲突**，但在 M4 阶段没有 auth gateway 时是唯一可行的过渡方案。
+
+**M10 落地 lightweight agent runtime + auth 时必须做的事**（写在 `rbrain-hub/plan.md` §10.4）：
+
+1. 从 auth token 解出 `(user_id, project_id)` 注入到 MCP server 上下文
+2. 从所有 MCP arg schemas 中移除 `TenantArgs`
+3. 若 `TenantArgs` 仍出现在请求里，server 应**忽略**（不能被客户端覆盖 auth 上下文）
+
+这是 M10 启动时**第一件要做的事**，否则任意客户端可冒充任意身份。
+
 ---
 
 ## 4. 数据模型约定

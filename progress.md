@@ -107,7 +107,7 @@ Claude M4 PR-1a/1b 后的系统审查发现：新增 tenancy columns 和 `Tenant
 ### 路线图更新
 
 - **M4 PR-1**：core tenancy 进行中（PR-1a + PR-1b 完成；PR-1c 安全收口完成，lit-review validators / pipeline / CLI 等剩余项后置）
-- **M4 PR-2**：剩余 schema（migration 0016–0020：project_topics / page_topics / push_inbox / topic_digests + research_runs.project_id）+ 对应 store 模块
+- **M4 PR-2**：剩余 schema（migration 0017–0021：project_topics / page_topics / push_inbox / topic_digests + research_runs.project_id）+ 对应 store 模块。**注**：原 0016 编号被 PR-1c 占用为 `page_stats` trigger tenant 修复，PR-2 顺延一格
 - **M4 PR-3–PR-5**：见 plan.md M4+ 章节
 
 ---

@@ -18,6 +18,8 @@ This note records the code-review findings and roadmap for evolving rbrain-hub i
 > - **PR-1a shipped (`2e024df`)**：migration 0014 (tenancy columns) + 0015 (projects 表) + `TenantContext` / `ProjectStore` 模块 + 9-test `project_lifecycle_fixture`。
 > - **PR-1b shipped (`3065389`)**：Engine 8 个核心方法 (`put_page` / `get_page` / `delete_page` / `list_pages` / `add_link` / `outlinks` / `backlinks` / `put_page_force`) 新增 `_with_ctx` tenant-aware 变体；新增 `TenantView<'a>` 包装器 + `Engine::with_tenant()` 入口；8-test `tenant_view_fixture` 覆盖 read/write isolation、global 可见、跨 tenant 拒绝、delete guard 等不变式。
 > - **PR-1c security hardening shipped (2026-06-11)**：核心检索/graph/stats/chunk 回取新增 `_with_ctx`；MCP stdio + HTTP 核心工具支持可选 `user_id` / `project_id`；worker embed job 继承 tenant；`brain_evidence_check` / `brain_provenance_of` 切 scoped 版本；新增 migration 0016 修复 tenant-aware `page_stats` trigger；`tenant_view_fixture` 扩到 11 测试。
+>
+> ⚠ **临时设计警告（M10 时必须收掉）**：PR-1c 把 `TenantArgs { user_id, project_id }` 通过 `#[serde(flatten)]` 暴露在 MCP 工具参数里。这违反了 plan.md §4.4 "**不在参数里暴露**——避免客户端伪造身份" 原则，是 **M4 PR-1 阶段没有 auth gateway 时的过渡方案**。M10 落地 lightweight agent runtime + auth gateway 时必须改回：从 auth token 解出 `(user_id, project_id)` 注入 server 上下文，把 `TenantArgs` 从 schema 中移除。否则任意客户端可冒充任意身份。
 > - **测试**：131/131 ✅（65 lib + 10 data_analysis + 8 m2 + 28 literature + 9 project + 11 tenant_view）。`cargo check --workspace` / `rbrain-mcp --no-default-features --lib` / `rbrain-worker --lib` / `git diff --check` 均通过。
 > - **PR-1c 剩余后置**：lit-review validators tenant scope、pipeline/dream cycle tenant 注入、CLI 显式 tenant/project context、维护命令（remove_link/orphan/stale/fix）tenant 收口。这些继续后置，不阻塞 PR-2。
 
@@ -638,12 +640,14 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
 | PR-1b | Engine 8 个 `_with_ctx` 变体 + `TenantView` wrapper + tenant_view_fixture | ✅ shipped `3065389` |
 | PR-1c | Tenant safety hardening：search/graph/stats/chunk 回取、MCP stdio+HTTP、worker embed job、provenance/evidence_walk、page_stats trigger | ✅ partial shipped 2026-06-11 |
 | PR-1c-remain | Lit-review validators tenant scope + pipeline/dream cycle tenant 注入 + CLI context + 维护命令收口 + 既有测试 wrapper 迁移 | ⏸️ 后置（不阻塞 PR-2） |
-| PR-2 | migration 0016–0020 (project_topics / page_topics / push_inbox / topic_digests / research_runs.project_id) + store 模块 | 🚧 下一步 |
+| PR-2 | migration 0017–0021 (project_topics / page_topics / push_inbox / topic_digests / research_runs.project_id) + store 模块 ※ 0016 被 PR-1c 占用为 page_stats trigger 修复 | 🚧 下一步 |
 | PR-3 | 7 新 MCP 工具（5 project 管理 + 3 push inbox）+ `brain_create_research_run` 加 project_id | 待办 |
 | PR-4 | CLI `rbrain project` 子命令 + context 注入 + `.rbrain/context.toml` | 待办 |
 | PR-5 | `rbrain sync` / `rbrain export` 文件夹 ↔ 单 DB 双向同步改造 | 待办 |
 
-### 4.1 Schema 改造（migration 0014–0020）
+### 4.1 Schema 改造（migration 0014–0021）
+
+> **编号变更**：原计划 PR-2 migrations 编号为 `0016–0020`。PR-1c 在 2026-06-11 占用了 `0016` 用于 `page_stats` trigger tenant 修复。PR-2 的 5 个 migration 顺延为 `0017–0021`。
 
 - **0014_tenancy_columns.sql** ✅ shipped (PR-1a)
   ```sql
@@ -670,7 +674,7 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
   ) STRICT;
   ```
 
-- **0016_project_topics.sql** — 项目订阅哪些 topic
+- **0017_project_topics.sql** — 项目订阅哪些 topic（顺延自原 0016）
   ```sql
   CREATE TABLE project_topics (
       project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -681,7 +685,7 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
   ) STRICT;
   ```
 
-- **0017_page_topics.sql** — 文章被打的 topic 标签
+- **0018_page_topics.sql** — 文章被打的 topic 标签（顺延自原 0017）
   ```sql
   CREATE TABLE page_topics (
       page_slug TEXT NOT NULL,
@@ -694,12 +698,12 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
   CREATE INDEX idx_page_topics_topic ON page_topics(topic, user_id);
   ```
 
-- **0018_research_runs_project.sql**
+- **0019_research_runs_project.sql**（顺延自原 0018）
   ```sql
   ALTER TABLE research_runs ADD COLUMN project_id TEXT NOT NULL DEFAULT 'unassigned';
   ```
 
-- **0019_push_inbox.sql**
+- **0020_push_inbox.sql**（顺延自原 0019）
   ```sql
   CREATE TABLE push_inbox (
       id TEXT PRIMARY KEY,
@@ -718,7 +722,7 @@ M0–M3 已经全部上线（commit `8c98000`）：研究运行表、validator �
   CREATE INDEX idx_push_inbox_user ON push_inbox(user_id, project_id, status, created_at DESC);
   ```
 
-- **0020_topic_digests.sql**
+- **0021_topic_digests.sql**（顺延自原 0020）
   ```sql
   CREATE TABLE topic_digests (
       id TEXT PRIMARY KEY,
@@ -851,7 +855,7 @@ impl TenantContext {
 
 | 文件 | 工作 |
 |---|---|
-| `migrations/0014–0020_*.sql` | 7 个新 migration |
+| `migrations/0014–0021_*.sql` | 8 个新 migration（0014–0015 PR-1a；0016 PR-1c；0017–0021 PR-2） |
 | `crates/rbrain-engine/src/research/tenant.rs` | 新增 |
 | `crates/rbrain-engine/src/research/projects.rs` | 新增 |
 | `crates/rbrain-engine/src/research/push_inbox.rs` | 新增 |
@@ -1042,6 +1046,7 @@ impl TenantContext {
 ### 10.4 Auth / 部署
 
 - 简单 token-based auth（M10 v1）
+- **MCP `TenantArgs` 收回**：M4 PR-1c 临时把 `user_id` / `project_id` 通过 `#[serde(flatten)]` 暴露在 `QueryArgs` / `GetArgs` / `PutArgs` / ... 里（任意客户端可冒充任意身份）。M10 必须改成从 auth token 解出 tenant 后注入 server 上下文，从 schema 中删除 `TenantArgs`。这是 M10 启动时**第一件要做的事**，否则 production 部署不安全。
 - Postgres 迁移评估（若 SQLite 真的撞天花板）
 - pgbouncer / 连池
 - Postgres + pgvector + `pg_search`（保留 Tantivy 质量）的 spike
