@@ -11,10 +11,14 @@
 
 pub mod edges;
 pub mod model;
+pub mod projects;
 pub mod protocol;
 pub mod store;
+pub mod tenant;
 
 pub use edges::{ResearchEdge, is_research_edge};
 pub use model::{ResearchRun, RunStatus, TaskType};
+pub use projects::{Project, ProjectStatus, ProjectStore};
 pub use protocol::{NextAction, ProtocolState};
 pub use store::ResearchRunStore;
+pub use tenant::{ADMIN_USER, DEFAULT_PROJECT, DEFAULT_USER, GLOBAL_USER, TenantContext};
